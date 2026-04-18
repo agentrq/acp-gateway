@@ -107,9 +107,6 @@ async function main() {
         console.error(
           `\n[acp] Agent completed task. Reason: ${result.stopReason}`,
         );
-
-        // Loop: When a task is complete, automatically ask for the next one
-        await checkForNextTask(mcpBridge, connection, sessionId);
       } catch (err) {
         console.error("[acp] Error during prompt execution:", err);
       }
