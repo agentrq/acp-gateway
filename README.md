@@ -25,7 +25,7 @@ It automates task execution by:
 - **Node.js** >= 24
 - **npm** or **yarn**
 - An [ACP-compatible agent](https://agentclientprotocol.com) (e.g., Gemini CLI)
-- An [agentrq](https://github.com/agentrq/agentrq) workspace with an HTTP MCP server
+- An [agentrq](https://agentrq.com/?utm_source=github) workspace with an HTTP MCP server
 
 ## Installation
 
