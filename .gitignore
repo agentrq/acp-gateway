@@ -1,0 +1,16 @@
+# Dependencies
+node_modules
+
+# Build artifacts
+dist
+coverage
+
+# Logs
+.log
+npm-debug.log*
+
+# System/IDE files
+.DS_Store
+.mcp.json
+.gemini
+.claude
