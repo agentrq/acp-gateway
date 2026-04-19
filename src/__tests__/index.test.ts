@@ -1,7 +1,83 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createAcpSessionSwitcher, checkForNextTask } from "../index.js";
+import { createAcpSessionSwitcher, checkForNextTask, mapMcpServers } from "../index.js";
+import type { McpServerConfig } from "../config.js";
 
 describe("index", () => {
+  describe("mapMcpServers", () => {
+    it("should correctly map HTTP servers with headers and env", () => {
+      const configs: McpServerConfig[] = [{
+        type: "http",
+        name: "test-http",
+        url: "http://localhost:8000",
+        env: { "Authorization": "Bearer env-token", "Other": "Val" },
+        headers: { "Authorization": "Bearer header-token", "Custom": "Header" }
+      }];
+      const result = mapMcpServers(configs);
+      expect(result).toEqual([{
+        type: "http",
+        name: "test-http",
+        url: "http://localhost:8000",
+        headers: [
+          { name: "Authorization", value: "Bearer header-token" },
+          { name: "Custom", value: "Header" }
+        ]
+      }]);
+    });
+
+    it("should default headers to empty object for HTTP servers", () => {
+      const configs: McpServerConfig[] = [{
+        type: "http",
+        name: "test-http",
+        url: "http://localhost:8000"
+      }];
+      const result = mapMcpServers(configs);
+      expect(result).toEqual([{
+        type: "http",
+        name: "test-http",
+        url: "http://localhost:8000",
+        headers: []
+      }]);
+    });
+
+    it("should correctly map stdio servers", () => {
+      const configs: McpServerConfig[] = [{
+        type: "stdio",
+        name: "test-stdio",
+        command: "npx",
+        args: ["-y", "some-pkg"],
+        env: {
+          API_KEY: "secret",
+          MODE: "test"
+        }
+      }];
+      const result = mapMcpServers(configs);
+      expect(result).toEqual([{
+        name: "test-stdio",
+        command: "npx",
+        args: ["-y", "some-pkg"],
+        env: [
+          { name: "API_KEY", value: "secret" },
+          { name: "MODE", value: "test" }
+        ]
+      }]);
+    });
+
+    it("should default args to empty array and env to empty object for stdio servers", () => {
+      const configs: McpServerConfig[] = [{
+        type: "stdio",
+        name: "minimal-stdio",
+        command: "echo"
+      }];
+      const result = mapMcpServers(configs);
+      expect(result).toEqual([{
+        name: "minimal-stdio",
+        command: "echo",
+        args: [],
+        env: []
+      }]);
+    });
+  });
+
   describe("createAcpSessionSwitcher", () => {
     let mockConnection: any;
     let params: any;

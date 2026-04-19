@@ -15,6 +15,7 @@ export interface McpServerConfig {
   command?: string;
   args?: string[];
   env?: Record<string, string>;
+  headers?: Record<string, string>;
 }
 
 interface McpJson {
@@ -26,6 +27,7 @@ interface McpJson {
       command?: string;
       args?: string[];
       env?: Record<string, string>;
+      headers?: Record<string, string>;
     }
   >;
 }
@@ -55,6 +57,7 @@ export function loadMcpConfig(startDir: string = process.cwd()): McpServerConfig
         command: cfg.command,
         args: cfg.args,
         env: cfg.env,
+        headers: cfg.headers,
       }));
 
       if (servers.length > 0) {

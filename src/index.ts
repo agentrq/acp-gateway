@@ -14,8 +14,28 @@ const pkg = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
 );
 
-import { loadMcpConfig, pickAgentrqServer } from "./config.js";
+import { loadMcpConfig, pickAgentrqServer, type McpServerConfig } from "./config.js";
 import { MCPBridge } from "./mcpClient.js";
+
+export function mapMcpServers(configs: McpServerConfig[]): acp.McpServer[] {
+  return configs.map((cfg): acp.McpServer => {
+    if (cfg.type === "http") {
+      return {
+        type: "http",
+        name: cfg.name,
+        url: cfg.url!,
+        headers: Object.entries(cfg.headers || {}).map(([name, value]) => ({ name, value })) as any,
+      };
+    } else {
+      return {
+        name: cfg.name,
+        command: cfg.command!,
+        args: cfg.args ?? [],
+        env: Object.entries(cfg.env || {}).map(([name, value]) => ({ name, value })) as any,
+      };
+    }
+  });
+}
 import { AgentRQACPClient } from "./acpClient.js";
 import {
   extractTaskIdFromMeta,
@@ -121,14 +141,7 @@ async function main() {
     // The McpServer object must follow the ACP protocol schema (type, name, url, headers).
     const newSessionParams: AcpNewSessionParams = {
       cwd: process.cwd(),
-      mcpServers: [
-        {
-          type: "http",
-          name: agentrqConfig.name,
-          url: agentrqConfig.url!,
-          headers: [],
-        },
-      ],
+      mcpServers: mapMcpServers(configs),
     };
 
     const sessionResult = await connection.newSession(newSessionParams);
