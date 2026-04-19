@@ -8,12 +8,19 @@
 
 import { spawn } from "node:child_process";
 import { Writable, Readable } from "node:stream";
+import { readFileSync } from "node:fs";
 import * as acp from "@agentclientprotocol/sdk";
+const pkg = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
+);
+
 import { loadMcpConfig, pickAgentrqServer } from "./config.js";
 import { MCPBridge } from "./mcpClient.js";
 import { AgentRQACPClient } from "./acpClient.js";
 
 async function main() {
+  console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
+
   const args = process.argv.slice(2);
 
   // Find where the command starts (after -- if provided, or just all args)
@@ -22,8 +29,8 @@ async function main() {
     cmdStartIndex !== -1 ? args.slice(cmdStartIndex + 1) : args;
 
   if (acpCmdArgs.length === 0) {
-    console.error("Usage: acp-gateway -- <acp-server-command> [args...]");
-    console.error("Example: acp-gateway -- gemini --acp");
+    console.log("Usage: acp-gateway -- <acp-server-command> [args...]");
+    console.log("Example: acp-gateway -- gemini --acp");
     process.exit(1);
   }
 

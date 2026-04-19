@@ -40,6 +40,10 @@ To use globally:
 npm install -g @agentrq/acp-gateway
 ```
 
+## Current Version
+
+`0.1.6`
+
 ## Usage
 
 ### Quick Start
