@@ -17,13 +17,16 @@ const pkg = JSON.parse(
 import { loadMcpConfig, pickAgentrqServer } from "./config.js";
 import { MCPBridge } from "./mcpClient.js";
 import { AgentRQACPClient } from "./acpClient.js";
-import { extractTaskIdFromMeta } from "./taskIdentity.js";
+import {
+  extractTaskIdFromMeta,
+  extractTaskIdFromText,
+} from "./taskIdentity.js";
 
 type AcpNewSessionParams = Parameters<
   acp.ClientSideConnection["newSession"]
 >[0];
 
-function createAcpSessionSwitcher(
+export function createAcpSessionSwitcher(
   connection: acp.ClientSideConnection,
   params: AcpNewSessionParams,
   initialSessionId: string,
@@ -36,21 +39,15 @@ function createAcpSessionSwitcher(
       return sessionId;
     },
     async ensureForTask(taskId: string | undefined): Promise<string> {
-      if (taskId === undefined) {
-        return sessionId;
-      }
-      if (activeTaskId === undefined) {
-        activeTaskId = taskId;
-        return sessionId;
-      }
       if (taskId === activeTaskId) {
         return sessionId;
       }
+
       const next = await connection.newSession(params);
       sessionId = next.sessionId;
       activeTaskId = taskId;
       console.error(
-        `[acp] New ACP session for task ${taskId} (MCP connection unchanged): ${sessionId}`,
+        `[acp] New ACP session for task ${taskId ?? "anonymous"} (MCP connection unchanged): ${sessionId}`,
       );
       return sessionId;
     },
@@ -184,7 +181,7 @@ async function main() {
  * Checks for the next pending task using the 'getNextTask' tool on the MCP server.
  * If found, sends it to the ACP agent.
  */
-async function checkForNextTask(
+export async function checkForNextTask(
   mcpBridge: MCPBridge,
   connection: acp.ClientSideConnection,
   sessionSwitcher: ReturnType<typeof createAcpSessionSwitcher>,
@@ -213,7 +210,8 @@ async function checkForNextTask(
         `[bridge] Found task: "${text.slice(0, 50).replace(/\n/g, " ")}..."`,
       );
 
-      const sessionId = sessionSwitcher.getSessionId();
+      const taskId = extractTaskIdFromText(text);
+      const sessionId = await sessionSwitcher.ensureForTask(taskId);
       const promptResult = await connection.prompt({
         sessionId,
         prompt: [{ type: "text", text }],
@@ -231,7 +229,10 @@ async function checkForNextTask(
   }
 }
 
-main().catch((err) => {
-  console.error("[fatal]", err);
-  process.exit(1);
-});
+if (process.env.NODE_ENV !== "test") {
+  main().catch((err) => {
+    console.error("[fatal]", err);
+    process.exit(1);
+  });
+}
+
