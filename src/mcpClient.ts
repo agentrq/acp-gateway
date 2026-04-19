@@ -12,11 +12,14 @@ import { z } from "zod";
 import type { McpServerConfig } from "./config.js";
 
 export class MCPBridge extends EventEmitter {
-  private client: Client;
-  private transport: StreamableHTTPClientTransport;
+  private client: Client | null = null;
+  private transport: StreamableHTTPClientTransport | null = null;
+  private isConnected = false;
+  private isConnecting = false;
+  private isClosed = false;
 
   public getSessionId(): string | undefined {
-    return (this.transport as any)._sessionId;
+    return (this.transport as any)?._sessionId;
   }
 
   constructor(private config: McpServerConfig) {
@@ -24,8 +27,52 @@ export class MCPBridge extends EventEmitter {
     if (!config.url) {
       throw new Error(`MCP server ${config.name} has no URL`);
     }
+  }
 
-    const url = new URL(config.url);
+  async connect() {
+    if (this.isConnecting || this.isConnected) return;
+    this.isConnecting = true;
+    this.isClosed = false;
+
+    let attempt = 0;
+    const initialDelay = 1000;
+    const maxDelay = 900000; // 15 minutes
+
+    while (!this.isConnected && !this.isClosed) {
+      try {
+        await this._connectOnce();
+        this.isConnected = true;
+        console.error(`[mcp] Connected to ${this.config.name}`);
+      } catch (error: any) {
+        if (this.isClosed) break;
+        const delay = Math.min(initialDelay * Math.pow(2, attempt), maxDelay);
+        console.error(
+          `[mcp] Connection failed to ${this.config.name} (attempt ${attempt + 1}): ${error.message || error}. Retrying in ${delay / 1000}s...`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        attempt++;
+      }
+    }
+    this.isConnecting = false;
+  }
+
+  private async _connectOnce() {
+    // Clean up existing transport and client
+    if (this.transport) {
+      this.transport.onclose = undefined;
+      this.transport.onerror = undefined;
+      await this.transport.close().catch(() => {});
+      this.transport = null;
+    }
+    if (this.client) {
+      await this.client.close().catch(() => {});
+      this.client = null;
+    }
+
+    if (!this.config.url) {
+      throw new Error("MCP server URL is not configured");
+    }
+    const url = new URL(this.config.url);
     this.transport = new StreamableHTTPClientTransport(url);
     this.client = new Client(
       {
@@ -36,54 +83,12 @@ export class MCPBridge extends EventEmitter {
         capabilities: {},
       },
     );
-  }
-
-  private isConnected = false;
-  private isConnecting = false;
-
-  async connect() {
-    if (this.isConnecting || this.isConnected) return;
-    this.isConnecting = true;
-
-    let attempt = 0;
-    const initialDelay = 1000;
-    const maxDelay = 30000;
-
-    while (!this.isConnected) {
-      try {
-        await this._connectOnce();
-        this.isConnected = true;
-        this.isConnecting = false;
-        console.error(`[mcp] Connected to ${this.config.name}`);
-      } catch (error) {
-        const delay = Math.min(initialDelay * Math.pow(2, attempt), maxDelay);
-        console.error(
-          `[mcp] Connection failed to ${this.config.name}. Retrying in ${delay / 1000}s...`,
-        );
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        attempt++;
-      }
-    }
-  }
-
-  private async _connectOnce() {
-    if (this.transport) {
-      await this.transport.close().catch(() => {});
-    }
-
-    if (!this.config.url) {
-      throw new Error("MCP server URL is not configured");
-    }
-    const url = new URL(this.config.url);
-    this.transport = new StreamableHTTPClientTransport(url);
 
     // Set up transport hooks for disconnection
     this.transport.onclose = () => {
-      if (this.isConnected) {
-        console.error(`[mcp] Connection to ${this.config.name} lost.`);
-        this.isConnected = false;
-        this.connect(); // Start reconnection loop
-      }
+      console.error(`[mcp] Connection to ${this.config.name} lost.`);
+      this.isConnected = false;
+      this.connect(); // Start reconnection loop
     };
 
     this.transport.onerror = (error) => {
@@ -128,7 +133,10 @@ export class MCPBridge extends EventEmitter {
   private async ensureConnected() {
     if (this.isConnected) return;
     if (!this.isConnecting) {
-      this.connect();
+      // Fire and forget connect loop if not already running
+      this.connect().catch((err) => {
+        console.error(`[mcp] Unexpected error in connect loop:`, err);
+      });
     }
 
     // Wait up to 10 seconds for connection
@@ -145,6 +153,7 @@ export class MCPBridge extends EventEmitter {
 
   async callTool(name: string, args: any = {}) {
     await this.ensureConnected();
+    if (!this.client) throw new Error("MCP client not initialized");
     return await this.client.callTool({
       name,
       arguments: args,
@@ -153,6 +162,7 @@ export class MCPBridge extends EventEmitter {
 
   async sendNotification(method: string, params: any) {
     await this.ensureConnected();
+    if (!this.client) throw new Error("MCP client not initialized");
     await this.client.notification({
       method,
       params,
@@ -160,6 +170,17 @@ export class MCPBridge extends EventEmitter {
   }
 
   async close() {
-    await this.client.close();
+    this.isClosed = true;
+    this.isConnected = false;
+    if (this.transport) {
+      this.transport.onclose = undefined;
+      this.transport.onerror = undefined;
+      await this.transport.close().catch(() => {});
+      this.transport = null;
+    }
+    if (this.client) {
+      await this.client.close().catch(() => {});
+      this.client = null;
+    }
   }
 }
