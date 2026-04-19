@@ -17,6 +17,45 @@ const pkg = JSON.parse(
 import { loadMcpConfig, pickAgentrqServer } from "./config.js";
 import { MCPBridge } from "./mcpClient.js";
 import { AgentRQACPClient } from "./acpClient.js";
+import { extractTaskIdFromMeta } from "./taskIdentity.js";
+
+type AcpNewSessionParams = Parameters<
+  acp.ClientSideConnection["newSession"]
+>[0];
+
+function createAcpSessionSwitcher(
+  connection: acp.ClientSideConnection,
+  params: AcpNewSessionParams,
+  initialSessionId: string,
+) {
+  let sessionId = initialSessionId;
+  let activeTaskId: string | undefined = undefined;
+
+  return {
+    getSessionId(): string {
+      return sessionId;
+    },
+    async ensureForTask(taskId: string | undefined): Promise<string> {
+      if (taskId === undefined) {
+        return sessionId;
+      }
+      if (activeTaskId === undefined) {
+        activeTaskId = taskId;
+        return sessionId;
+      }
+      if (taskId === activeTaskId) {
+        return sessionId;
+      }
+      const next = await connection.newSession(params);
+      sessionId = next.sessionId;
+      activeTaskId = taskId;
+      console.error(
+        `[acp] New ACP session for task ${taskId} (MCP connection unchanged): ${sessionId}`,
+      );
+      return sessionId;
+    },
+  };
+}
 
 async function main() {
   console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
@@ -83,7 +122,7 @@ async function main() {
     // 6. Create ACP Session
     // We pass our agentrq MCP server to the agent so it can use our tools directly.
     // The McpServer object must follow the ACP protocol schema (type, name, url, headers).
-    const sessionResult = await connection.newSession({
+    const newSessionParams: AcpNewSessionParams = {
       cwd: process.cwd(),
       mcpServers: [
         {
@@ -93,19 +132,27 @@ async function main() {
           headers: [],
         },
       ],
-    });
+    };
 
-    const sessionId = sessionResult.sessionId;
-    console.error(`[acp] Created session: ${sessionId}`);
+    const sessionResult = await connection.newSession(newSessionParams);
+
+    const sessionSwitcher = createAcpSessionSwitcher(
+      connection,
+      newSessionParams,
+      sessionResult.sessionId,
+    );
+    console.error(`[acp] Created session: ${sessionSwitcher.getSessionId()}`);
 
     // Bridge: MCP -> ACP
     // When the MCP server sends a notification to 'notifications/claude/channel',
     // it contains a new task content.
-    mcpBridge.on("task", async ({ content }) => {
+    mcpBridge.on("task", async ({ content, meta }) => {
       console.error(
         "\n[bridge] Incoming task from MCP server. Forwarding to ACP agent...",
       );
       try {
+        const taskId = extractTaskIdFromMeta(meta);
+        const sessionId = await sessionSwitcher.ensureForTask(taskId);
         const result = await connection.prompt({
           sessionId,
           prompt: [{ type: "text", text: content }],
@@ -120,7 +167,7 @@ async function main() {
     });
 
     // Initial check for a pending task
-    await checkForNextTask(mcpBridge, connection, sessionId);
+    await checkForNextTask(mcpBridge, connection, sessionSwitcher);
 
     // Keep the process alive
     await new Promise(() => {});
@@ -140,7 +187,7 @@ async function main() {
 async function checkForNextTask(
   mcpBridge: MCPBridge,
   connection: acp.ClientSideConnection,
-  sessionId: string,
+  sessionSwitcher: ReturnType<typeof createAcpSessionSwitcher>,
 ) {
   console.error("[bridge] Checking for next task via MCP server...");
   try {
@@ -161,19 +208,21 @@ async function checkForNextTask(
       content.text &&
       !content.text.includes("no pending tasks exist")
     ) {
+      const text = content.text;
       console.error(
-        `[bridge] Found task: "${content.text.slice(0, 50).replace(/\n/g, " ")}..."`,
+        `[bridge] Found task: "${text.slice(0, 50).replace(/\n/g, " ")}..."`,
       );
 
+      const sessionId = sessionSwitcher.getSessionId();
       const promptResult = await connection.prompt({
         sessionId,
-        prompt: [{ type: "text", text: content.text }],
+        prompt: [{ type: "text", text }],
       });
 
       console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
 
       // Recursively check for next task
-      await checkForNextTask(mcpBridge, connection, sessionId);
+      await checkForNextTask(mcpBridge, connection, sessionSwitcher);
     } else {
       console.error("[bridge] No pending tasks available.");
     }
