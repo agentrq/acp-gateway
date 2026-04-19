@@ -42,7 +42,7 @@ npm install -g @agentrq/acp-gateway
 
 ## Current Version
 
-`0.1.7`
+`0.1.8`
 
 ## Usage
 
@@ -105,8 +105,11 @@ Example `.mcp.json`:
 1. **Config Loading** — Reads `.mcp.json` to find the agentrq MCP server.
 2. **MCP Connection** — Establishes a `StreamableHTTPClientTransport` to the MCP server with automatic retry and reconnection.
 3. **Agent Spawning** — Launches the specified ACP agent as a subprocess with stdio piping.
-4. **ACP Handshake** — Initializes the ACP connection and creates a new session with the MCP server reference.
-5. **Task Bridge** — The MCP server sends `notifications/claude/channel` for new tasks; `acp-gateway` forwards them to the ACP agent.
+4. **ACP Handshake** — Initializes the ACP connection.
+5. **Task Bridge & Multi-Session Isolation** — When a task is received from the MCP server:
+    - `acp-gateway` extracts the `chat_id` (Task ID).
+    - It ensures a dedicated ACP session for that specific task.
+    - If the task belongs to a different session than the current one, a new ACP session is initialized, providing clean state isolation between concurrent or sequential tasks.
 6. **Permission Bridge** — Permission requests from the ACP agent are forwarded to the MCP server; verdicts are sent back.
 7. **Recursive Execution** — After each task completes, `acp-gateway` checks for the next pending task automatically.
 
