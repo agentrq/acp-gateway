@@ -53,10 +53,14 @@ export function createAcpSessionSwitcher(
 ) {
   let currentSessionId = initialSessionId;
   const taskSessionMap = new Map<string, string>();
+  const sessionTaskMap = new Map<string, string>();
 
   return {
     getSessionId(): string {
       return currentSessionId;
+    },
+    getTaskIdForSession(sessionId: string): string | undefined {
+      return sessionTaskMap.get(sessionId);
     },
     async ensureForTask(taskId: string | undefined): Promise<string> {
       if (taskId === undefined) {
@@ -72,6 +76,7 @@ export function createAcpSessionSwitcher(
       const next = await connection.newSession(params);
       currentSessionId = next.sessionId;
       taskSessionMap.set(taskId, currentSessionId);
+      sessionTaskMap.set(currentSessionId, taskId);
       console.error(
         `[acp] New ACP session for task ${taskId} (MCP connection unchanged): ${currentSessionId}`,
       );
@@ -119,7 +124,9 @@ async function main() {
   ) as ReadableStream<Uint8Array>;
 
   // 4. Create ACP Connection
-  const acpClient = new AgentRQACPClient(mcpBridge);
+  // taskIdLookup is filled in after the session switcher is created below.
+  let taskIdLookup: (sessionId: string) => string | undefined = () => undefined;
+  const acpClient = new AgentRQACPClient(mcpBridge, (sid) => taskIdLookup(sid));
   const stream = acp.ndJsonStream(input, output);
   const connection = new acp.ClientSideConnection(
     (_agent) => acpClient,
@@ -157,6 +164,7 @@ async function main() {
       newSessionParams,
       sessionResult.sessionId,
     );
+    taskIdLookup = (sid) => sessionSwitcher.getTaskIdForSession(sid);
     console.error(`[acp] Created session: ${sessionSwitcher.getSessionId()}`);
 
     // Bridge: MCP -> ACP
@@ -174,6 +182,7 @@ async function main() {
           prompt: [{ type: "text", text: content }],
         });
 
+        await acpClient.flushReply(sessionId);
         console.error(
           `\n[acp] Agent completed task. Reason: ${result.stopReason}`,
         );
@@ -183,7 +192,7 @@ async function main() {
     });
 
     // Initial check for a pending task
-    await checkForNextTask(mcpBridge, connection, sessionSwitcher);
+    await checkForNextTask(mcpBridge, connection, sessionSwitcher, acpClient);
 
     // Keep the process alive
     await new Promise(() => {});
@@ -204,6 +213,7 @@ export async function checkForNextTask(
   mcpBridge: MCPBridge,
   connection: acp.ClientSideConnection,
   sessionSwitcher: ReturnType<typeof createAcpSessionSwitcher>,
+  acpClient: AgentRQACPClient,
 ) {
   console.error("[bridge] Checking for next task via MCP server...");
   try {
@@ -236,10 +246,11 @@ export async function checkForNextTask(
         prompt: [{ type: "text", text }],
       });
 
+      await acpClient.flushReply(sessionId);
       console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
 
       // Recursively check for next task
-      await checkForNextTask(mcpBridge, connection, sessionSwitcher);
+      await checkForNextTask(mcpBridge, connection, sessionSwitcher, acpClient);
     } else {
       console.error("[bridge] No pending tasks available.");
     }
