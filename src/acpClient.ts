@@ -12,6 +12,8 @@ import * as path from "node:path";
 
 export class AgentRQACPClient implements acp.Client {
   private replyBuffers = new Map<string, string>();
+  // chatId → text sent by the agent via the reply MCP tool (for dedup in flushReply)
+  private agentReplies = new Map<string, string>();
 
   constructor(
     private mcpBridge: MCPBridge,
@@ -26,6 +28,13 @@ export class AgentRQACPClient implements acp.Client {
     const taskId = this.getTaskIdForSession(sessionId);
     if (!taskId) {
       console.error(`[acp] No task ID for session ${sessionId}, skipping reply`);
+      return;
+    }
+
+    const agentReplyText = this.agentReplies.get(taskId);
+    this.agentReplies.delete(taskId);
+    if (agentReplyText !== undefined && agentReplyText === text) {
+      console.error(`[acp] Skipping reply to task ${taskId} — agent already sent identical reply`);
       return;
     }
 
@@ -126,14 +135,24 @@ export class AgentRQACPClient implements acp.Client {
           this.replyBuffers.set(sid, (this.replyBuffers.get(sid) ?? "") + update.content.text);
         }
         break;
-      case "tool_call":
-        // Skip logging for auto-allowed tools to avoid noise in the backend/logs
+      case "tool_call": {
         const agentrqToolPattern = /agentrq-[a-zA-Z0-9]{11}/;
         if (update.title && agentrqToolPattern.test(update.title)) {
+          // Track completed reply calls so flushReply can skip exact duplicates
+          if (
+            update.status === "completed" &&
+            update.title.split(/[\s(]/)[0] === "reply" &&
+            update.rawInput != null &&
+            typeof (update.rawInput as any).chatId === "string"
+          ) {
+            const { chatId, text = "" } = update.rawInput as { chatId: string; text?: string };
+            this.agentReplies.set(chatId, text);
+          }
           break;
         }
         console.error(`\n🔧 [ACP Agent] Tool call: ${update.title} (${update.status})`);
         break;
+      }
       default:
         break;
     }
