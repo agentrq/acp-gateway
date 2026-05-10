@@ -11,7 +11,31 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 export class AgentRQACPClient implements acp.Client {
-  constructor(private mcpBridge: MCPBridge) {}
+  private replyBuffers = new Map<string, string>();
+
+  constructor(
+    private mcpBridge: MCPBridge,
+    private getTaskIdForSession: (sessionId: string) => string | undefined = () => undefined,
+  ) {}
+
+  async flushReply(sessionId: string): Promise<void> {
+    const text = this.replyBuffers.get(sessionId) ?? "";
+    this.replyBuffers.delete(sessionId);
+    if (!text.trim()) return;
+
+    const taskId = this.getTaskIdForSession(sessionId);
+    if (!taskId) {
+      console.error(`[acp] No task ID for session ${sessionId}, skipping reply`);
+      return;
+    }
+
+    try {
+      await this.mcpBridge.callTool("reply", { chatId: taskId, text });
+      console.error(`[acp] Forwarded agent reply to task ${taskId}`);
+    } catch (err) {
+      console.error(`[acp] Failed to forward reply to task ${taskId}:`, err);
+    }
+  }
 
   async requestPermission(
     params: acp.RequestPermissionRequest
@@ -98,6 +122,8 @@ export class AgentRQACPClient implements acp.Client {
       case "agent_message_chunk":
         if (update.content.type === "text") {
           process.stdout.write(update.content.text);
+          const sid = params.sessionId;
+          this.replyBuffers.set(sid, (this.replyBuffers.get(sid) ?? "") + update.content.text);
         }
         break;
       case "tool_call":

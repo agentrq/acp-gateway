@@ -218,6 +218,7 @@ describe("AgentRQACPClient", () => {
         .spyOn(process.stdout, "write")
         .mockImplementation(() => true);
       const params = {
+        sessionId: "sess-1",
         update: {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "hello" },
@@ -234,6 +235,7 @@ describe("AgentRQACPClient", () => {
         .spyOn(process.stdout, "write")
         .mockImplementation(() => true);
       const params = {
+        sessionId: "sess-1",
         update: {
           sessionUpdate: "agent_message_chunk",
           content: { type: "other", text: "ignored" },
@@ -284,6 +286,50 @@ describe("AgentRQACPClient", () => {
     it("should handle unknown update types", async () => {
       const params = { update: { sessionUpdate: "unknown" } } as any;
       await expect(client.sessionUpdate(params)).resolves.toBeUndefined();
+    });
+  });
+
+  describe("flushReply", () => {
+    it("should call reply tool with accumulated text and clear the buffer", async () => {
+      mcpBridge.callTool = vi.fn().mockResolvedValue({ isError: false, content: [] });
+      const getTaskId = vi.fn().mockReturnValue("task-123");
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, getTaskId);
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      await c.sessionUpdate({ sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello " } } } as any);
+      await c.sessionUpdate({ sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "world" } } } as any);
+
+      await c.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("reply", { chatId: "task-123", text: "Hello world" });
+
+      // Buffer cleared — second flush should not call reply again
+      mcpBridge.callTool.mockClear();
+      await c.flushReply("sess-1");
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+    });
+
+    it("should skip reply if buffer is empty", async () => {
+      mcpBridge.callTool = vi.fn();
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+
+      await c.flushReply("sess-empty");
+
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+    });
+
+    it("should skip reply if no task ID is found for the session", async () => {
+      mcpBridge.callTool = vi.fn();
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => undefined);
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      await c.sessionUpdate({ sessionId: "sess-unknown", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi" } } } as any);
+      await c.flushReply("sess-unknown");
+
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("No task ID for session"));
+      consoleSpy.mockRestore();
     });
   });
 

@@ -148,10 +148,44 @@ describe("index", () => {
     });
   });
 
+  describe("createAcpSessionSwitcher – getTaskIdForSession", () => {
+    let mockConnection: any;
+    let params: any;
+
+    beforeEach(() => {
+      mockConnection = {
+        newSession: vi.fn()
+          .mockResolvedValueOnce({ sessionId: "session-for-task-1" })
+          .mockResolvedValueOnce({ sessionId: "session-for-task-2" }),
+      };
+      params = { cwd: "/test", mcpServers: [] };
+    });
+
+    it("should return taskId for a known session", async () => {
+      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
+      await switcher.ensureForTask("task-1");
+      expect(switcher.getTaskIdForSession("session-for-task-1")).toBe("task-1");
+    });
+
+    it("should return undefined for an unknown session", async () => {
+      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
+      expect(switcher.getTaskIdForSession("unknown-session")).toBeUndefined();
+    });
+
+    it("should track multiple sessions independently", async () => {
+      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
+      await switcher.ensureForTask("task-1");
+      await switcher.ensureForTask("task-2");
+      expect(switcher.getTaskIdForSession("session-for-task-1")).toBe("task-1");
+      expect(switcher.getTaskIdForSession("session-for-task-2")).toBe("task-2");
+    });
+  });
+
   describe("checkForNextTask", () => {
     let mockMcpBridge: any;
     let mockConnection: any;
     let mockSessionSwitcher: any;
+    let mockAcpClient: any;
 
     beforeEach(() => {
       vi.clearAllMocks();
@@ -165,6 +199,9 @@ describe("index", () => {
         getSessionId: vi.fn().mockReturnValue("current-session"),
         ensureForTask: vi.fn().mockResolvedValue("current-session"),
       };
+      mockAcpClient = {
+        flushReply: vi.fn().mockResolvedValue(undefined),
+      };
 
       // Mock console.error to avoid cluttering test output
       vi.spyOn(console, "error").mockImplementation(() => {});
@@ -176,7 +213,7 @@ describe("index", () => {
         content: [{ type: "text", text: "no pending tasks exist" }],
       });
 
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher);
+      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
 
       expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getNextTask");
       expect(mockConnection.prompt).not.toHaveBeenCalled();
@@ -188,7 +225,7 @@ describe("index", () => {
         content: "some error",
       });
 
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher);
+      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
 
       expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getNextTask");
       expect(mockConnection.prompt).not.toHaveBeenCalled();
@@ -206,7 +243,7 @@ describe("index", () => {
           content: [{ type: "text", text: "no pending tasks exist" }],
         });
 
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher);
+      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
 
       expect(mockMcpBridge.callTool).toHaveBeenCalledTimes(2);
       expect(mockSessionSwitcher.ensureForTask).toHaveBeenCalledWith("T1");
@@ -214,12 +251,13 @@ describe("index", () => {
         sessionId: "current-session",
         prompt: [{ type: "text", text: "Task ID: T1\ndo something" }],
       });
+      expect(mockAcpClient.flushReply).toHaveBeenCalledWith("current-session");
     });
 
     it("should handle exceptions during execution", async () => {
       mockMcpBridge.callTool.mockRejectedValue(new Error("network error"));
 
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher);
+      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
 
       expect(console.error).toHaveBeenCalledWith(
         expect.stringContaining("Failed to check for next task"),
