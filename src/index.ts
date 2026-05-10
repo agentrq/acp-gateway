@@ -51,25 +51,31 @@ export function createAcpSessionSwitcher(
   params: AcpNewSessionParams,
   initialSessionId: string,
 ) {
-  let sessionId = initialSessionId;
-  let activeTaskId: string | undefined = undefined;
+  let currentSessionId = initialSessionId;
+  const taskSessionMap = new Map<string, string>();
 
   return {
     getSessionId(): string {
-      return sessionId;
+      return currentSessionId;
     },
     async ensureForTask(taskId: string | undefined): Promise<string> {
-      if (taskId === activeTaskId) {
-        return sessionId;
+      if (taskId === undefined) {
+        return currentSessionId;
+      }
+
+      const existing = taskSessionMap.get(taskId);
+      if (existing) {
+        currentSessionId = existing;
+        return existing;
       }
 
       const next = await connection.newSession(params);
-      sessionId = next.sessionId;
-      activeTaskId = taskId;
+      currentSessionId = next.sessionId;
+      taskSessionMap.set(taskId, currentSessionId);
       console.error(
-        `[acp] New ACP session for task ${taskId ?? "anonymous"} (MCP connection unchanged): ${sessionId}`,
+        `[acp] New ACP session for task ${taskId} (MCP connection unchanged): ${currentSessionId}`,
       );
-      return sessionId;
+      return currentSessionId;
     },
   };
 }

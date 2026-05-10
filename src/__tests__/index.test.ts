@@ -116,16 +116,35 @@ describe("index", () => {
     it("should create a new session when taskId changes", async () => {
       params = { cwd: "/test", mcpServers: [{ name: "s1", url: "http://s1", headers: [] }] };
       const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      
+
       // Set initial task
       await switcher.ensureForTask("task-1");
-      
+
       // Change task
       const id = await switcher.ensureForTask("task-2");
-      
+
       expect(id).toBe("new-session-id");
       expect(mockConnection.newSession).toHaveBeenCalledTimes(2);
       expect(switcher.getSessionId()).toBe("new-session-id");
+    });
+
+    it("should return existing session when a previously seen task returns", async () => {
+      mockConnection.newSession
+        .mockResolvedValueOnce({ sessionId: "session-for-task-1" })
+        .mockResolvedValueOnce({ sessionId: "session-for-task-2" });
+
+      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
+
+      const id1 = await switcher.ensureForTask("task-1");
+      expect(id1).toBe("session-for-task-1");
+
+      const id2 = await switcher.ensureForTask("task-2");
+      expect(id2).toBe("session-for-task-2");
+
+      // task-1 returns — must reuse session-for-task-1, not create a third session
+      const id3 = await switcher.ensureForTask("task-1");
+      expect(id3).toBe("session-for-task-1");
+      expect(mockConnection.newSession).toHaveBeenCalledTimes(2);
     });
   });
 
