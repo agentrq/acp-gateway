@@ -73,7 +73,14 @@ export class MCPBridge extends EventEmitter {
       throw new Error("MCP server URL is not configured");
     }
     const url = new URL(this.config.url);
-    this.transport = new StreamableHTTPClientTransport(url);
+    this.transport = new StreamableHTTPClientTransport(url, {
+      reconnectionOptions: {
+        maxRetries: 100, // Allow many retries at the transport level
+        initialReconnectionDelay: 1000,
+        maxReconnectionDelay: 900000, // 15 minutes
+        reconnectionDelayGrowFactor: 2,
+      },
+    });
     this.client = new Client(
       {
         name: "acp-gateway",
