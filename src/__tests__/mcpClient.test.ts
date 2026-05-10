@@ -155,6 +155,23 @@ describe("MCPBridge", () => {
       });
     });
 
+    it("should initialize transport with correct reconnection options", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      expect(StreamableHTTPClientTransport).toHaveBeenCalledWith(
+        expect.any(URL),
+        expect.objectContaining({
+          reconnectionOptions: {
+            maxRetries: 100,
+            initialReconnectionDelay: 1000,
+            maxReconnectionDelay: 900000,
+            reconnectionDelayGrowFactor: 2,
+          },
+        }),
+      );
+    });
+
     it("should handle transport close by reconnecting with a fresh client", async () => {
       const bridge = new MCPBridge(config);
       await bridge.connect();
