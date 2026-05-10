@@ -331,6 +331,82 @@ describe("AgentRQACPClient", () => {
       expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("No task ID for session"));
       consoleSpy.mockRestore();
     });
+
+    it("should skip reply when agent already sent identical reply via tool call", async () => {
+      mcpBridge.callTool = vi.fn().mockResolvedValue({ isError: false, content: [] });
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      // Agent buffers text
+      await c.sessionUpdate({ sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello world" } } } as any);
+
+      // Agent also called reply via MCP tool with identical params
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call",
+          title: "reply (agentrq-0an2BXTfpGj MCP Server)",
+          status: "completed",
+          toolCallId: "tc-1",
+          rawInput: { chatId: "task-123", text: "Hello world" },
+        },
+      } as any);
+
+      await c.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).not.toHaveBeenCalledWith("reply", expect.anything());
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("agent already sent identical reply"));
+      consoleSpy.mockRestore();
+    });
+
+    it("should still send reply when agent called reply with different text", async () => {
+      mcpBridge.callTool = vi.fn().mockResolvedValue({ isError: false, content: [] });
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      await c.sessionUpdate({ sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Full verbose output" } } } as any);
+
+      // Agent sent a different message via reply tool
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call",
+          title: "reply (agentrq-0an2BXTfpGj MCP Server)",
+          status: "completed",
+          toolCallId: "tc-1",
+          rawInput: { chatId: "task-123", text: "Summary only" },
+        },
+      } as any);
+
+      await c.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("reply", { chatId: "task-123", text: "Full verbose output" });
+    });
+
+    it("should not skip reply if agent tool call was not completed", async () => {
+      mcpBridge.callTool = vi.fn().mockResolvedValue({ isError: false, content: [] });
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      await c.sessionUpdate({ sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello world" } } } as any);
+
+      // Tool call is in_progress, not completed
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call",
+          title: "reply (agentrq-0an2BXTfpGj MCP Server)",
+          status: "in_progress",
+          toolCallId: "tc-1",
+          rawInput: { chatId: "task-123", text: "Hello world" },
+        },
+      } as any);
+
+      await c.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("reply", { chatId: "task-123", text: "Hello world" });
+    });
   });
 
   describe("file operations", () => {
