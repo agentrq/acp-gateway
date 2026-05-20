@@ -99,7 +99,19 @@ export class MCPBridge extends EventEmitter {
     };
 
     this.transport.onerror = (error) => {
-      console.error(`[mcp] Transport error:`, error.message || error);
+      const msg = error?.message || String(error);
+      console.error(`[mcp] Transport error:`, msg);
+      
+      if (msg.includes("Failed to reconnect SSE stream") || msg.includes("Not Found")) {
+        console.error(`[mcp] Unrecoverable transport error, forcing new connection...`);
+        this.isConnected = false;
+        if (this.transport) {
+          this.transport.onclose = undefined;
+          this.transport.onerror = undefined;
+          this.transport.close().catch(() => {});
+        }
+        this.connect();
+      }
     };
 
     await this.client.connect(this.transport);
