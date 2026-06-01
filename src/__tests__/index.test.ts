@@ -106,7 +106,7 @@ describe("index", () => {
       const id = await switcher.ensureForTask("task-1");
       expect(id).toBe("new-session-id");
       expect(mockConnection.newSession).toHaveBeenCalled();
-      
+
       // Second call with same taskId should still return same ID
       const id2 = await switcher.ensureForTask("task-1");
       expect(id2).toBe("new-session-id");
@@ -231,21 +231,15 @@ describe("index", () => {
       expect(mockConnection.prompt).not.toHaveBeenCalled();
     });
 
-    it("should process task and recurse if task is found", async () => {
-      // First call returns a task with ID in text, second call returns no task
-      mockMcpBridge.callTool
-        .mockResolvedValueOnce({
-          isError: false,
-          content: [{ type: "text", text: "Task ID: T1\ndo something" }],
-        })
-        .mockResolvedValueOnce({
-          isError: false,
-          content: [{ type: "text", text: "no pending tasks exist" }],
-        });
+    it("should process task and NOT recurse if task is found", async () => {
+      mockMcpBridge.callTool.mockResolvedValue({
+        isError: false,
+        content: [{ type: "text", text: "Task ID: T1\ndo something" }],
+      });
 
       await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
 
-      expect(mockMcpBridge.callTool).toHaveBeenCalledTimes(2);
+      expect(mockMcpBridge.callTool).toHaveBeenCalledTimes(1);
       expect(mockSessionSwitcher.ensureForTask).toHaveBeenCalledWith("T1");
       expect(mockConnection.prompt).toHaveBeenCalledWith({
         sessionId: "current-session",

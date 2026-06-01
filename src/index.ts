@@ -195,7 +195,7 @@ async function main() {
     await checkForNextTask(mcpBridge, connection, sessionSwitcher, acpClient);
 
     // Keep the process alive
-    await new Promise(() => {});
+    await new Promise(() => { });
   } catch (error) {
     console.error("[acp-gateway] Error:", error);
   } finally {
@@ -248,9 +248,6 @@ export async function checkForNextTask(
 
       await acpClient.flushReply(sessionId);
       console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
-
-      // Recursively check for next task
-      await checkForNextTask(mcpBridge, connection, sessionSwitcher, acpClient);
     } else {
       console.error("[bridge] No pending tasks available.");
     }
