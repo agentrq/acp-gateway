@@ -42,6 +42,8 @@ import {
   extractTaskIdFromText,
 } from "./taskIdentity.js";
 
+const lastTaskContent = new Map<string, string>();
+
 type AcpNewSessionParams = Parameters<
   acp.ClientSideConnection["newSession"]
 >[0];
@@ -85,6 +87,61 @@ export function createAcpSessionSwitcher(
   };
 }
 
+
+export class TaskQueue {
+  private activeTasks = 0;
+  private queue: (() => Promise<void>)[] = [];
+
+  constructor(private maxConcurrency: number) {}
+
+  async run(taskFn: () => Promise<void>): Promise<void> {
+    if (this.activeTasks < this.maxConcurrency) {
+      await this.execute(taskFn);
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        this.queue.push(async () => {
+          try {
+            await taskFn();
+            resolve();
+          } catch (err) {
+            reject(err);
+            throw err;
+          }
+        });
+      });
+    }
+  }
+
+  private async execute(taskFn: () => Promise<void>): Promise<void> {
+    this.activeTasks++;
+    try {
+      await taskFn();
+    } finally {
+      this.activeTasks--;
+      this.next();
+    }
+  }
+
+  private next() {
+    if (this.queue.length > 0 && this.activeTasks < this.maxConcurrency) {
+      const nextTask = this.queue.shift();
+      if (nextTask) {
+        this.execute(nextTask).catch((err) => {
+          console.log("[queue] Error executing queued task:", err);
+        });
+      }
+    }
+  }
+
+  public getActiveCount(): number {
+    return this.activeTasks;
+  }
+
+  public getQueueLength(): number {
+    return this.queue.length;
+  }
+}
+
 async function main() {
   console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
 
@@ -96,14 +153,29 @@ async function main() {
     cmdStartIndex !== -1 ? args.slice(cmdStartIndex + 1) : args;
 
   if (acpCmdArgs.length === 0) {
-    console.log("Usage: acp-gateway -- <acp-server-command> [args...]");
-    console.log("Example: acp-gateway -- gemini --acp");
+    console.log("Usage: acp-gateway [--max-concurrency <number>] -- <acp-server-command> [args...]");
+    console.log("Example: acp-gateway --max-concurrency 4 -- gemini --acp");
     process.exit(1);
   }
 
   // 1. Load MCP Config
   const configs = loadMcpConfig();
   const agentrqConfig = pickAgentrqServer(configs);
+
+  // Parse max concurrency from CLI args, falling back to default of 2
+  let maxConcurrency = 2;
+  const gatewayArgs = cmdStartIndex !== -1 ? args.slice(0, cmdStartIndex) : [];
+  const maxConcurrencyIdx = gatewayArgs.findIndex(
+    (arg) => arg === "--max-concurrency" || arg === "--maxConcurrency",
+  );
+  if (maxConcurrencyIdx !== -1 && maxConcurrencyIdx + 1 < gatewayArgs.length) {
+    const val = parseInt(gatewayArgs[maxConcurrencyIdx + 1], 10);
+    if (!isNaN(val)) {
+      maxConcurrency = val;
+    }
+  }
+
+  const taskQueue = new TaskQueue(maxConcurrency);
 
   // 2. Initialize MCP Bridge
   const mcpBridge = new MCPBridge(agentrqConfig);
@@ -170,29 +242,40 @@ async function main() {
     // Bridge: MCP -> ACP
     // When the MCP server sends a notification to 'notifications/claude/channel',
     // it contains a new task content.
-    mcpBridge.on("task", async ({ content, meta }) => {
+    mcpBridge.on("task", ({ content, meta }) => {
+      const taskId = extractTaskIdFromMeta(meta);
+      if (taskId) {
+        if (lastTaskContent.get(taskId) === content) {
+          console.log(`[bridge] Dropping repetitive task notification for ${taskId}`);
+          return;
+        }
+        lastTaskContent.set(taskId, content);
+      }
       console.error(
         "\n[bridge] Incoming task from MCP server. Forwarding to ACP agent...",
       );
-      try {
-        const taskId = extractTaskIdFromMeta(meta);
-        const sessionId = await sessionSwitcher.ensureForTask(taskId);
-        const result = await connection.prompt({
-          sessionId,
-          prompt: [{ type: "text", text: content }],
-        });
+      taskQueue.run(async () => {
+        try {
+          const sessionId = await sessionSwitcher.ensureForTask(taskId);
+          const result = await connection.prompt({
+            sessionId,
+            prompt: [{ type: "text", text: content }],
+          });
 
-        await acpClient.flushReply(sessionId);
-        console.error(
-          `\n[acp] Agent completed task. Reason: ${result.stopReason}`,
-        );
-      } catch (err) {
-        console.error("[acp] Error during prompt execution:", err);
-      }
+          await acpClient.flushReply(sessionId);
+          console.error(
+            `\n[acp] Agent completed task. Reason: ${result.stopReason}`,
+          );
+        } catch (err) {
+          console.error("[acp] Error during prompt execution:", err);
+        }
+      }).catch((err) => {
+        console.error("[bridge] Error queuing task:", err);
+      });
     });
 
     // Initial check for a pending task
-    await checkForNextTask(mcpBridge, connection, sessionSwitcher, acpClient);
+    await checkForNextTask(mcpBridge, connection, sessionSwitcher, acpClient, taskQueue);
 
     // Keep the process alive
     await new Promise(() => { });
@@ -214,6 +297,7 @@ export async function checkForNextTask(
   connection: acp.ClientSideConnection,
   sessionSwitcher: ReturnType<typeof createAcpSessionSwitcher>,
   acpClient: AgentRQACPClient,
+  taskQueue?: TaskQueue,
 ) {
   console.error("[bridge] Checking for next task via MCP server...");
   try {
@@ -235,19 +319,34 @@ export async function checkForNextTask(
       !content.text.includes("no pending tasks exist")
     ) {
       const text = content.text;
+      const taskId = extractTaskIdFromText(text);
+      if (taskId) {
+        if (lastTaskContent.get(taskId) === text) {
+          console.log(`[bridge] Dropping repetitive checked task for ${taskId}`);
+          return;
+        }
+        lastTaskContent.set(taskId, text);
+      }
       console.error(
         `[bridge] Found task: "${text.slice(0, 50).replace(/\n/g, " ")}..."`,
       );
 
-      const taskId = extractTaskIdFromText(text);
-      const sessionId = await sessionSwitcher.ensureForTask(taskId);
-      const promptResult = await connection.prompt({
-        sessionId,
-        prompt: [{ type: "text", text }],
-      });
+      const runFn = async () => {
+        const sessionId = await sessionSwitcher.ensureForTask(taskId);
+        const promptResult = await connection.prompt({
+          sessionId,
+          prompt: [{ type: "text", text }],
+        });
 
-      await acpClient.flushReply(sessionId);
-      console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
+        await acpClient.flushReply(sessionId);
+        console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
+      };
+
+      if (taskQueue) {
+        await taskQueue.run(runFn);
+      } else {
+        await runFn();
+      }
     } else {
       console.error("[bridge] No pending tasks available.");
     }

@@ -32,6 +32,7 @@ describe("config", () => {
         args: undefined,
         command: undefined,
         env: undefined,
+        headers: undefined,
       });
     });
 
