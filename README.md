@@ -61,6 +61,17 @@ Or with a custom command:
 acp-gateway -- your-acp-agent --flag1 --flag2
 ```
 
+### CLI Options
+
+You can specify gateway options before the `--` separator:
+
+- `--max-concurrency` / `--maxConcurrency` `<number>`: Sets the maximum number of concurrent tasks allowed to prompt the ACP agent at once. Defaults to `2`.
+
+Example:
+```bash
+acp-gateway --max-concurrency 4 -- gemini --acp
+```
+
 ### Configuration
 
 `acp-gateway` searches for `.mcp.json` starting in the current working directory and up to 3 parent directories.
@@ -108,6 +119,8 @@ Example `.mcp.json`:
 4. **ACP Handshake** — Initializes the ACP connection.
 5. **Task Bridge & Multi-Session Isolation** — When a task is received from the MCP server:
     - `acp-gateway` extracts the `chat_id` (Task ID).
+    - It checks if the task content is a duplicate of the last processed task for this Task ID. If it is repetitive, the task is dropped to prevent redundant processing.
+    - If not repetitive, the task is added to a concurrency-limiting queue (honoring the `--max-concurrency` limit).
     - It ensures a dedicated ACP session for that specific task.
     - If the task belongs to a different session than the current one, a new ACP session is initialized, providing clean state isolation between concurrent or sequential tasks.
 6. **Permission Bridge** — Permission requests from the ACP agent are forwarded to the MCP server; verdicts are sent back.
