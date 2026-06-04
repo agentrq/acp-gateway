@@ -1,6 +1,38 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createAcpSessionSwitcher, checkForNextTask, mapMcpServers, TaskQueue } from "../index.js";
+import { Writable, Readable } from "node:stream";
+import {
+  createAcpSessionSwitcher,
+  checkForNextTask,
+  mapMcpServers,
+  TaskQueue,
+  getOrCreateSession,
+  activeSessions,
+} from "../index.js";
 import type { McpServerConfig } from "../config.js";
+
+vi.mock("node:child_process", () => {
+  return {
+    spawn: vi.fn().mockReturnValue({
+      stdin: new Writable({ write(chunk, encoding, callback) { callback(); } }),
+      stdout: new Readable({ read() { this.push(null); } }),
+      kill: vi.fn(),
+    }),
+  };
+});
+
+vi.mock("@agentclientprotocol/sdk", async () => {
+  const actual = await vi.importActual<typeof import("@agentclientprotocol/sdk")>("@agentclientprotocol/sdk");
+  return {
+    ...actual,
+    ClientSideConnection: vi.fn().mockImplementation(function() {
+      return {
+        initialize: vi.fn().mockResolvedValue({ protocolVersion: "0.1.0" }),
+        newSession: vi.fn().mockResolvedValue({ sessionId: "test-sess-123" }),
+        prompt: vi.fn().mockResolvedValue({ stopReason: "complete" }),
+      };
+    }),
+  };
+});
 
 describe("index", () => {
   describe("mapMcpServers", () => {
@@ -350,6 +382,35 @@ describe("index", () => {
       expect(logSpy).toHaveBeenCalledWith("[queue] Error executing queued task:", expect.any(Error));
 
       logSpy.mockRestore();
+    });
+  });
+
+  describe("getOrCreateSession", () => {
+    beforeEach(() => {
+      activeSessions.clear();
+    });
+
+    it("should spawn a new session when not cached", async () => {
+      const mockBridge: any = {};
+      const configs: any[] = [];
+      const agentrqConfig: any = { env: {} };
+      
+      const session = await getOrCreateSession("T-New", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
+      
+      expect(session).toBeDefined();
+      expect(session.sessionId).toBe("test-sess-123");
+      expect(activeSessions.has("T-New")).toBe(true);
+    });
+
+    it("should return cached session when already created", async () => {
+      const mockBridge: any = {};
+      const configs: any[] = [];
+      const agentrqConfig: any = { env: {} };
+
+      const session1 = await getOrCreateSession("T-Cache", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
+      const session2 = await getOrCreateSession("T-Cache", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
+
+      expect(session1).toBe(session2);
     });
   });
 });

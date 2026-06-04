@@ -44,6 +44,80 @@ import {
 
 const lastTaskContent = new Map<string, string>();
 
+export interface AgentSession {
+  process: any;
+  connection: acp.ClientSideConnection;
+  acpClient: AgentRQACPClient;
+  sessionId: string;
+}
+
+export const activeSessions = new Map<string, AgentSession>();
+
+export async function getOrCreateSession(
+  taskId: string | undefined,
+  acpCmdArgs: string[],
+  configs: McpServerConfig[],
+  agentrqConfig: McpServerConfig,
+  mcpBridge: MCPBridge,
+): Promise<AgentSession> {
+  const key = taskId || "default";
+  const existing = activeSessions.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const [cmd, ...cmdArgs] = acpCmdArgs;
+  console.error(`[acp] Spawning agent for task ${key}: ${cmd} ${cmdArgs.join(" ")}`);
+
+  const agentProcess = spawn(cmd, cmdArgs, {
+    stdio: ["pipe", "pipe", "inherit"],
+    env: { ...process.env, ...agentrqConfig.env },
+  });
+
+  const input = Writable.toWeb(agentProcess.stdin!);
+  const output = Readable.toWeb(
+    agentProcess.stdout!,
+  ) as ReadableStream<Uint8Array>;
+
+  const acpClient = new AgentRQACPClient(mcpBridge, () => taskId);
+  const stream = acp.ndJsonStream(input, output);
+  const connection = new acp.ClientSideConnection(
+    (_agent) => acpClient,
+    stream,
+  );
+
+  const initResult = await connection.initialize({
+    protocolVersion: acp.PROTOCOL_VERSION,
+    clientCapabilities: {
+      fs: {
+        readTextFile: true,
+        writeTextFile: true,
+      },
+    },
+  });
+
+  console.error(
+    `[acp] Connected to agent for task ${key} (protocol v${initResult.protocolVersion})`,
+  );
+
+  const newSessionParams: AcpNewSessionParams = {
+    cwd: process.cwd(),
+    mcpServers: mapMcpServers(configs),
+  };
+
+  const sessionResult = await connection.newSession(newSessionParams);
+  console.error(`[acp] Created session ${sessionResult.sessionId} for task ${key}`);
+
+  const sessionInfo: AgentSession = {
+    process: agentProcess,
+    connection,
+    acpClient,
+    sessionId: sessionResult.sessionId,
+  };
+  activeSessions.set(key, sessionInfo);
+  return sessionInfo;
+}
+
 type AcpNewSessionParams = Parameters<
   acp.ClientSideConnection["newSession"]
 >[0];
@@ -181,64 +255,7 @@ async function main() {
   const mcpBridge = new MCPBridge(agentrqConfig);
   await mcpBridge.connect();
 
-  // 3. Spawn ACP Agent Subprocess
-  const [cmd, ...cmdArgs] = acpCmdArgs;
-  console.error(`[acp] Spawning agent: ${cmd} ${cmdArgs.join(" ")}`);
-
-  const agentProcess = spawn(cmd, cmdArgs, {
-    stdio: ["pipe", "pipe", "inherit"],
-    env: { ...process.env, ...agentrqConfig.env },
-  });
-
-  const input = Writable.toWeb(agentProcess.stdin!);
-  const output = Readable.toWeb(
-    agentProcess.stdout!,
-  ) as ReadableStream<Uint8Array>;
-
-  // 4. Create ACP Connection
-  // taskIdLookup is filled in after the session switcher is created below.
-  let taskIdLookup: (sessionId: string) => string | undefined = () => undefined;
-  const acpClient = new AgentRQACPClient(mcpBridge, (sid) => taskIdLookup(sid));
-  const stream = acp.ndJsonStream(input, output);
-  const connection = new acp.ClientSideConnection(
-    (_agent) => acpClient,
-    stream,
-  );
-
   try {
-    // 5. Initialize ACP Connection
-    const initResult = await connection.initialize({
-      protocolVersion: acp.PROTOCOL_VERSION,
-      clientCapabilities: {
-        fs: {
-          readTextFile: true,
-          writeTextFile: true,
-        },
-      },
-    });
-
-    console.error(
-      `[acp] Connected to agent (protocol v${initResult.protocolVersion})`,
-    );
-
-    // 6. Create ACP Session
-    // We pass our agentrq MCP server to the agent so it can use our tools directly.
-    // The McpServer object must follow the ACP protocol schema (type, name, url, headers).
-    const newSessionParams: AcpNewSessionParams = {
-      cwd: process.cwd(),
-      mcpServers: mapMcpServers(configs),
-    };
-
-    const sessionResult = await connection.newSession(newSessionParams);
-
-    const sessionSwitcher = createAcpSessionSwitcher(
-      connection,
-      newSessionParams,
-      sessionResult.sessionId,
-    );
-    taskIdLookup = (sid) => sessionSwitcher.getTaskIdForSession(sid);
-    console.error(`[acp] Created session: ${sessionSwitcher.getSessionId()}`);
-
     // Bridge: MCP -> ACP
     // When the MCP server sends a notification to 'notifications/claude/channel',
     // it contains a new task content.
@@ -256,13 +273,19 @@ async function main() {
       );
       taskQueue.run(async () => {
         try {
-          const sessionId = await sessionSwitcher.ensureForTask(taskId);
-          const result = await connection.prompt({
-            sessionId,
+          const sessionInfo = await getOrCreateSession(
+            taskId,
+            acpCmdArgs,
+            configs,
+            agentrqConfig,
+            mcpBridge,
+          );
+          const result = await sessionInfo.connection.prompt({
+            sessionId: sessionInfo.sessionId,
             prompt: [{ type: "text", text: content }],
           });
 
-          await acpClient.flushReply(sessionId);
+          await sessionInfo.acpClient.flushReply(sessionInfo.sessionId);
           console.error(
             `\n[acp] Agent completed task. Reason: ${result.stopReason}`,
           );
@@ -275,14 +298,22 @@ async function main() {
     });
 
     // Initial check for a pending task
-    await checkForNextTask(mcpBridge, connection, sessionSwitcher, acpClient, taskQueue);
+    await checkForNextTask(
+      mcpBridge,
+      acpCmdArgs,
+      configs,
+      agentrqConfig,
+      taskQueue,
+    );
 
     // Keep the process alive
     await new Promise(() => { });
   } catch (error) {
     console.error("[acp-gateway] Error:", error);
   } finally {
-    agentProcess.kill();
+    for (const session of activeSessions.values()) {
+      session.process.kill();
+    }
     await mcpBridge.close();
     process.exit(0);
   }
@@ -294,10 +325,13 @@ async function main() {
  */
 export async function checkForNextTask(
   mcpBridge: MCPBridge,
-  connection: acp.ClientSideConnection,
-  sessionSwitcher: ReturnType<typeof createAcpSessionSwitcher>,
-  acpClient: AgentRQACPClient,
+  acpCmdArgsOrConnection: string[] | acp.ClientSideConnection,
+  configsOrSessionSwitcher: McpServerConfig[] | ReturnType<typeof createAcpSessionSwitcher>,
+  agentrqConfigOrAcpClient: McpServerConfig | AgentRQACPClient,
   taskQueue?: TaskQueue,
+  acpCmdArgs?: string[],
+  configs?: McpServerConfig[],
+  agentrqConfig?: McpServerConfig,
 ) {
   console.error("[bridge] Checking for next task via MCP server...");
   try {
@@ -332,13 +366,49 @@ export async function checkForNextTask(
       );
 
       const runFn = async () => {
-        const sessionId = await sessionSwitcher.ensureForTask(taskId);
-        const promptResult = await connection.prompt({
-          sessionId,
+        let connectionToUse: acp.ClientSideConnection | undefined;
+        let acpClientToUse: AgentRQACPClient | undefined;
+        let sessionIdToUse: string | undefined;
+
+        let actualAcpCmdArgs: string[] = [];
+        let actualConfigs: McpServerConfig[] = [];
+        let actualAgentrqConfig: McpServerConfig | undefined;
+
+        if (Array.isArray(acpCmdArgsOrConnection)) {
+          actualAcpCmdArgs = acpCmdArgsOrConnection;
+          actualConfigs = configsOrSessionSwitcher as McpServerConfig[];
+          actualAgentrqConfig = agentrqConfigOrAcpClient as McpServerConfig;
+        } else {
+          connectionToUse = acpCmdArgsOrConnection as acp.ClientSideConnection;
+          acpClientToUse = agentrqConfigOrAcpClient as AgentRQACPClient;
+          const switcher = configsOrSessionSwitcher as any;
+          if (switcher && typeof switcher.ensureForTask === "function") {
+            sessionIdToUse = await switcher.ensureForTask(taskId);
+          }
+          actualAcpCmdArgs = acpCmdArgs || [];
+          actualConfigs = configs || [];
+          actualAgentrqConfig = agentrqConfig;
+        }
+
+        if (!connectionToUse) {
+          const sessionInfo = await getOrCreateSession(
+            taskId,
+            actualAcpCmdArgs,
+            actualConfigs,
+            actualAgentrqConfig!,
+            mcpBridge,
+          );
+          connectionToUse = sessionInfo.connection;
+          sessionIdToUse = sessionInfo.sessionId;
+          acpClientToUse = sessionInfo.acpClient;
+        }
+
+        const promptResult = await connectionToUse.prompt({
+          sessionId: sessionIdToUse!,
           prompt: [{ type: "text", text }],
         });
 
-        await acpClient.flushReply(sessionId);
+        await acpClientToUse!.flushReply(sessionIdToUse!);
         console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
       };
 
