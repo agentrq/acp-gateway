@@ -73,8 +73,10 @@ export class AgentRQACPClient implements acp.Client {
 
     console.error(`\n🔐 ACP Permission requested: ${toolTitle} (ID: ${requestId})`);
 
+    const taskId = params.sessionId ? this.getTaskIdForSession(params.sessionId) : undefined;
     const payload = {
       request_id: requestId,
+      task_id: taskId,
       tool_name: toolTitle,
       description: toolTitle,
       input_preview: JSON.stringify(params.toolCall.rawInput ?? {}),

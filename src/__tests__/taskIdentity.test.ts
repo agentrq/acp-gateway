@@ -42,6 +42,17 @@ describe("extractTaskIdFromText", () => {
     expect(extractTaskIdFromText("Working on task abc")).toBe("abc");
   });
 
+  it("extracts from ID: keyword and handles Next assigned task format", () => {
+    expect(extractTaskIdFromText("Next assigned task:\nID: 0aleR6CbZBp\nTitle: Some Title")).toBe("0aleR6CbZBp");
+    expect(extractTaskIdFromText("ID: 12345")).toBe("12345");
+  });
+
+  it("extracts from chat_id keyword", () => {
+    expect(extractTaskIdFromText('<channel source="agentrq" chat_id="0aleR6CbZBp">')).toBe("0aleR6CbZBp");
+    expect(extractTaskIdFromText('chat_id: "0aleR6CbZBp"')).toBe("0aleR6CbZBp");
+    expect(extractTaskIdFromText("chat_id 0aleR6CbZBp")).toBe("0aleR6CbZBp");
+  });
+
   it("returns undefined if no match", () => {
     expect(extractTaskIdFromText("Hello world")).toBeUndefined();
     expect(extractTaskIdFromText("")).toBeUndefined();

@@ -50,6 +50,43 @@ describe("AgentRQACPClient", () => {
       expect((response.outcome as any).optionId).toBe("opt-1");
     });
 
+    it("should include task_id in the payload when available", async () => {
+      const getTaskId = vi.fn().mockReturnValue("task-123");
+      const clientWithTaskId = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, getTaskId);
+
+      const params = {
+        sessionId: "sess-1",
+        toolCall: {
+          toolCallId: "req-123",
+          title: "Test Tool",
+          rawInput: { foo: "bar" },
+        },
+        options: [
+          { optionId: "opt-1", kind: "allow", name: "Allow Once" },
+          { optionId: "opt-2", kind: "deny", name: "Deny" },
+        ],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(
+            () => handler({ requestId: "req-123", behavior: "allow" }),
+            10,
+          );
+        }
+      });
+
+      await clientWithTaskId.requestPermission(params);
+      
+      expect(getTaskId).toHaveBeenCalledWith("sess-1");
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/permission_request",
+        expect.objectContaining({
+          task_id: "task-123",
+        })
+      );
+    });
+
     it("should auto-allow tools matching agentrq-<11 chars> pattern in title", async () => {
       const params = {
         toolCall: {
