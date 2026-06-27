@@ -247,7 +247,7 @@ describe("index", () => {
 
       await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
 
-      expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getNextTask");
+      expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getTask");
       expect(mockConnection.prompt).not.toHaveBeenCalled();
     });
 
@@ -259,7 +259,7 @@ describe("index", () => {
 
       await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
 
-      expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getNextTask");
+      expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getTask");
       expect(mockConnection.prompt).not.toHaveBeenCalled();
     });
 
