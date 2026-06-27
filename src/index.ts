@@ -320,7 +320,8 @@ async function main() {
 }
 
 /**
- * Checks for the next pending task using the 'getNextTask' tool on the MCP server.
+ * Checks for the next pending task using the 'getTask' tool on the MCP server.
+ * Called with no taskId, 'getTask' dequeues the next not-started task.
  * If found, sends it to the ACP agent.
  */
 export async function checkForNextTask(
@@ -335,7 +336,7 @@ export async function checkForNextTask(
 ) {
   console.error("[bridge] Checking for next task via MCP server...");
   try {
-    const result = await mcpBridge.callTool("getNextTask");
+    const result = await mcpBridge.callTool("getTask");
 
     if (result.isError) {
       console.error("[mcp] Error getting next task:", result.content);
