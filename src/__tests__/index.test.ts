@@ -16,6 +16,7 @@ vi.mock("node:child_process", () => {
       stdin: new Writable({ write(chunk, encoding, callback) { callback(); } }),
       stdout: new Readable({ read() { this.push(null); } }),
       kill: vi.fn(),
+      on: vi.fn(),
     }),
   };
 });
