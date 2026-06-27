@@ -50,6 +50,34 @@ describe("AgentRQACPClient", () => {
       expect((response.outcome as any).optionId).toBe("opt-1");
     });
 
+    it("should cancel (not throw) when sendNotification rejects, e.g. on network outage", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mcpBridge.sendNotification.mockRejectedValue(
+        new Error("MCP not connected after 10s timeout"),
+      );
+
+      const params = {
+        toolCall: {
+          toolCallId: "req-123",
+          title: "Test Tool",
+          rawInput: { foo: "bar" },
+        },
+        options: [
+          { optionId: "opt-1", kind: "allow", name: "Allow Once" },
+          { optionId: "opt-2", kind: "deny", name: "Deny" },
+        ],
+      } as any;
+
+      // Must resolve with a cancelled outcome rather than reject — a rejection
+      // here would surface as an unhandled rejection and crash the gateway.
+      const response = await client.requestPermission(params);
+      expect(response.outcome.outcome).toBe("cancelled");
+      // It must not register a verdict listener it can never clean up.
+      expect(mcpBridge.on).not.toHaveBeenCalled();
+
+      consoleSpy.mockRestore();
+    });
+
     it("should include task_id in the payload when available", async () => {
       const getTaskId = vi.fn().mockReturnValue("task-123");
       const clientWithTaskId = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, getTaskId);

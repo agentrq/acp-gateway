@@ -85,10 +85,23 @@ export class AgentRQACPClient implements acp.Client {
     console.error(`[acp] Sending permission request notification:`, JSON.stringify(payload, null, 2));
 
     // 1. Forward the permission request to the MCP server as a notification.
-    await this.mcpBridge.sendNotification(
-      "notifications/claude/channel/permission_request",
-      payload
-    );
+    //    If the MCP transport is down (e.g. network outage), sendNotification
+    //    rejects. Swallow it here so the rejection doesn't bubble up as an
+    //    unhandled promise rejection and crash the process — instead cancel
+    //    this permission request and let the transport reconnect in the
+    //    background. The agent receives a clean "cancelled" outcome.
+    try {
+      await this.mcpBridge.sendNotification(
+        "notifications/claude/channel/permission_request",
+        payload
+      );
+    } catch (err) {
+      console.error(
+        `[acp] Failed to forward permission request ${requestId} (cancelling):`,
+        err
+      );
+      return { outcome: { outcome: "cancelled" } };
+    }
 
     // 2. Wait for the verdict from the MCP server
     console.error(`⌛ Waiting for human approval in the agentrq dashboard...`);

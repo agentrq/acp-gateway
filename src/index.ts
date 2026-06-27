@@ -74,6 +74,25 @@ export async function getOrCreateSession(
     env: { ...process.env, ...agentrqConfig.env },
   });
 
+  // Guard against unhandled child-process failures. Without these listeners a
+  // crashed agent (e.g. on network loss) leaves a broken stdin pipe; the next
+  // write raises EPIPE as an uncaught error and takes the gateway down with it.
+  agentProcess.on("error", (err: Error) => {
+    console.error(`[acp] Agent process error for task ${key}:`, err.message);
+    activeSessions.delete(key);
+  });
+  agentProcess.on("exit", (code: number | null, signal: string | null) => {
+    console.error(
+      `[acp] Agent process for task ${key} exited (code=${code}, signal=${signal})`,
+    );
+    activeSessions.delete(key);
+  });
+  // stdin can emit EPIPE when the child dies mid-write; swallow it so it
+  // doesn't surface as an uncaught exception.
+  agentProcess.stdin?.on("error", (err: Error) => {
+    console.error(`[acp] Agent stdin error for task ${key}:`, err.message);
+  });
+
   const input = Writable.toWeb(agentProcess.stdin!);
   const output = Readable.toWeb(
     agentProcess.stdout!,
@@ -427,6 +446,19 @@ export async function checkForNextTask(
 }
 
 if (process.env.NODE_ENV !== "test") {
+  // Keep the gateway alive across transient failures. The MCP transport has its
+  // own reconnect logic (mcpClient.ts), so a stray rejected promise or async
+  // error from a dropped connection should be logged, not fatal. Without these
+  // nets, Node terminates the process on the first unhandled rejection.
+  process.on("unhandledRejection", (reason) => {
+    console.error("[acp-gateway] Unhandled promise rejection (continuing):", reason);
+  });
+  process.on("uncaughtException", (err) => {
+    console.error("[acp-gateway] Uncaught exception (continuing):", err);
+  });
+
+  // A rejection from main() itself means startup failed before the bridge was
+  // established — that is genuinely fatal, so exit.
   main().catch((err) => {
     console.error("[fatal]", err);
     process.exit(1);
