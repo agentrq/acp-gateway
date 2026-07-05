@@ -61,11 +61,11 @@ export class MCPBridge extends EventEmitter {
     if (this.transport) {
       this.transport.onclose = undefined;
       this.transport.onerror = undefined;
-      await this.transport.close().catch(() => {});
+      await this.transport.close().catch(() => { });
       this.transport = null;
     }
     if (this.client) {
-      await this.client.close().catch(() => {});
+      await this.client.close().catch(() => { });
       this.client = null;
     }
 
@@ -84,7 +84,7 @@ export class MCPBridge extends EventEmitter {
     this.client = new Client(
       {
         name: "acp-gateway",
-        version: "0.1.23",
+        version: "0.1.26",
       },
       {
         capabilities: {},
@@ -101,14 +101,14 @@ export class MCPBridge extends EventEmitter {
     this.transport.onerror = (error) => {
       const msg = error?.message || String(error);
       console.error(`[mcp] Transport error:`, msg);
-      
+
       if (msg.includes("Failed to reconnect SSE stream") || msg.includes("Not Found")) {
         console.error(`[mcp] Unrecoverable transport error, forcing new connection...`);
         this.isConnected = false;
         if (this.transport) {
           this.transport.onclose = undefined;
           this.transport.onerror = undefined;
-          this.transport.close().catch(() => {});
+          this.transport.close().catch(() => { });
         }
         this.connect();
       }
@@ -194,11 +194,11 @@ export class MCPBridge extends EventEmitter {
     if (this.transport) {
       this.transport.onclose = undefined;
       this.transport.onerror = undefined;
-      await this.transport.close().catch(() => {});
+      await this.transport.close().catch(() => { });
       this.transport = null;
     }
     if (this.client) {
-      await this.client.close().catch(() => {});
+      await this.client.close().catch(() => { });
       this.client = null;
     }
   }
