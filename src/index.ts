@@ -112,6 +112,10 @@ export async function getOrCreateSession(
         readTextFile: true,
         writeTextFile: true,
       },
+      elicitation: {
+        form: {},
+        url: {},
+      },
     },
   });
 

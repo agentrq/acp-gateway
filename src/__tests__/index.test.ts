@@ -413,5 +413,21 @@ describe("index", () => {
 
       expect(session1).toBe(session2);
     });
+
+    it("should declare elicitation support when initializing the ACP connection", async () => {
+      const mockBridge: any = {};
+      const configs: any[] = [];
+      const agentrqConfig: any = { env: {} };
+
+      const session = await getOrCreateSession("T-Elicit", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
+
+      expect(session.connection.initialize).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clientCapabilities: expect.objectContaining({
+            elicitation: { form: {}, url: {} },
+          }),
+        }),
+      );
+    });
   });
 });
