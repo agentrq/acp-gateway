@@ -185,11 +185,18 @@ export class AgentRQACPClient implements acp.Client {
     params: acp.CreateElicitationRequest
   ): Promise<acp.CreateElicitationResponse> {
     const sessionId = "sessionId" in params ? (params.sessionId as string) : undefined;
-    const taskId = sessionId ? this.getTaskIdForSession(sessionId) : undefined;
+    let taskId = sessionId ? this.getTaskIdForSession(sessionId) : undefined;
 
     if (!taskId) {
-      console.error(`[acp] Elicitation request has no associated task, cancelling`);
-      return { action: "cancel" };
+      // Request-scoped elicitations (e.g. during an auth/config phase before
+      // any session exists) have no task to attach to, but the elicit tool
+      // requires one — create one for the human to answer instead of
+      // cancelling outright.
+      taskId = await this.createTaskForElicitation(params.message);
+      if (!taskId) {
+        console.error(`[acp] Elicitation request has no associated task and task creation failed, cancelling`);
+        return { action: "cancel" };
+      }
     }
 
     const toolArgs: Record<string, unknown> = {
@@ -232,6 +239,34 @@ export class AgentRQACPClient implements acp.Client {
     } catch (err) {
       console.error(`[acp] Failed to process elicitation request:`, err);
       return { action: "cancel" };
+    }
+  }
+
+  /**
+   * Creates a new AgentRQ task for a session-less elicitation and marks it
+   * ongoing, so the elicit tool call has somewhere to post the question and
+   * the human sees it show up as an active task rather than a stray message.
+   * Returns the new task's base62 ID, or undefined if creation failed.
+   */
+  private async createTaskForElicitation(message: string): Promise<string | undefined> {
+    try {
+      const created = await this.mcpBridge.callTool("createTask", {
+        title: message.length > 80 ? `${message.slice(0, 77)}...` : message,
+        body: message,
+        assignee: "human",
+      });
+      const text = (created.content as Array<{ type: string; text?: string }> | undefined)?.[0]?.text;
+      const taskId = text?.match(/id=(\S+)/)?.[1];
+      if (!taskId) {
+        console.error(`[acp] Could not parse task ID from createTask response: ${text ?? "<empty>"}`);
+        return undefined;
+      }
+
+      await this.mcpBridge.callTool("updateTaskStatus", { taskId, status: "ongoing" });
+      return taskId;
+    } catch (err) {
+      console.error(`[acp] Failed to create task for elicitation:`, err);
+      return undefined;
     }
   }
 

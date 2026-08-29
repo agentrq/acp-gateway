@@ -354,17 +354,81 @@ describe("AgentRQACPClient", () => {
       expect(await clientWithTaskId.createElicitation(params)).toEqual({ action: "cancel" });
     });
 
-    it("should cancel when there is no task associated with the session", async () => {
+    it("should create and start a task when there is no associated task, then delegate to it", async () => {
       const params = {
-        sessionId: "sess-1",
         mode: "form",
-        message: "Name?",
+        message: "Please provide your workspace name to continue setup.",
         requestedSchema: { type: "object", properties: { name: { type: "string" } } },
       } as any;
 
+      mcpBridge.callTool.mockImplementation(async (name: string) => {
+        if (name === "createTask") {
+          return { content: [{ type: "text", text: "task created with id=T-new123" }] };
+        }
+        if (name === "updateTaskStatus") {
+          return { content: [{ type: "text", text: "ok" }] };
+        }
+        if (name === "elicit") {
+          return { content: [{ type: "text", text: JSON.stringify({ action: "accept", content: { name: "acme" } }) }] };
+        }
+        throw new Error(`unexpected tool ${name}`);
+      });
+
       const response = await client.createElicitation(params);
 
-      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+      expect(mcpBridge.callTool).toHaveBeenNthCalledWith(1, "createTask", {
+        title: params.message,
+        body: params.message,
+        assignee: "human",
+      });
+      expect(mcpBridge.callTool).toHaveBeenNthCalledWith(2, "updateTaskStatus", {
+        taskId: "T-new123",
+        status: "ongoing",
+      });
+      expect(mcpBridge.callTool).toHaveBeenNthCalledWith(3, "elicit", {
+        taskId: "T-new123",
+        message: params.message,
+        mode: "form",
+        requestedSchema: params.requestedSchema,
+      });
+      expect(response).toEqual({ action: "accept", content: { name: "acme" } });
+    });
+
+    it("should truncate long messages for the created task's title", async () => {
+      const longMessage = "x".repeat(120);
+      const params = { mode: "form", message: longMessage, requestedSchema: { type: "object", properties: {} } } as any;
+
+      mcpBridge.callTool.mockImplementation(async (name: string) => {
+        if (name === "createTask") return { content: [{ type: "text", text: "task created with id=T-1" }] };
+        if (name === "updateTaskStatus") return { content: [{ type: "text", text: "ok" }] };
+        return { content: [{ type: "text", text: JSON.stringify({ action: "cancel" }) }] };
+      });
+
+      await client.createElicitation(params);
+
+      const [, createTaskArgs] = mcpBridge.callTool.mock.calls[0];
+      expect(createTaskArgs.title).toBe(`${"x".repeat(77)}...`);
+      expect(createTaskArgs.title.length).toBe(80);
+      expect(createTaskArgs.body).toBe(longMessage);
+    });
+
+    it("should cancel when the created task's ID cannot be parsed", async () => {
+      const params = { sessionId: undefined, mode: "form", message: "Name?", requestedSchema: {} } as any;
+      mcpBridge.callTool.mockResolvedValue({ content: [{ type: "text", text: "something went wrong" }] });
+
+      const response = await client.createElicitation(params);
+
+      expect(mcpBridge.callTool).toHaveBeenCalledTimes(1);
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("createTask", expect.any(Object));
+      expect(response).toEqual({ action: "cancel" });
+    });
+
+    it("should cancel when task creation throws", async () => {
+      const params = { mode: "form", message: "Name?", requestedSchema: {} } as any;
+      mcpBridge.callTool.mockRejectedValue(new Error("MCP not connected"));
+
+      const response = await client.createElicitation(params);
+
       expect(response).toEqual({ action: "cancel" });
     });
 
