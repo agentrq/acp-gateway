@@ -17,6 +17,7 @@ describe("AgentRQACPClient", () => {
     mcpBridge = {
       getSessionId: vi.fn().mockReturnValue("test-session"),
       sendNotification: vi.fn().mockResolvedValue(undefined),
+      callTool: vi.fn(),
       on: vi.fn(),
       off: vi.fn(),
     };
@@ -274,6 +275,152 @@ describe("AgentRQACPClient", () => {
 
       const response = await client.requestPermission(params);
       expect((response.outcome as any).optionId).toBe("opt-default");
+    });
+  });
+
+  describe("createElicitation", () => {
+    it("should delegate form mode to the elicit tool and return an accept result", async () => {
+      const getTaskId = vi.fn().mockReturnValue("task-123");
+      const clientWithTaskId = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, getTaskId);
+
+      mcpBridge.callTool.mockResolvedValue({
+        content: [{ type: "text", text: JSON.stringify({ action: "accept", content: { strategy: "balanced" } }) }],
+      });
+
+      const params = {
+        sessionId: "sess-1",
+        mode: "form",
+        message: "How should I proceed?",
+        requestedSchema: { type: "object", properties: { strategy: { type: "string" } } },
+      } as any;
+
+      const response = await clientWithTaskId.createElicitation(params);
+
+      expect(getTaskId).toHaveBeenCalledWith("sess-1");
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("elicit", {
+        taskId: "task-123",
+        message: "How should I proceed?",
+        mode: "form",
+        requestedSchema: params.requestedSchema,
+      });
+      expect(response).toEqual({ action: "accept", content: { strategy: "balanced" } });
+    });
+
+    it("should delegate url mode to the elicit tool", async () => {
+      const getTaskId = vi.fn().mockReturnValue("task-123");
+      const clientWithTaskId = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, getTaskId);
+
+      mcpBridge.callTool.mockResolvedValue({
+        content: [{ type: "text", text: JSON.stringify({ action: "accept" }) }],
+      });
+
+      const params = {
+        sessionId: "sess-1",
+        mode: "url",
+        elicitationId: "oauth-1",
+        url: "https://example.com/connect",
+        message: "Please authorize access.",
+      } as any;
+
+      const response = await clientWithTaskId.createElicitation(params);
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("elicit", {
+        taskId: "task-123",
+        message: "Please authorize access.",
+        mode: "url",
+        url: "https://example.com/connect",
+      });
+      expect(response).toEqual({ action: "accept" });
+    });
+
+    it("should map decline and cancel actions through", async () => {
+      const getTaskId = vi.fn().mockReturnValue("task-123");
+      const clientWithTaskId = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, getTaskId);
+      const params = {
+        sessionId: "sess-1",
+        mode: "form",
+        message: "Name?",
+        requestedSchema: { type: "object", properties: { name: { type: "string" } } },
+      } as any;
+
+      mcpBridge.callTool.mockResolvedValueOnce({
+        content: [{ type: "text", text: JSON.stringify({ action: "decline" }) }],
+      });
+      expect(await clientWithTaskId.createElicitation(params)).toEqual({ action: "decline" });
+
+      mcpBridge.callTool.mockResolvedValueOnce({
+        content: [{ type: "text", text: JSON.stringify({ action: "cancel" }) }],
+      });
+      expect(await clientWithTaskId.createElicitation(params)).toEqual({ action: "cancel" });
+    });
+
+    it("should cancel when there is no task associated with the session", async () => {
+      const params = {
+        sessionId: "sess-1",
+        mode: "form",
+        message: "Name?",
+        requestedSchema: { type: "object", properties: { name: { type: "string" } } },
+      } as any;
+
+      const response = await client.createElicitation(params);
+
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+      expect(response).toEqual({ action: "cancel" });
+    });
+
+    it("should cancel for an unsupported elicitation mode", async () => {
+      const getTaskId = vi.fn().mockReturnValue("task-123");
+      const clientWithTaskId = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, getTaskId);
+      const params = { sessionId: "sess-1", mode: "_custom", message: "?" } as any;
+
+      const response = await clientWithTaskId.createElicitation(params);
+
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+      expect(response).toEqual({ action: "cancel" });
+    });
+
+    it("should cancel when the elicit tool call errors", async () => {
+      const getTaskId = vi.fn().mockReturnValue("task-123");
+      const clientWithTaskId = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, getTaskId);
+      const params = {
+        sessionId: "sess-1",
+        mode: "form",
+        message: "Name?",
+        requestedSchema: { type: "object", properties: { name: { type: "string" } } },
+      } as any;
+
+      mcpBridge.callTool.mockResolvedValue({
+        isError: true,
+        content: [{ type: "text", text: "taskId and message are required" }],
+      });
+
+      const response = await clientWithTaskId.createElicitation(params);
+      expect(response).toEqual({ action: "cancel" });
+    });
+
+    it("should cancel when the elicit tool call throws", async () => {
+      const getTaskId = vi.fn().mockReturnValue("task-123");
+      const clientWithTaskId = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, getTaskId);
+      const params = {
+        sessionId: "sess-1",
+        mode: "form",
+        message: "Name?",
+        requestedSchema: { type: "object", properties: { name: { type: "string" } } },
+      } as any;
+
+      mcpBridge.callTool.mockRejectedValue(new Error("MCP not connected"));
+
+      const response = await clientWithTaskId.createElicitation(params);
+      expect(response).toEqual({ action: "cancel" });
+    });
+  });
+
+  describe("completeElicitation", () => {
+    it("should resolve without side effects", async () => {
+      await expect(
+        client.completeElicitation({ elicitationId: "oauth-1" } as any)
+      ).resolves.toBeUndefined();
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
     });
   });
 

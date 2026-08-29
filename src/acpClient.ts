@@ -173,6 +173,78 @@ export class AgentRQACPClient implements acp.Client {
     }
   }
 
+  /**
+   * Handles the agent's elicitation/create requests by delegating to
+   * AgentRQ's `elicit` MCP tool, which blocks in the chat until the human
+   * answers (or times out). AgentRQ's tool already waits for the human to
+   * confirm in url mode too — collapsing ACP's "accept now, complete
+   * later" url flow into a single round trip — so the response here already
+   * reflects completion; see completeElicitation below.
+   */
+  async createElicitation(
+    params: acp.CreateElicitationRequest
+  ): Promise<acp.CreateElicitationResponse> {
+    const sessionId = "sessionId" in params ? (params.sessionId as string) : undefined;
+    const taskId = sessionId ? this.getTaskIdForSession(sessionId) : undefined;
+
+    if (!taskId) {
+      console.error(`[acp] Elicitation request has no associated task, cancelling`);
+      return { action: "cancel" };
+    }
+
+    const toolArgs: Record<string, unknown> = {
+      taskId,
+      message: params.message,
+      mode: params.mode,
+    };
+    if (params.mode === "form") {
+      toolArgs.requestedSchema = (params as acp.ElicitationFormMode).requestedSchema;
+    } else if (params.mode === "url") {
+      toolArgs.url = (params as acp.ElicitationUrlMode).url;
+    } else {
+      console.error(`[acp] Unsupported elicitation mode "${params.mode}", cancelling`);
+      return { action: "cancel" };
+    }
+
+    console.error(`[acp] Elicitation requested (mode=${params.mode}): ${params.message}`);
+
+    try {
+      const result = await this.mcpBridge.callTool("elicit", toolArgs);
+      const contentBlock = result.content as Array<{ type: string; text?: string }> | undefined;
+      const text = contentBlock?.[0]?.text;
+      if (!text) {
+        console.error(`[acp] Elicit tool returned no content, cancelling`);
+        return { action: "cancel" };
+      }
+      if (result.isError) {
+        console.error(`[acp] Elicit tool call failed: ${text}`);
+        return { action: "cancel" };
+      }
+
+      const parsed = JSON.parse(text) as { action: string; content?: Record<string, unknown> };
+      if (parsed.action === "accept") {
+        return { action: "accept", content: parsed.content };
+      }
+      if (parsed.action === "decline") {
+        return { action: "decline" };
+      }
+      return { action: "cancel" };
+    } catch (err) {
+      console.error(`[acp] Failed to process elicitation request:`, err);
+      return { action: "cancel" };
+    }
+  }
+
+  /**
+   * Called when the agent reports a url-mode elicitation as complete.
+   * AgentRQ's elicit tool already blocks until the human confirms, so our
+   * createElicitation response has already reflected completion by the time
+   * this notification (if any) arrives — matching the spec's requirement
+   * that clients ignore completion notices for elicitations they don't
+   * still consider pending.
+   */
+  async completeElicitation(_params: acp.CompleteElicitationNotification): Promise<void> {}
+
   async writeTextFile(
     params: acp.WriteTextFileRequest
   ): Promise<acp.WriteTextFileResponse> {
