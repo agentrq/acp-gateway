@@ -17,19 +17,24 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
-      
+
+      # Trusted publishing (OIDC) requires npm CLI >= 11.5.1; Node 20 ships an
+      # older bundled npm, so upgrade it before the publish step runs.
+      - name: Update npm
+        run: npm install -g npm@latest
+
       - name: Install dependencies
         run: npm ci
-      
+
       - name: Run typecheck
         run: npm run typecheck
-      
+
       - name: Run tests
         run: npm test
-      
+
       - name: Build
         run: npm run build
-      
+
       - name: Publish to npm
         run: |
           PACKAGE_NAME=$(node -p "require('./package.json').name")
@@ -39,5 +44,3 @@ jobs:
           else
             npm publish --provenance --access public
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
