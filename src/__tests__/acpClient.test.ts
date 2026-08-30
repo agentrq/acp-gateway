@@ -192,6 +192,296 @@ describe("AgentRQACPClient", () => {
       consoleSpy.mockRestore();
     });
 
+    // codex-acp emits a `tool_call` session update naming the MCP tool, then
+    // requests permission for that same toolCallId with no title and no
+    // rawInput. Without correlating the two, agentrq's own calls reach the
+    // human as "Unknown Tool" instead of being auto-allowed.
+    it("should auto-allow an agentrq MCP call whose permission request carries no title", async () => {
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_QDSxAGK3Qagv",
+          title: "mcp.agentrq-0cHiaZsOGMj.updateTaskStatus",
+          status: "pending",
+          rawInput: { server: "agentrq-0cHiaZsOGMj", tool: "updateTaskStatus", arguments: {} },
+        },
+      } as any);
+
+      const params = {
+        sessionId: "sess-1",
+        toolCall: { toolCallId: "call_QDSxAGK3Qagv", kind: "execute", status: "pending" },
+        options: [
+          { optionId: "opt-1", kind: "allow_once", name: "Allow" },
+          { optionId: "opt-2", kind: "reject_once", name: "Reject" },
+        ],
+      } as any;
+
+      const response = await client.requestPermission(params);
+
+      expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
+      expect((response.outcome as any).optionId).toBe("opt-1");
+    });
+
+    it("should recover the title and input from an earlier tool_call_update", async () => {
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_abc",
+          title: "mcp.other-server.doThing",
+          status: "pending",
+          rawInput: { server: "other-server", tool: "doThing" },
+        },
+      } as any);
+
+      const params = {
+        sessionId: "sess-1",
+        toolCall: { toolCallId: "call_abc", kind: "execute", status: "pending" },
+        options: [
+          { optionId: "opt-1", kind: "allow_once", name: "Allow" },
+          { optionId: "opt-2", kind: "reject_once", name: "Reject" },
+        ],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(() => handler({ requestId: "call_abc", behavior: "allow" }), 10);
+        }
+      });
+
+      await client.requestPermission(params);
+
+      // A non-agentrq tool still goes to the human, but now with a meaningful
+      // name and input rather than "Unknown Tool" / "{}".
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          tool_name: "mcp.other-server.doThing",
+          input_preview: JSON.stringify({ server: "other-server", tool: "doThing" }),
+        }),
+      );
+    });
+
+    it("should prefer the permission request's own title over the remembered one", async () => {
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_cmd",
+          title: "stale title",
+          status: "pending",
+          rawInput: { command: "stale" },
+        },
+      } as any);
+
+      const params = {
+        sessionId: "sess-1",
+        toolCall: {
+          toolCallId: "call_cmd",
+          title: "Run command",
+          rawInput: { command: "rm index" },
+        },
+        options: [
+          { optionId: "opt-1", kind: "allow_once", name: "Allow" },
+          { optionId: "opt-2", kind: "reject_once", name: "Reject" },
+        ],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(() => handler({ requestId: "call_cmd", behavior: "allow" }), 10);
+        }
+      });
+
+      await client.requestPermission(params);
+
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          tool_name: "Run command",
+          input_preview: JSON.stringify({ command: "rm index" }),
+        }),
+      );
+    });
+
+    it("should still report Unknown Tool when nothing was ever recorded", async () => {
+      const params = {
+        sessionId: "sess-1",
+        toolCall: { toolCallId: "call_unseen", kind: "execute", status: "pending" },
+        options: [
+          { optionId: "opt-1", kind: "allow_once", name: "Allow" },
+          { optionId: "opt-2", kind: "reject_once", name: "Reject" },
+        ],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(() => handler({ requestId: "call_unseen", behavior: "allow" }), 10);
+        }
+      });
+
+      await client.requestPermission(params);
+
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ tool_name: "Unknown Tool", input_preview: "{}" }),
+      );
+    });
+
+    it("should forget a tool call once it has completed, so the map does not grow unbounded", async () => {
+      const record = { sessionId: "sess-1", toolCallId: "call_done", title: "mcp.agentrq-0cHiaZsOGMj.reply" };
+
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: { ...record, sessionUpdate: "tool_call", status: "pending" },
+      } as any);
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: { ...record, sessionUpdate: "tool_call_update", status: "completed" },
+      } as any);
+
+      const params = {
+        sessionId: "sess-1",
+        toolCall: { toolCallId: "call_done", kind: "execute", status: "pending" },
+        options: [
+          { optionId: "opt-1", kind: "allow_once", name: "Allow" },
+          { optionId: "opt-2", kind: "reject_once", name: "Reject" },
+        ],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(() => handler({ requestId: "call_done", behavior: "allow" }), 10);
+        }
+      });
+
+      await client.requestPermission(params);
+
+      // Entry was dropped on completion, so it is no longer auto-allowed by
+      // the remembered title — it goes to the human as an unknown tool.
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ tool_name: "Unknown Tool" }),
+      );
+    });
+
+    it("should not retain details for a consumed permission request", async () => {
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_once",
+          title: "mcp.agentrq-0cHiaZsOGMj.reply",
+          status: "pending",
+        },
+      } as any);
+
+      const params = {
+        sessionId: "sess-1",
+        toolCall: { toolCallId: "call_once", kind: "execute", status: "pending" },
+        options: [
+          { optionId: "opt-1", kind: "allow_once", name: "Allow" },
+          { optionId: "opt-2", kind: "reject_once", name: "Reject" },
+        ],
+      } as any;
+
+      // First request is auto-allowed from the remembered agentrq title.
+      const first = await client.requestPermission(params);
+      expect((first.outcome as any).optionId).toBe("opt-1");
+      expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
+
+      // A replay of the same id no longer resolves, so it reaches the human.
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(() => handler({ requestId: "call_once", behavior: "allow" }), 10);
+        }
+      });
+      await client.requestPermission(params);
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ tool_name: "Unknown Tool" }),
+      );
+    });
+
+    // codex-acp follows an accepted MCP approval with a bare
+    // {toolCallId, status: "in_progress"} update carrying no title.
+    it("should retain a known title when a later update omits it", async () => {
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call_keep",
+          title: "mcp.agentrq-0cHiaZsOGMj.reply",
+          status: "pending",
+        },
+      } as any);
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_keep",
+          status: "in_progress",
+        },
+      } as any);
+
+      const params = {
+        sessionId: "sess-1",
+        toolCall: { toolCallId: "call_keep", kind: "execute", status: "pending" },
+        options: [
+          { optionId: "opt-1", kind: "allow_once", name: "Allow" },
+          { optionId: "opt-2", kind: "reject_once", name: "Reject" },
+        ],
+      } as any;
+
+      const response = await client.requestPermission(params);
+
+      expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
+      expect((response.outcome as any).optionId).toBe("opt-1");
+    });
+
+    it("should record nothing for an update with neither title nor input", async () => {
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_bare",
+          status: "in_progress",
+        },
+      } as any);
+
+      const params = {
+        sessionId: "sess-1",
+        toolCall: { toolCallId: "call_bare", kind: "execute", status: "pending" },
+        options: [
+          { optionId: "opt-1", kind: "allow_once", name: "Allow" },
+          { optionId: "opt-2", kind: "reject_once", name: "Reject" },
+        ],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(() => handler({ requestId: "call_bare", behavior: "allow" }), 10);
+        }
+      });
+
+      await client.requestPermission(params);
+
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ tool_name: "Unknown Tool", input_preview: "{}" }),
+      );
+    });
+
+    it("should ignore session updates that carry no tool call id", async () => {
+      await expect(
+        client.sessionUpdate({
+          sessionId: "sess-1",
+          update: { sessionUpdate: "tool_call_update", title: "no id here" },
+        } as any),
+      ).resolves.toBeUndefined();
+    });
+
     it("should match options with 'yes' or 'approve'", async () => {
       const params = {
         toolCall: { toolCallId: "req-123" },
