@@ -10,10 +10,18 @@ import type { MCPBridge } from "./mcpClient.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
+/** Identifies a tool call routed through an agentrq MCP server. */
+const AGENTRQ_TOOL_PATTERN = /agentrq-[a-zA-Z0-9]{11}/;
+
 export class AgentRQACPClient implements acp.Client {
   private replyBuffers = new Map<string, string>();
   // chatId → text sent by the agent via the reply MCP tool (for dedup in flushReply)
   private agentReplies = new Map<string, string>();
+  // toolCallId → details seen on session updates. A `tool_call` update always
+  // carries a title, but the permission request for that same call may omit it
+  // (ACP marks it optional there, and codex-acp sends it bare), which would
+  // otherwise leave us unable to tell an agentrq MCP call from anything else.
+  private toolCallDetails = new Map<string, { title?: string; rawInput?: unknown }>();
 
   constructor(
     private mcpBridge: MCPBridge,
@@ -50,11 +58,15 @@ export class AgentRQACPClient implements acp.Client {
     params: acp.RequestPermissionRequest
   ): Promise<acp.RequestPermissionResponse> {
     const requestId = params.toolCall.toolCallId;
-    const toolTitle = params.toolCall.title ?? "Unknown Tool";
+    // Fall back to what the earlier session update reported for this same tool
+    // call: the permission request itself may carry no title or input.
+    const remembered = this.toolCallDetails.get(requestId);
+    this.toolCallDetails.delete(requestId);
+    const toolTitle = params.toolCall.title ?? remembered?.title ?? "Unknown Tool";
+    const rawInput = params.toolCall.rawInput ?? remembered?.rawInput;
 
     // Auto-allow tool calls that contain the pattern: agentrq-<11 chars a-zA-Z0-9>
-    const agentrqToolPattern = /agentrq-[a-zA-Z0-9]{11}/;
-    if (agentrqToolPattern.test(toolTitle)) {
+    if (AGENTRQ_TOOL_PATTERN.test(toolTitle)) {
       console.error(`\n🔓 ACP Auto-allowing tool call: ${toolTitle} (ID: ${requestId})`);
       const option = params.options.find(o => 
         o.kind.startsWith("allow") ||
@@ -79,7 +91,7 @@ export class AgentRQACPClient implements acp.Client {
       task_id: taskId,
       tool_name: toolTitle,
       description: toolTitle,
-      input_preview: JSON.stringify(params.toolCall.rawInput ?? {}),
+      input_preview: JSON.stringify(rawInput ?? {}),
     };
     console.error(`[acp] Bridge Session ID: ${this.mcpBridge.getSessionId() ?? "unknown"}`);
     console.error(`[acp] Sending permission request notification:`, JSON.stringify(payload, null, 2));
@@ -170,6 +182,37 @@ export class AgentRQACPClient implements acp.Client {
     });
   }
 
+  /**
+   * Records what a tool call is, keyed by its id, so that a permission request
+   * arriving without a title or input can still be identified. ACP requires a
+   * title on the `tool_call` session update but leaves it optional on the
+   * permission request for that same call — codex-acp sends the request bare,
+   * which previously surfaced agentrq's own MCP calls to the human as
+   * "Unknown Tool" instead of being auto-allowed.
+   */
+  private rememberToolCall(update: {
+    toolCallId?: string;
+    title?: string | null;
+    rawInput?: unknown;
+    status?: string | null;
+  }): void {
+    const id = update.toolCallId;
+    if (!id) return;
+
+    // A finished call will never ask for permission, so drop what we kept
+    // rather than growing the map for the lifetime of the session.
+    if (update.status === "completed" || update.status === "failed") {
+      this.toolCallDetails.delete(id);
+      return;
+    }
+
+    const previous = this.toolCallDetails.get(id);
+    const title = update.title ?? previous?.title;
+    const rawInput = update.rawInput ?? previous?.rawInput;
+    if (title === undefined && rawInput === undefined) return;
+    this.toolCallDetails.set(id, { title, rawInput });
+  }
+
   async sessionUpdate(params: acp.SessionNotification): Promise<void> {
     const update = params.update;
 
@@ -181,9 +224,12 @@ export class AgentRQACPClient implements acp.Client {
           this.replyBuffers.set(sid, (this.replyBuffers.get(sid) ?? "") + update.content.text);
         }
         break;
+      case "tool_call_update":
+        this.rememberToolCall(update);
+        break;
       case "tool_call": {
-        const agentrqToolPattern = /agentrq-[a-zA-Z0-9]{11}/;
-        if (update.title && agentrqToolPattern.test(update.title)) {
+        this.rememberToolCall(update);
+        if (update.title && AGENTRQ_TOOL_PATTERN.test(update.title)) {
           // Track completed reply calls so flushReply can skip exact duplicates
           if (
             update.status === "completed" &&
