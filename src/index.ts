@@ -131,6 +131,8 @@ export async function getOrCreateSession(
   const sessionResult = await connection.newSession(newSessionParams);
   console.error(`[acp] Created session ${sessionResult.sessionId} for task ${key}`);
 
+  await enforceHumanApprovalMode(connection, sessionResult);
+
   const sessionInfo: AgentSession = {
     process: agentProcess,
     connection,
@@ -144,6 +146,78 @@ export async function getOrCreateSession(
 type AcpNewSessionParams = Parameters<
   acp.ClientSideConnection["newSession"]
 >[0];
+
+// Modes that approve tool calls without asking the user. codex-acp, for
+// example, defaults to an "agent" mode whose reviewer is "auto_review" — an
+// automated Guardian Review that approves on the human's behalf — and also
+// offers an "agent-full-access" mode that never asks at all.
+const AUTO_APPROVING_MODE = /auto|full[\s_-]?access|danger|bypass|yolo|never|always/i;
+// Modes that defer the decision to the human.
+const HUMAN_APPROVAL_MODE = /ask|approval|approve|manual|prompt|review|read[\s_-]?only/i;
+
+function describeMode(mode: acp.SessionMode): string {
+  const kind = (mode._meta as { kind?: unknown } | null | undefined)?.kind;
+  return `${mode.id} ${mode.name} ${typeof kind === "string" ? kind : ""}`;
+}
+
+/**
+ * Picks the session mode that routes every tool-call approval to the human.
+ *
+ * Agents may offer modes that approve on the user's behalf and commonly
+ * default to one. In such a mode the agent never sends a permission request,
+ * so tool calls — including destructive ones — execute without ever reaching
+ * agentrq. Returns the id of a mode that defers to the human, or undefined if
+ * the agent offers none.
+ */
+export function pickHumanApprovalMode(
+  modes: acp.SessionModeState | null | undefined,
+): string | undefined {
+  const available = modes?.availableModes;
+  if (!available?.length) return undefined;
+
+  const candidates = available.filter((m) => !AUTO_APPROVING_MODE.test(describeMode(m)));
+  const chosen =
+    candidates.find((m) => HUMAN_APPROVAL_MODE.test(describeMode(m))) ?? candidates[0];
+  return chosen?.id;
+}
+
+/**
+ * Switches a freshly created session into a mode that requires human approval,
+ * so that every non-agentrq tool call reaches the agentrq dashboard rather than
+ * being auto-approved inside the agent.
+ */
+export async function enforceHumanApprovalMode(
+  connection: acp.ClientSideConnection,
+  sessionResult: { sessionId: string; modes?: acp.SessionModeState | null },
+): Promise<void> {
+  const modes = sessionResult.modes;
+  // Agents that expose no modes have nothing to switch; they either always ask
+  // or their policy is out of the gateway's reach.
+  if (!modes?.availableModes?.length) return;
+
+  const modeId = pickHumanApprovalMode(modes);
+  if (!modeId) {
+    console.error(
+      `[acp] ⚠️  Agent offers no mode that defers approvals to the human ` +
+        `(available: ${modes.availableModes.map((m) => m.id).join(", ")}). ` +
+        `Tool calls may execute without agentrq approval.`,
+    );
+    return;
+  }
+  if (modeId === modes.currentModeId) return;
+
+  try {
+    await connection.setSessionMode({ sessionId: sessionResult.sessionId, modeId });
+    console.error(
+      `[acp] Session mode set to "${modeId}" (was "${modes.currentModeId}") so tool calls require agentrq approval`,
+    );
+  } catch (err) {
+    console.error(
+      `[acp] ⚠️  Failed to set session mode to "${modeId}" — tool calls may execute without agentrq approval:`,
+      err,
+    );
+  }
+}
 
 export function createAcpSessionSwitcher(
   connection: acp.ClientSideConnection,

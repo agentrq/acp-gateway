@@ -7,6 +7,8 @@ import {
   TaskQueue,
   getOrCreateSession,
   activeSessions,
+  pickHumanApprovalMode,
+  enforceHumanApprovalMode,
 } from "../index.js";
 import type { McpServerConfig } from "../config.js";
 
@@ -427,6 +429,168 @@ describe("index", () => {
             elicitation: { form: {}, url: {} },
           }),
         }),
+      );
+    });
+  });
+
+  describe("pickHumanApprovalMode", () => {
+    // The real modes codex-acp advertises. Its default is "agent", whose
+    // reviewer is an automated Guardian Review that approves on the human's
+    // behalf — so tool calls never reach agentrq.
+    const codexModes: any = {
+      currentModeId: "agent",
+      availableModes: [
+        { id: "read-only", name: "Ask for approval", _meta: { kind: "standard" } },
+        { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
+        { id: "agent-full-access", name: "Full access", _meta: { kind: "full_access" } },
+      ],
+    };
+
+    it("should pick the human-approval mode over auto-reviewing and full-access modes", () => {
+      expect(pickHumanApprovalMode(codexModes)).toBe("read-only");
+    });
+
+    it("should return undefined when the agent advertises no modes", () => {
+      expect(pickHumanApprovalMode(undefined)).toBeUndefined();
+      expect(pickHumanApprovalMode(null)).toBeUndefined();
+      expect(pickHumanApprovalMode({ currentModeId: "x", availableModes: [] } as any)).toBeUndefined();
+    });
+
+    it("should return undefined when every available mode auto-approves", () => {
+      const modes: any = {
+        currentModeId: "agent",
+        availableModes: [
+          { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
+          { id: "yolo", name: "Never ask", _meta: { kind: "full_access" } },
+        ],
+      };
+      expect(pickHumanApprovalMode(modes)).toBeUndefined();
+    });
+
+    it("should fall back to the first non-auto-approving mode when none names approval", () => {
+      const modes: any = {
+        currentModeId: "fast",
+        availableModes: [
+          { id: "fast", name: "Full access", _meta: { kind: "full_access" } },
+          { id: "careful", name: "Careful" },
+          { id: "other", name: "Other" },
+        ],
+      };
+      expect(pickHumanApprovalMode(modes)).toBe("careful");
+    });
+
+    it("should tolerate modes without _meta or with a non-string kind", () => {
+      const modes: any = {
+        currentModeId: "a",
+        availableModes: [
+          { id: "a", name: "Full access" },
+          { id: "b", name: "Ask first", _meta: { kind: 42 } },
+        ],
+      };
+      expect(pickHumanApprovalMode(modes)).toBe("b");
+    });
+  });
+
+  describe("enforceHumanApprovalMode", () => {
+    let consoleSpy: any;
+
+    beforeEach(() => {
+      consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    it("should switch out of an auto-approving default mode", async () => {
+      const connection: any = { setSessionMode: vi.fn().mockResolvedValue({}) };
+      const sessionResult: any = {
+        sessionId: "sess-1",
+        modes: {
+          currentModeId: "agent",
+          availableModes: [
+            { id: "read-only", name: "Ask for approval", _meta: { kind: "standard" } },
+            { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
+          ],
+        },
+      };
+
+      await enforceHumanApprovalMode(connection, sessionResult);
+
+      expect(connection.setSessionMode).toHaveBeenCalledWith({
+        sessionId: "sess-1",
+        modeId: "read-only",
+      });
+    });
+
+    it("should do nothing when the agent advertises no modes", async () => {
+      const connection: any = { setSessionMode: vi.fn() };
+
+      await enforceHumanApprovalMode(connection, { sessionId: "sess-1" } as any);
+      await enforceHumanApprovalMode(connection, {
+        sessionId: "sess-1",
+        modes: { currentModeId: "x", availableModes: [] },
+      } as any);
+
+      expect(connection.setSessionMode).not.toHaveBeenCalled();
+    });
+
+    it("should not switch when already in a human-approval mode", async () => {
+      const connection: any = { setSessionMode: vi.fn() };
+      const sessionResult: any = {
+        sessionId: "sess-1",
+        modes: {
+          currentModeId: "read-only",
+          availableModes: [
+            { id: "read-only", name: "Ask for approval", _meta: { kind: "standard" } },
+            { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
+          ],
+        },
+      };
+
+      await enforceHumanApprovalMode(connection, sessionResult);
+
+      expect(connection.setSessionMode).not.toHaveBeenCalled();
+    });
+
+    it("should warn and not switch when every mode auto-approves", async () => {
+      const connection: any = { setSessionMode: vi.fn() };
+      const sessionResult: any = {
+        sessionId: "sess-1",
+        modes: {
+          currentModeId: "agent",
+          availableModes: [
+            { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
+            { id: "full", name: "Full access", _meta: { kind: "full_access" } },
+          ],
+        },
+      };
+
+      await enforceHumanApprovalMode(connection, sessionResult);
+
+      expect(connection.setSessionMode).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("no mode that defers approvals to the human"),
+      );
+    });
+
+    it("should log and not throw when setSessionMode fails", async () => {
+      const connection: any = {
+        setSessionMode: vi.fn().mockRejectedValue(new Error("unsupported")),
+      };
+      const sessionResult: any = {
+        sessionId: "sess-1",
+        modes: {
+          currentModeId: "agent",
+          availableModes: [
+            { id: "read-only", name: "Ask for approval", _meta: { kind: "standard" } },
+            { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
+          ],
+        },
+      };
+
+      await expect(
+        enforceHumanApprovalMode(connection, sessionResult),
+      ).resolves.toBeUndefined();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to set session mode"),
+        expect.any(Error),
       );
     });
   });
