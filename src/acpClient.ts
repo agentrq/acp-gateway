@@ -114,24 +114,55 @@ export class AgentRQACPClient implements acp.Client {
           
           console.error(`✅ Permission verdict received: ${data.behavior}`);
 
-          // Map "allow"/"deny" to the correct ACP option
-          // ACP options usually include "allow_once", "allow_always", etc.
-          const verdictMatch = data.behavior === "allow" ? "allow" : "deny";
-          const option = params.options.find(o => 
-            o.kind.startsWith(verdictMatch) ||
-            o.name.toLowerCase().includes(verdictMatch) || 
-            (verdictMatch === "allow" && (o.name.toLowerCase().includes("yes") || o.name.toLowerCase().includes("approve")))
+          // A verdict from agentrq covers exactly one tool call. Never select
+          // a "persistent" option (ACP's "allow_always"/"reject_always" kinds,
+          // or an equivalent "remember"/"don't ask again" option by name) —
+          // picking one would make the *spawned agent* remember the decision
+          // and stop sending requestPermission for matching future tool
+          // calls, so those calls would never reach agentrq again. Every
+          // subsequent call must still be forwarded and re-approved there.
+          const isPersistent = (o: acp.PermissionOption) =>
+            /always|remember|don'?t ask/i.test(o.kind) || /always|remember|don'?t ask/i.test(o.name);
+          const onceOptions = params.options.filter(o => !isPersistent(o));
+
+          // Map "allow"/"deny" to the correct ACP option. Per the ACP spec,
+          // PermissionOptionKind is one of "allow_once" | "allow_always" |
+          // "reject_once" | "reject_always" — there is no "deny_*" kind, so a
+          // deny verdict must match on "reject" to find a spec-compliant option.
+          const isAllow = data.behavior === "allow";
+          const option = onceOptions.find(o => {
+            const name = o.name.toLowerCase();
+            return isAllow
+              ? o.kind.startsWith("allow") || name.includes("allow") || name.includes("yes") || name.includes("approve")
+              : o.kind.startsWith("reject") || name.includes("deny") || name.includes("reject") || name.includes("no");
+          });
+
+          // Falling back to onceOptions[0] unconditionally is unsafe for a
+          // deny verdict: ACP conventionally lists allow options first, so an
+          // unmatched deny could silently resolve to an allow option and
+          // approve a tool call the human explicitly denied. Only ever fall
+          // back to a non-persistent option that is not itself an allow-kind;
+          // if no safe option exists at all (e.g. only "always" options were
+          // offered), cancel instead of guessing.
+          let outcome: acp.RequestPermissionOutcome;
+          if (option) {
+            outcome = { outcome: "selected", optionId: option.optionId };
+          } else if (isAllow) {
+            outcome = onceOptions[0]
+              ? { outcome: "selected", optionId: onceOptions[0].optionId }
+              : { outcome: "cancelled" };
+          } else {
+            const safeFallback = onceOptions.find(o => !o.kind.startsWith("allow"));
+            outcome = safeFallback
+              ? { outcome: "selected", optionId: safeFallback.optionId }
+              : { outcome: "cancelled" };
+          }
+
+          console.error(
+            `[acp] Selected permission option: ${"optionId" in outcome ? outcome.optionId : "cancelled"} (${option?.name ?? "default"})`
           );
 
-          const optionId = option?.optionId ?? params.options[0].optionId;
-          console.error(`[acp] Selected permission option: ${optionId} (${option?.name ?? "default"})`);
-
-          resolve({
-            outcome: {
-              outcome: "selected",
-              optionId: optionId,
-            },
-          });
+          resolve({ outcome });
         }
       };
 

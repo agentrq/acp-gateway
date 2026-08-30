@@ -258,6 +258,138 @@ describe("AgentRQACPClient", () => {
       expect((response.outcome as any).optionId).toBe("opt-1");
     });
 
+    it("should match spec-compliant reject_once/reject_always kinds on deny (not just a literal 'deny' kind prefix)", async () => {
+      const params = {
+        toolCall: { toolCallId: "req-123" },
+        options: [
+          { optionId: "opt-1", kind: "allow_once", name: "Allow Once" },
+          { optionId: "opt-2", kind: "reject_once", name: "Reject Once" },
+        ],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(
+            () => handler({ requestId: "req-123", behavior: "deny" }),
+            10,
+          );
+        }
+      });
+
+      const response = await client.requestPermission(params);
+      // A spec-compliant "reject_once" kind must never be missed and fall
+      // through to the first (allow) option — that would silently approve a
+      // tool call the human explicitly denied.
+      expect((response.outcome as any).optionId).toBe("opt-2");
+    });
+
+    it("should never resolve a deny verdict to an allow-kind option, even with no matching option", async () => {
+      const params = {
+        toolCall: { toolCallId: "req-123" },
+        options: [
+          { optionId: "opt-1", kind: "allow_once", name: "Proceed" },
+          { optionId: "opt-2", kind: "other", name: "Skip" },
+        ],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(
+            () => handler({ requestId: "req-123", behavior: "deny" }),
+            10,
+          );
+        }
+      });
+
+      const response = await client.requestPermission(params);
+      expect((response.outcome as any).optionId).toBe("opt-2");
+    });
+
+    it("should cancel a deny verdict rather than select an allow option when every option is allow-kind", async () => {
+      const params = {
+        toolCall: { toolCallId: "req-123" },
+        options: [{ optionId: "opt-1", kind: "allow_once", name: "Proceed" }],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(
+            () => handler({ requestId: "req-123", behavior: "deny" }),
+            10,
+          );
+        }
+      });
+
+      const response = await client.requestPermission(params);
+      expect(response.outcome.outcome).toBe("cancelled");
+    });
+
+    it("should select the once option on allow, never the always option, so future calls still require agentrq approval", async () => {
+      const params = {
+        toolCall: { toolCallId: "req-123" },
+        options: [
+          { optionId: "opt-always", kind: "allow_always", name: "Always Allow" },
+          { optionId: "opt-once", kind: "allow_once", name: "Allow Once" },
+        ],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(
+            () => handler({ requestId: "req-123", behavior: "allow" }),
+            10,
+          );
+        }
+      });
+
+      const response = await client.requestPermission(params);
+      // Selecting "allow_always" would make the spawned agent remember this
+      // decision and stop asking for matching future tool calls, bypassing
+      // agentrq entirely for those. Must always pick the once-only variant.
+      expect((response.outcome as any).optionId).toBe("opt-once");
+    });
+
+    it("should select the once option on deny, never the always option", async () => {
+      const params = {
+        toolCall: { toolCallId: "req-123" },
+        options: [
+          { optionId: "opt-always", kind: "reject_always", name: "Always Reject" },
+          { optionId: "opt-once", kind: "reject_once", name: "Reject Once" },
+        ],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(
+            () => handler({ requestId: "req-123", behavior: "deny" }),
+            10,
+          );
+        }
+      });
+
+      const response = await client.requestPermission(params);
+      expect((response.outcome as any).optionId).toBe("opt-once");
+    });
+
+    it("should cancel an allow verdict rather than select an always-kind option when no once option exists", async () => {
+      const params = {
+        toolCall: { toolCallId: "req-123" },
+        options: [{ optionId: "opt-always", kind: "allow_always", name: "Always Allow" }],
+      } as any;
+
+      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
+        if (event === "verdict") {
+          setTimeout(
+            () => handler({ requestId: "req-123", behavior: "allow" }),
+            10,
+          );
+        }
+      });
+
+      const response = await client.requestPermission(params);
+      expect(response.outcome.outcome).toBe("cancelled");
+    });
+
     it("should fall back to first option if no match", async () => {
       const params = {
         toolCall: { toolCallId: "req-123" },
