@@ -431,7 +431,8 @@ export type GatewayCommand =
   | "login"
   | "logout"
   | "list-auth-methods"
-  | "list-agents";
+  | "list-agents"
+  | "help";
 
 export interface GatewayOptions {
   maxConcurrency: number;
@@ -511,6 +512,10 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
           options.registryUrl = value;
           i++;
         }
+        break;
+      case "--help":
+      case "-h":
+        options.command = "help";
         break;
       default:
         // Anything unrecognised belongs to the agent command, which may be
@@ -619,22 +624,65 @@ export async function runAuthCommand(
   }
 }
 
-export function printUsage(): void {
-  console.log(
-    "Usage: acp-gateway [--max-concurrency <number>] [--auth-method <id>] -- <acp-server-command> [args...]",
-  );
-  console.log("       acp-gateway --agent <registry-id> [--allow-unverified-agent]");
-  console.log("       acp-gateway --list-agents");
-  console.log("       acp-gateway --list-auth-methods -- <acp-server-command> [args...]");
-  console.log("       acp-gateway --login [method-id] -- <acp-server-command> [args...]");
-  console.log("       acp-gateway --logout -- <acp-server-command> [args...]");
-  console.log("Example: acp-gateway --max-concurrency 4 -- gemini --acp");
-  console.log("Example: acp-gateway --agent gemini");
+/**
+ * The full help text.
+ *
+ * Shown for `--help`, and when the gateway is run with nothing to do — at
+ * which point the reason someone is looking at the terminal is that they do
+ * not yet know what to type.
+ */
+export function helpText(version: string = pkg.version): string {
+  return `acp-gateway ${version} — bridges an ACP agent to an agentrq workspace.
+
+USAGE
+  acp-gateway [options] -- <agent-command> [agent-args...]
+  acp-gateway [options] --agent <registry-id>
+
+  The agent is either a command you supply after \`--\`, or an id from the ACP
+  registry. Everything after \`--\` is passed to the agent untouched.
+
+AGENT
+  --agent <registry-id>       Run an agent from the ACP registry, installing it
+                              if needed, instead of a command you supply.
+  --list-agents               List every agent in the registry, and how each one
+                              can run on this machine. Exits.
+  --allow-unverified-agent    Install a registry binary that publishes no
+                              checksum. Off by default: without a checksum there
+                              is no way to tell what was downloaded.
+  --registry-url <url>        Read a different registry index, for pinning it or
+                              for testing.
+
+AUTHENTICATION
+  --list-auth-methods         List the login methods the agent offers. Exits.
+  --login [method-id]         Log in to the agent. With no id, and a terminal to
+                              ask in, you are asked which method to use. Exits.
+  --logout                    Log out of the agent, where it supports it. Exits.
+  --auth-method <id>          The method to use when the agent demands a login
+                              mid-run. Defaults to choosing one automatically.
+
+BRIDGE
+  --max-concurrency <number>  How many tasks may prompt the agent at once.
+                              Defaults to 2.
+
+OTHER
+  --help, -h                  Show this help. Exits.
+
+EXAMPLES
+  acp-gateway --agent gemini                     Run Gemini from the registry
+  acp-gateway -- gemini --acp                    Run an agent you installed
+  acp-gateway --list-agents                      See what the registry offers
+  acp-gateway --login -- gemini --acp            Log in before running anything
+  acp-gateway --max-concurrency 4 -- gemini --acp
+
+The workspace comes from .mcp.json, searched for in the current directory and up
+to three directories above it.`;
+}
+
+export function printHelp(): void {
+  console.log(helpText());
 }
 
 async function main() {
-  console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
-
   const args = process.argv.slice(2);
 
   // Everything after `--` is the agent command. Without a separator the
@@ -648,11 +696,26 @@ async function main() {
 
   const { maxConcurrency, command, authMethodId } = options;
 
+  if (command === "help") {
+    printHelp();
+    process.exit(0);
+  }
+
   // Listing the registry needs neither a workspace nor an agent.
   if (command === "list-agents") {
     await runListAgents(options.registryUrl);
     process.exit(0);
   }
+
+  // Nothing to run: the reason someone is looking at the terminal now is that
+  // they do not yet know what to type, so show the help rather than an error
+  // about a workspace they have not got to yet.
+  if (!options.agentId && explicitCommand.length === 0) {
+    printHelp();
+    process.exit(1);
+  }
+
+  console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
 
   // 1. Load MCP Config
   const configs = loadMcpConfig();
@@ -662,10 +725,6 @@ async function main() {
   // the user gave.
   const resolved = await resolveAgentCommand(options, explicitCommand);
   const acpCmdArgs = resolved.command;
-  if (acpCmdArgs.length === 0) {
-    printUsage();
-    process.exit(1);
-  }
   if (resolved.env) {
     // The registry entry's env is part of how that agent must be launched, so
     // it travels with the command into every session spawned from it.

@@ -14,7 +14,8 @@ import {
   isInteractiveTerminal,
   openAgentConnection,
   parseGatewayArgs,
-  printUsage,
+  helpText,
+  printHelp,
   resolveAgentCommand,
   runListAgents,
   pickHumanApprovalMode,
@@ -638,6 +639,11 @@ describe("index", () => {
       ).toBe("http://localhost/registry.json");
       expect(parseGatewayArgs(["--registry-url"]).registryUrl).toBeUndefined();
     });
+
+    it("should recognise both spellings of the help flag", () => {
+      expect(parseGatewayArgs(["--help"]).command).toBe("help");
+      expect(parseGatewayArgs(["-h"]).command).toBe("help");
+    });
   });
 
   describe("runListAgents", () => {
@@ -819,17 +825,52 @@ describe("index", () => {
     });
   });
 
-  describe("printUsage", () => {
-    it("should document the auth commands alongside the bridge usage", () => {
+  describe("helpText", () => {
+    it("should explain every option the parser accepts", () => {
+      const text = helpText("9.9.9");
+
+      // Every documented flag must be one parseGatewayArgs actually handles,
+      // and every flag it handles must be documented.
+      const documented = [...text.matchAll(/^\s{2}(--[a-z-]+|-h)/gm)].map((m) => m[1]);
+      expect(new Set(documented)).toEqual(
+        new Set([
+          "--agent",
+          "--list-agents",
+          "--allow-unverified-agent",
+          "--registry-url",
+          "--list-auth-methods",
+          "--login",
+          "--logout",
+          "--auth-method",
+          "--max-concurrency",
+          "--help",
+        ]),
+      );
+    });
+
+    it("should name the version and show how to run an agent both ways", () => {
+      const text = helpText("9.9.9");
+
+      expect(text).toContain("acp-gateway 9.9.9");
+      expect(text).toContain("acp-gateway --agent gemini");
+      expect(text).toContain("acp-gateway -- gemini --acp");
+      expect(text).toContain(".mcp.json");
+    });
+
+    it("should say why an unverified agent is not installed by default", () => {
+      expect(helpText()).toMatch(/no way to tell what was downloaded/);
+    });
+  });
+
+  describe("printHelp", () => {
+    it("should print the help text", () => {
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-      printUsage();
+      printHelp();
       const printed = logSpy.mock.calls.flat().join("\n");
       logSpy.mockRestore();
 
-      expect(printed).toContain("--list-auth-methods");
-      expect(printed).toContain("--login [method-id]");
-      expect(printed).toContain("--logout");
-      expect(printed).toContain("--auth-method <id>");
+      expect(printed).toContain("USAGE");
+      expect(printed).toContain("--list-agents");
     });
   });
 

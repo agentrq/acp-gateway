@@ -71,6 +71,7 @@ You can specify gateway options before the `--` separator:
 - `--allow-unverified-agent`: Installs a registry binary that publishes no checksum. Off by default.
 - `--registry-url <url>`: Reads a different registry index (for pinning, or for testing).
 - `--auth-method <id>`: The authentication method to use when the agent asks for a login. Defaults to picking one automatically.
+- `--help` / `-h`: Explains every option, with examples. Also shown when `acp-gateway` is run with nothing to do.
 - `--list-auth-methods`: Prints the login methods the agent advertises, then exits.
 - `--login [method-id]`: Logs in to the agent, then exits.
 - `--logout`: Ends the agent's authenticated state, then exits (only for agents that support logout).
