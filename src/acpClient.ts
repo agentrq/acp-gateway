@@ -7,6 +7,7 @@
 
 import * as acp from "@agentclientprotocol/sdk";
 import type { MCPBridge } from "./mcpClient.js";
+import { describeToolCall } from "./toolCallPreview.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -54,7 +55,16 @@ export class AgentRQACPClient implements acp.Client {
   // carries a title, but the permission request for that same call may omit it
   // (ACP marks it optional there, and codex-acp sends it bare), which would
   // otherwise leave us unable to tell an agentrq MCP call from anything else.
-  private toolCallDetails = new Map<string, { title?: string; rawInput?: unknown }>();
+  private toolCallDetails = new Map<
+    string,
+    {
+      title?: string;
+      rawInput?: unknown;
+      kind?: string;
+      locations?: acp.ToolCallLocation[];
+      content?: acp.ToolCallContent[];
+    }
+  >();
 
   // request_id → the tool call waiting on a human. One shared verdict listener
   // serves them all: a listener per request was only ever removed on a matching
@@ -224,6 +234,13 @@ export class AgentRQACPClient implements acp.Client {
     this.toolCallDetails.delete(toolCallId);
     const toolTitle = params.toolCall.title ?? remembered?.title ?? "Unknown Tool";
     const rawInput = params.toolCall.rawInput ?? remembered?.rawInput;
+    // The diff and the file list are usually on the earlier tool_call update
+    // rather than the permission request, so fall back to that the same way.
+    const preview = describeToolCall({
+      kind: params.toolCall.kind ?? remembered?.kind,
+      locations: params.toolCall.locations ?? remembered?.locations,
+      content: params.toolCall.content ?? remembered?.content,
+    });
 
     // Auto-allow tool calls that contain the pattern: agentrq-<11 chars a-zA-Z0-9>
     if (AGENTRQ_TOOL_PATTERN.test(toolTitle)) {
@@ -257,7 +274,12 @@ export class AgentRQACPClient implements acp.Client {
       task_id: taskId,
       tool_name: toolTitle,
       description: toolTitle,
+      // input_preview stays exactly as it was: agentrq parses it as JSON to
+      // match saved auto-allow rules. Everything new travels alongside it.
       input_preview: JSON.stringify(rawInput ?? {}),
+      ...(preview.kind ? { tool_kind: preview.kind } : {}),
+      ...(preview.locations ? { locations: preview.locations } : {}),
+      ...(preview.contentPreview ? { content_preview: preview.contentPreview } : {}),
     };
     console.error(`[acp] Bridge Session ID: ${this.mcpBridge.getSessionId() ?? "unknown"}`);
     console.error(`[acp] Sending permission request notification:`, JSON.stringify(payload, null, 2));
@@ -380,6 +402,9 @@ export class AgentRQACPClient implements acp.Client {
     title?: string | null;
     rawInput?: unknown;
     status?: string | null;
+    kind?: string | null;
+    locations?: acp.ToolCallLocation[] | null;
+    content?: acp.ToolCallContent[] | null;
   }): void {
     const id = update.toolCallId;
     if (!id) return;
@@ -392,10 +417,15 @@ export class AgentRQACPClient implements acp.Client {
     }
 
     const previous = this.toolCallDetails.get(id);
-    const title = update.title ?? previous?.title;
-    const rawInput = update.rawInput ?? previous?.rawInput;
-    if (title === undefined && rawInput === undefined) return;
-    this.toolCallDetails.set(id, { title, rawInput });
+    const details = {
+      title: update.title ?? previous?.title,
+      rawInput: update.rawInput ?? previous?.rawInput,
+      kind: update.kind ?? previous?.kind,
+      locations: update.locations ?? previous?.locations,
+      content: update.content ?? previous?.content,
+    };
+    if (Object.values(details).every((value) => value === undefined)) return;
+    this.toolCallDetails.set(id, details);
   }
 
   async sessionUpdate(params: acp.SessionNotification): Promise<void> {

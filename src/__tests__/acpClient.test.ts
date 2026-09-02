@@ -1027,6 +1027,63 @@ describe("AgentRQACPClient", () => {
       expect(mcpBridge.sendNotification.mock.calls[0][1].request_id).toBe("call-1");
     });
 
+    it("should send the human the diff, kind and files, not just the raw input", async () => {
+      answerWith("allow");
+      await client.requestPermission(
+        params({
+          toolCall: {
+            toolCallId: "call-edit",
+            title: "Edit config.ts",
+            kind: "edit",
+            rawInput: { path: "config.ts" },
+            locations: [{ path: "/repo/config.ts", line: 12 }],
+            content: [
+              { type: "diff", path: "/repo/config.ts", oldText: "port = 80", newText: "port = 443" },
+            ],
+          },
+        }),
+      );
+
+      const sent = mcpBridge.sendNotification.mock.calls[0][1];
+      expect(sent.tool_kind).toBe("edit");
+      expect(sent.locations).toEqual(["/repo/config.ts:12"]);
+      expect(sent.content_preview).toContain("-port = 80");
+      expect(sent.content_preview).toContain("+port = 443");
+      // Unchanged: agentrq parses this as JSON to match auto-allow rules.
+      expect(sent.input_preview).toBe(JSON.stringify({ path: "config.ts" }));
+    });
+
+    it("should take the diff from the earlier tool call when the request omits it", async () => {
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-1",
+          title: "Edit",
+          kind: "edit",
+          status: "pending",
+          content: [{ type: "diff", path: "/repo/a.ts", oldText: "a", newText: "b" }],
+        },
+      } as any);
+
+      answerWith("allow");
+      await client.requestPermission(params({ toolCall: { toolCallId: "call-1", title: "Edit" } }));
+
+      const sent = mcpBridge.sendNotification.mock.calls[0][1];
+      expect(sent.tool_kind).toBe("edit");
+      expect(sent.content_preview).toContain("+b");
+    });
+
+    it("should send nothing extra for a call that describes nothing extra", async () => {
+      answerWith("allow");
+      await client.requestPermission(params());
+
+      const sent = mcpBridge.sendNotification.mock.calls[0][1];
+      expect(sent).not.toHaveProperty("tool_kind");
+      expect(sent).not.toHaveProperty("locations");
+      expect(sent).not.toHaveProperty("content_preview");
+    });
+
     it("should keep one verdict listener however many calls are waiting", async () => {
       const waiting = [
         client.requestPermission(params()),
