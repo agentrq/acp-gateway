@@ -85,7 +85,7 @@ export function mapMcpServers(
       };
     });
 }
-import { AgentRQACPClient } from "./acpClient.js";
+import { AgentRQACPClient, DEFAULT_PERMISSION_TIMEOUT_MS } from "./acpClient.js";
 import {
   describeAuthMethods,
   isAuthRequiredError,
@@ -121,6 +121,9 @@ export const activeSessions = new Map<string, AgentSession>();
 
 /** Login preferences taken from the CLI, consulted whenever an agent demands auth. */
 export const authConfig: { methodId?: string } = {};
+
+/** How long tool calls wait for a human, taken from the CLI at startup. */
+export const permissionConfig: { timeoutMs?: number } = {};
 
 /**
  * Whether a human is sitting in front of this process.
@@ -172,17 +175,25 @@ export async function openAgentConnection({
     env: { ...process.env, ...env },
   });
 
+  const acpClient = new AgentRQACPClient(mcpBridge, () => taskId, {
+    permissionTimeoutMs: permissionConfig.timeoutMs,
+  });
+
   // Guard against unhandled child-process failures. Without these listeners a
   // crashed agent (e.g. on network loss) leaves a broken stdin pipe; the next
   // write raises EPIPE as an uncaught error and takes the gateway down with it.
   agentProcess.on("error", (err: Error) => {
     console.error(`[acp] Agent process error for ${label}:`, err.message);
+    acpClient.cancelPendingPermissions(`agent process for ${label} failed`);
     onExit?.();
   });
   agentProcess.on("exit", (code: number | null, signal: string | null) => {
     console.error(
       `[acp] Agent process for ${label} exited (code=${code}, signal=${signal})`,
     );
+    // Nothing will act on these answers now, but the tool calls waiting on them
+    // are holding task-queue slots that would never be given back.
+    acpClient.cancelPendingPermissions(`agent process for ${label} exited`);
     onExit?.();
   });
   // stdin can emit EPIPE when the child dies mid-write; swallow it so it
@@ -196,12 +207,14 @@ export async function openAgentConnection({
     agentProcess.stdout!,
   ) as ReadableStream<Uint8Array>;
 
-  const acpClient = new AgentRQACPClient(mcpBridge, () => taskId);
   const stream = acp.ndJsonStream(input, output);
   const connection = new acp.ClientSideConnection(
     (_agent) => acpClient,
     stream,
   );
+  // Stopping a turn is only possible once the connection exists, and the
+  // connection is built around the client — so it is handed over afterwards.
+  acpClient.setSessionCanceller((sessionId) => connection.cancel({ sessionId }));
 
   const initResult = await connection.initialize({
     protocolVersion: acp.PROTOCOL_VERSION,
@@ -487,6 +500,8 @@ export type GatewayCommand =
 
 export interface GatewayOptions {
   maxConcurrency: number;
+  /** How long a tool call waits for a human verdict. 0 waits indefinitely. */
+  permissionTimeoutMs: number;
   authMethodId?: string;
   command: GatewayCommand;
   /** Registry id of the agent to run, instead of a command given after `--`. */
@@ -506,6 +521,7 @@ export interface GatewayOptions {
 export function parseGatewayArgs(args: string[]): GatewayOptions {
   const options: GatewayOptions = {
     maxConcurrency: 2,
+    permissionTimeoutMs: DEFAULT_PERMISSION_TIMEOUT_MS,
     command: "run",
     allowUnverifiedAgent: false,
     rest: [],
@@ -523,6 +539,14 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
         const parsed = parseInt(value ?? "", 10);
         if (!isNaN(parsed)) {
           options.maxConcurrency = parsed;
+          i++;
+        }
+        break;
+      }
+      case "--permission-timeout": {
+        const minutes = parseInt(value ?? "", 10);
+        if (!isNaN(minutes) && minutes >= 0) {
+          options.permissionTimeoutMs = minutes * 60_000;
           i++;
         }
         break;
@@ -766,6 +790,10 @@ AUTHENTICATION
 BRIDGE
   --max-concurrency <number>  How many tasks may prompt the agent at once.
                               Defaults to 2.
+  --permission-timeout <min>  How long a tool call waits for someone to approve
+                              it before the turn is cancelled. Defaults to 30.
+                              0 waits indefinitely, which is what a wedged
+                              gateway looks like — use it knowingly.
 
 OTHER
   --help, -h                  Show this help. Exits.
@@ -849,6 +877,7 @@ async function main() {
   }
 
   authConfig.methodId = authMethodId;
+  permissionConfig.timeoutMs = options.permissionTimeoutMs;
 
   const taskQueue = new TaskQueue(maxConcurrency);
 

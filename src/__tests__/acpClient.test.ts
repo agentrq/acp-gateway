@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { EventEmitter } from "node:events";
 import { AgentRQACPClient } from "../acpClient.js";
 import type { MCPBridge } from "../mcpClient.js";
 import * as fs from "node:fs/promises";
@@ -12,15 +13,26 @@ describe("AgentRQACPClient", () => {
   let mcpBridge: any;
   let client: AgentRQACPClient;
 
+  /**
+   * Answers the tool call that is waiting, the way agentrq does: by echoing
+   * back the request id the gateway actually sent.
+   */
+  function answerWith(behavior: string) {
+    setTimeout(() => {
+      const sent = mcpBridge.sendNotification.mock.calls.at(-1)?.[1];
+      mcpBridge.emit("verdict", { requestId: sent?.request_id, behavior });
+    }, 10);
+  }
+
   beforeEach(() => {
     vi.clearAllMocks();
-    mcpBridge = {
+    // A real emitter: the client registers one shared verdict listener when it
+    // is constructed, so a mocked `on` would never see a verdict at all.
+    mcpBridge = Object.assign(new EventEmitter(), {
       getSessionId: vi.fn().mockReturnValue("test-session"),
       sendNotification: vi.fn().mockResolvedValue(undefined),
       callTool: vi.fn(),
-      on: vi.fn(),
-      off: vi.fn(),
-    };
+    });
     client = new AgentRQACPClient(mcpBridge as unknown as MCPBridge);
   });
 
@@ -38,14 +50,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "allow" }),
-            10,
-          );
-        }
-      });
+      answerWith("allow");
 
       const response = await client.requestPermission(params);
       expect((response.outcome as any).optionId).toBe("opt-1");
@@ -73,8 +78,8 @@ describe("AgentRQACPClient", () => {
       // here would surface as an unhandled rejection and crash the gateway.
       const response = await client.requestPermission(params);
       expect(response.outcome.outcome).toBe("cancelled");
-      // It must not register a verdict listener it can never clean up.
-      expect(mcpBridge.on).not.toHaveBeenCalled();
+      // Nothing may be left waiting on a verdict that will never come.
+      expect(client.pendingPermissionCount).toBe(0);
 
       consoleSpy.mockRestore();
     });
@@ -96,14 +101,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "allow" }),
-            10,
-          );
-        }
-      });
+      answerWith("allow");
 
       await clientWithTaskId.requestPermission(params);
       
@@ -144,14 +142,7 @@ describe("AgentRQACPClient", () => {
         options: [{ optionId: "opt-1", kind: "allow", name: "Allow" }],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "allow" }),
-            10,
-          );
-        }
-      });
+      answerWith("allow");
 
       const response = await client.requestPermission(params);
       // Permission matching still works based on behavior, independent of title presence
@@ -171,11 +162,7 @@ describe("AgentRQACPClient", () => {
         options: [{ optionId: "opt-1", kind: "allow", name: "Allow" }],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(() => handler({ requestId: "req-123", behavior: "allow" }), 10);
-        }
-      });
+      answerWith("allow");
 
       const response = await client.requestPermission(params);
       expect((response.outcome as any).optionId).toBe("opt-1");
@@ -244,11 +231,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(() => handler({ requestId: "call_abc", behavior: "allow" }), 10);
-        }
-      });
+      answerWith("allow");
 
       await client.requestPermission(params);
 
@@ -288,11 +271,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(() => handler({ requestId: "call_cmd", behavior: "allow" }), 10);
-        }
-      });
+      answerWith("allow");
 
       await client.requestPermission(params);
 
@@ -315,11 +294,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(() => handler({ requestId: "call_unseen", behavior: "allow" }), 10);
-        }
-      });
+      answerWith("allow");
 
       await client.requestPermission(params);
 
@@ -350,11 +325,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(() => handler({ requestId: "call_done", behavior: "allow" }), 10);
-        }
-      });
+      answerWith("allow");
 
       await client.requestPermission(params);
 
@@ -392,11 +363,7 @@ describe("AgentRQACPClient", () => {
       expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
 
       // A replay of the same id no longer resolves, so it reaches the human.
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(() => handler({ requestId: "call_once", behavior: "allow" }), 10);
-        }
-      });
+      answerWith("allow");
       await client.requestPermission(params);
       expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
         expect.any(String),
@@ -459,11 +426,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(() => handler({ requestId: "call_bare", behavior: "allow" }), 10);
-        }
-      });
+      answerWith("allow");
 
       await client.requestPermission(params);
 
@@ -491,14 +454,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "allow" }),
-            10,
-          );
-        }
-      });
+      answerWith("allow");
 
       const response = await client.requestPermission(params);
       expect((response.outcome as any).optionId).toBe("opt-1");
@@ -513,14 +469,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "deny" }),
-            10,
-          );
-        }
-      });
+      answerWith("deny");
 
       const response = await client.requestPermission(params);
       expect((response.outcome as any).optionId).toBe("opt-2");
@@ -535,14 +484,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "deny" }),
-            10,
-          );
-        }
-      });
+      answerWith("deny");
 
       const response = await client.requestPermission(params);
       expect((response.outcome as any).optionId).toBe("opt-1");
@@ -557,14 +499,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "deny" }),
-            10,
-          );
-        }
-      });
+      answerWith("deny");
 
       const response = await client.requestPermission(params);
       // A spec-compliant "reject_once" kind must never be missed and fall
@@ -582,14 +517,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "deny" }),
-            10,
-          );
-        }
-      });
+      answerWith("deny");
 
       const response = await client.requestPermission(params);
       expect((response.outcome as any).optionId).toBe("opt-2");
@@ -601,14 +529,7 @@ describe("AgentRQACPClient", () => {
         options: [{ optionId: "opt-1", kind: "allow_once", name: "Proceed" }],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "deny" }),
-            10,
-          );
-        }
-      });
+      answerWith("deny");
 
       const response = await client.requestPermission(params);
       expect(response.outcome.outcome).toBe("cancelled");
@@ -623,14 +544,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "allow" }),
-            10,
-          );
-        }
-      });
+      answerWith("allow");
 
       const response = await client.requestPermission(params);
       // Selecting "allow_always" would make the spawned agent remember this
@@ -648,14 +562,7 @@ describe("AgentRQACPClient", () => {
         ],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "deny" }),
-            10,
-          );
-        }
-      });
+      answerWith("deny");
 
       const response = await client.requestPermission(params);
       expect((response.outcome as any).optionId).toBe("opt-once");
@@ -667,14 +574,7 @@ describe("AgentRQACPClient", () => {
         options: [{ optionId: "opt-always", kind: "allow_always", name: "Always Allow" }],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "allow" }),
-            10,
-          );
-        }
-      });
+      answerWith("allow");
 
       const response = await client.requestPermission(params);
       expect(response.outcome.outcome).toBe("cancelled");
@@ -686,14 +586,7 @@ describe("AgentRQACPClient", () => {
         options: [{ optionId: "opt-default", kind: "other", name: "Maybe" }],
       } as any;
 
-      mcpBridge.on.mockImplementation((event: string, handler: Function) => {
-        if (event === "verdict") {
-          setTimeout(
-            () => handler({ requestId: "req-123", behavior: "allow" }),
-            10,
-          );
-        }
-      });
+      answerWith("allow");
 
       const response = await client.requestPermission(params);
       expect((response.outcome as any).optionId).toBe("opt-default");
@@ -1104,6 +997,130 @@ describe("AgentRQACPClient", () => {
       await c.flushReply("sess-1");
 
       expect(mcpBridge.callTool).toHaveBeenCalledWith("reply", { chatId: "task-123", text: "Hello world" });
+    });
+  });
+
+  describe("waiting for a verdict", () => {
+    const params = (overrides: Record<string, any> = {}) => ({
+      sessionId: "sess-1",
+      toolCall: { toolCallId: "call-1", title: "Bash", rawInput: { command: "ls" } },
+      options: [
+        { optionId: "opt-1", kind: "allow_once", name: "Allow" },
+        { optionId: "opt-2", kind: "reject_once", name: "Deny" },
+      ],
+      ...overrides,
+    }) as any;
+
+    it("should scope the request id to the session it came from", async () => {
+      answerWith("allow");
+      await client.requestPermission(params());
+
+      // agentrq keys its bookkeeping on the request id alone, workspace-wide,
+      // while tool call ids are only unique within one session.
+      expect(mcpBridge.sendNotification.mock.calls[0][1].request_id).toBe("sess-1:call-1");
+    });
+
+    it("should fall back to the bare tool call id when there is no session", async () => {
+      answerWith("allow");
+      await client.requestPermission(params({ sessionId: undefined }));
+
+      expect(mcpBridge.sendNotification.mock.calls[0][1].request_id).toBe("call-1");
+    });
+
+    it("should keep one verdict listener however many calls are waiting", async () => {
+      const waiting = [
+        client.requestPermission(params()),
+        client.requestPermission(params({ toolCall: { toolCallId: "call-2", title: "Bash" } })),
+        client.requestPermission(params({ toolCall: { toolCallId: "call-3", title: "Bash" } })),
+      ];
+      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(3));
+
+      // A listener per request was only ever removed on a matching verdict, so
+      // every unanswered request leaked one for the life of the process.
+      expect(mcpBridge.listenerCount("verdict")).toBe(1);
+
+      client.cancelPendingPermissions("test");
+      await Promise.all(waiting);
+      expect(client.pendingPermissionCount).toBe(0);
+    });
+
+    it("should ignore a verdict for a call that is not waiting", async () => {
+      answerWith("allow");
+      await client.requestPermission(params());
+
+      expect(() => mcpBridge.emit("verdict", { requestId: "gone", behavior: "allow" })).not.toThrow();
+    });
+
+    it("should give up on a call nobody answers, and stop the turn", async () => {
+      vi.useFakeTimers();
+      const cancel = vi.fn();
+      const bounded = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-1", {
+        permissionTimeoutMs: 60_000,
+      });
+      bounded.setSessionCanceller(cancel);
+
+      const waiting = bounded.requestPermission(params());
+      await vi.waitFor(() => expect(bounded.pendingPermissionCount).toBe(1));
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      // Cancelling as well as answering: the spec treats "cancelled" as the
+      // answer a client gives because it cancelled the turn. Answering alone
+      // would leave the agent free to carry on and ask again.
+      expect((await waiting).outcome.outcome).toBe("cancelled");
+      expect(cancel).toHaveBeenCalledWith("sess-1");
+      expect(bounded.pendingPermissionCount).toBe(0);
+      vi.useRealTimers();
+    });
+
+    it("should survive a turn that cannot be cancelled", async () => {
+      vi.useFakeTimers();
+      const bounded = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-1", {
+        permissionTimeoutMs: 60_000,
+      });
+      bounded.setSessionCanceller(() => {
+        throw new Error("connection gone");
+      });
+
+      const waiting = bounded.requestPermission(params());
+      await vi.waitFor(() => expect(bounded.pendingPermissionCount).toBe(1));
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect((await waiting).outcome.outcome).toBe("cancelled");
+      vi.useRealTimers();
+    });
+
+    it("should wait indefinitely when the timeout is switched off", async () => {
+      vi.useFakeTimers();
+      const unbounded = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-1", {
+        permissionTimeoutMs: 0,
+      });
+
+      const waiting = unbounded.requestPermission(params());
+      await vi.waitFor(() => expect(unbounded.pendingPermissionCount).toBe(1));
+      await vi.advanceTimersByTimeAsync(24 * 60 * 60_000);
+
+      expect(unbounded.pendingPermissionCount).toBe(1);
+      unbounded.cancelPendingPermissions("test over");
+      expect((await waiting).outcome.outcome).toBe("cancelled");
+      vi.useRealTimers();
+    });
+
+    it("should answer everything still waiting when the agent is gone", async () => {
+      const waiting = client.requestPermission(params());
+      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(1));
+
+      client.cancelPendingPermissions("agent process exited");
+
+      expect((await waiting).outcome.outcome).toBe("cancelled");
+      expect(client.pendingPermissionCount).toBe(0);
+    });
+
+    it("should say nothing when there is nothing waiting to cancel", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      client.cancelPendingPermissions("nothing doing");
+
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
     });
   });
 
