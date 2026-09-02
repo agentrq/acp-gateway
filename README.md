@@ -66,11 +66,51 @@ acp-gateway -- your-acp-agent --flag1 --flag2
 You can specify gateway options before the `--` separator:
 
 - `--max-concurrency` / `--maxConcurrency` `<number>`: Sets the maximum number of concurrent tasks allowed to prompt the ACP agent at once. Defaults to `2`.
+- `--auth-method <id>`: The authentication method to use when the agent asks for a login. Defaults to picking one automatically.
+- `--list-auth-methods`: Prints the login methods the agent advertises, then exits.
+- `--login [method-id]`: Logs in to the agent, then exits.
+- `--logout`: Ends the agent's authenticated state, then exits (only for agents that support logout).
 
 Example:
 ```bash
 acp-gateway --max-concurrency 4 -- gemini --acp
 ```
+
+### Authentication
+
+Agents that require a login advertise their login methods during the ACP handshake, and refuse to open a
+session until one has been used. `acp-gateway` handles that the same way an editor such as Zed does.
+
+List what an agent offers:
+
+```bash
+acp-gateway --list-auth-methods -- gemini --acp
+```
+
+Log in ahead of time — with no method id, you are asked to pick one:
+
+```bash
+acp-gateway --login -- gemini --acp
+acp-gateway --login oauth-personal -- gemini --acp   # or name the method directly
+```
+
+Log out again:
+
+```bash
+acp-gateway --logout -- gemini --acp
+```
+
+Nothing has to be done up front, though: if an agent refuses the first session because it needs a login,
+`acp-gateway` logs in and retries by itself.
+
+There are two kinds of method:
+
+- **Agent** methods — the agent runs the login itself (a browser flow, an API key it already holds). These
+  need nobody present, so they are chosen first and work in an unattended gateway.
+- **Terminal** methods — the agent's own binary is re-run interactively so you can log in at a TUI.
+  `acp-gateway` only offers to run these when it has a real terminal to hand over.
+
+Credentials are never stored by the gateway; the agent keeps its own, exactly as it does under an editor.
 
 ### Configuration
 
@@ -134,6 +174,7 @@ Example `.mcp.json`:
 | `src/acpClient.ts` | Implements the ACP `Client` interface — routes permission requests, handles session updates, and provides file operations. |
 | `src/mcpClient.ts` | `EventEmitter`-based MCP client with auto-reconnection, notification handling, and tool call dispatch. |
 | `src/config.ts` | Parses `.mcp.json` from the current directory tree up to 3 levels deep. |
+| `src/auth.ts` | ACP authentication — lists the agent's login methods, detects `auth_required`, and runs agent or terminal logins. |
 
 ## Development
 
@@ -156,6 +197,7 @@ npm test
 acp-gateway/
 ├── src/
 │   ├── acpClient.ts      # ACP Client implementation
+│   ├── auth.ts            # ACP authentication (login / logout)
 │   ├── config.ts          # .mcp.json loader
 │   ├── index.ts           # Entry point & orchestrator
 │   ├── mcpClient.ts       # MCP Bridge with auto-reconnect
@@ -169,6 +211,7 @@ acp-gateway/
 - **Auto-reconnection**: The MCP transport auto-reconnects on disconnection with exponential backoff (1s → 30s max).
 - **Notification-driven tasks**: The MCP server pushes task content via `notifications/claude/channel`; `acp-gateway` reacts immediately.
 - **Permission flow**: ACP agent requests permission → `acp-gateway` forwards to MCP server → waits for verdict → resolves the ACP permission.
+- **Authentication**: Login methods come from the `initialize` handshake; an `auth_required` refusal triggers a login and one retry of `newSession`.
 - **File I/O**: `readTextFile` / `writeTextFile` are proxied directly to the filesystem; paths are resolved relative to `process.cwd()`.
 
 ## Contributing
