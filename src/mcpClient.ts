@@ -17,6 +17,9 @@ export class MCPBridge extends EventEmitter {
   private isConnected = false;
   private isConnecting = false;
   private isClosed = false;
+  // Whether this bridge has ever been connected. A second connection is a
+  // reconnection, which matters to anything already waiting on the workspace.
+  private hasConnected = false;
 
   public getSessionId(): string | undefined {
     return (this.transport as any)?._sessionId;
@@ -43,6 +46,14 @@ export class MCPBridge extends EventEmitter {
         await this._connectOnce();
         this.isConnected = true;
         console.error(`[mcp] Connected to ${this.config.name}`);
+        if (this.hasConnected) {
+          // agentrq routes a permission verdict to the MCP session its request
+          // arrived on, and reconnecting mints a new one — so anything already
+          // waiting for an answer has just been orphaned. Say so, rather than
+          // let those calls sit until they time out.
+          this.emit("reconnected");
+        }
+        this.hasConnected = true;
       } catch (error: any) {
         if (this.isClosed) break;
         const delay = Math.min(initialDelay * Math.pow(2, attempt), maxDelay);

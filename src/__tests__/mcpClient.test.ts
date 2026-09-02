@@ -260,4 +260,20 @@ describe("MCPBridge", () => {
       });
     });
   });
+  it("should announce a reconnection, but not a first connection", async () => {
+    const bridge = new MCPBridge(config);
+    const reconnected = vi.fn();
+    bridge.on("reconnected", reconnected);
+
+    await bridge.connect();
+    expect(reconnected).not.toHaveBeenCalled();
+
+    // Losing the connection orphans every permission request in flight, since
+    // the workspace routes each verdict to the session it arrived on.
+    lastMockTransport.onclose();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(reconnected).toHaveBeenCalledTimes(1);
+  });
+
 });

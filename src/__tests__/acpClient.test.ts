@@ -1115,6 +1115,48 @@ describe("AgentRQACPClient", () => {
       expect(client.pendingPermissionCount).toBe(0);
     });
 
+    it("should re-send waiting calls when the workspace reconnects", async () => {
+      const waiting = client.requestPermission(params());
+      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(1));
+      const sentFirst = mcpBridge.sendNotification.mock.calls.length;
+
+      mcpBridge.emit("reconnected");
+      await vi.waitFor(() =>
+        expect(mcpBridge.sendNotification.mock.calls.length).toBe(sentFirst + 1),
+      );
+
+      // Same request id: the workspace has to recognise this as the decision it
+      // is already showing, not a new one to ask about again.
+      const [first, resent] = mcpBridge.sendNotification.mock.calls.map((c: any[]) => c[1]);
+      expect(resent).toEqual(first);
+      expect(client.pendingPermissionCount).toBe(1);
+
+      answerWith("allow");
+      expect((await waiting).outcome.outcome).toBe("selected");
+    });
+
+    it("should not talk to the workspace on reconnect when nothing is waiting", () => {
+      mcpBridge.emit("reconnected");
+
+      expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
+    });
+
+    it("should keep waiting when the re-send itself fails", async () => {
+      const waiting = client.requestPermission(params());
+      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(1));
+
+      mcpBridge.sendNotification.mockRejectedValueOnce(new Error("still down"));
+      mcpBridge.emit("reconnected");
+      await vi.waitFor(() =>
+        expect(mcpBridge.sendNotification.mock.calls.length).toBeGreaterThan(1),
+      );
+
+      // The next reconnect gets another go; giving up here would lose the turn.
+      expect(client.pendingPermissionCount).toBe(1);
+      client.cancelPendingPermissions("test over");
+      await waiting;
+    });
+
     it("should say nothing when there is nothing waiting to cancel", () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       client.cancelPendingPermissions("nothing doing");

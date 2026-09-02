@@ -70,6 +70,7 @@ export class AgentRQACPClient implements acp.Client {
   ) {
     this.permissionTimeoutMs = options.permissionTimeoutMs ?? DEFAULT_PERMISSION_TIMEOUT_MS;
     this.mcpBridge.on("verdict", this.onVerdict);
+    this.mcpBridge.on("reconnected", this.onWorkspaceReconnected);
   }
 
   /** How many tool calls are waiting on a human right now. */
@@ -100,6 +101,33 @@ export class AgentRQACPClient implements acp.Client {
       pending.settle({ outcome: "cancelled" });
     }
   }
+
+  /**
+   * Re-sends everything still waiting, after the workspace connection was
+   * re-established on a new session.
+   *
+   * A verdict is routed back to the session its request arrived on, so a
+   * request that was in flight across a reconnect can never be answered. The
+   * request id stays the same, which is what lets the workspace recognise this
+   * as the same pending decision rather than a new one to ask about again.
+   */
+  private onWorkspaceReconnected = (): void => {
+    if (this.pendingPermissions.size === 0) return;
+    console.error(
+      `[acp] Workspace reconnected — re-sending ${this.pendingPermissions.size} ` +
+        `permission request(s) that would otherwise never be answered`,
+    );
+    for (const pending of this.pendingPermissions.values()) {
+      void this.mcpBridge
+        .sendNotification("notifications/claude/channel/permission_request", pending.payload)
+        .catch((err) => {
+          console.error(
+            `[acp] Failed to re-send permission request ${pending.payload.request_id}:`,
+            err,
+          );
+        });
+    }
+  };
 
   /** Delivers a verdict to whichever tool call is waiting on it, if any. */
   private onVerdict = (data: { requestId: string; behavior: string }): void => {
