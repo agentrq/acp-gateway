@@ -8,7 +8,8 @@
 
 import { spawn } from "node:child_process";
 import { Writable, Readable } from "node:stream";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import * as path from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 const pkg = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
@@ -573,6 +574,46 @@ export async function resolveAgentCommand(
 }
 
 /**
+ * Whether a command can actually be run.
+ *
+ * A path is checked directly; a bare name is looked for along PATH, honouring
+ * PATHEXT on Windows where an executable is rarely named without a suffix.
+ */
+export function isRunnable(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: string = process.platform,
+): boolean {
+  if (command.includes("/") || (platform === "win32" && command.includes("\\"))) {
+    return existsSync(command);
+  }
+  const extensions =
+    platform === "win32" ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";") : [""];
+  const separator = platform === "win32" ? ";" : ":";
+  return (env.PATH ?? "")
+    .split(separator)
+    .filter(Boolean)
+    .some((dir) => extensions.some((ext) => existsSync(path.join(dir, command + ext))));
+}
+
+/**
+ * Refuses to start with an agent that cannot be run.
+ *
+ * The agent is not spawned until the first task arrives, so without this a
+ * mistyped command — or a registry id passed as if it were one — starts a
+ * gateway that looks healthy and only fails much later, out of sight.
+ */
+export function assertAgentRunnable(command: string, usedRegistryId: boolean): void {
+  if (isRunnable(command)) return;
+
+  const hint = usedRegistryId
+    ? `The registry says to run it as "${command}", which is not installed.`
+    : `If "${command}" is an ACP registry agent id, run it with --agent ${command} ` +
+      `(--list-agents shows what is published).`;
+  throw new Error(`Agent command "${command}" was not found. ${hint}`);
+}
+
+/**
  * Runs a one-shot auth command against the agent and shuts it down again.
  *
  * These commands exist so a login can be done deliberately — before any task
@@ -723,8 +764,21 @@ async function main() {
 
   // 2. Work out what actually starts the agent — a registry id, or the command
   // the user gave.
-  const resolved = await resolveAgentCommand(options, explicitCommand);
+  // These failures are all things the user can act on — an unknown registry
+  // id, no build for this platform, an unverifiable download, a mistyped
+  // command — so they get a sentence rather than a stack trace.
+  const fail = (err: unknown): never => {
+    console.error(`[acp-gateway] ${err instanceof Error ? err.message : err}`);
+    return process.exit(1);
+  };
+
+  const resolved = await resolveAgentCommand(options, explicitCommand).catch(fail);
   const acpCmdArgs = resolved.command;
+  try {
+    assertAgentRunnable(acpCmdArgs[0], Boolean(options.agentId));
+  } catch (err) {
+    fail(err);
+  }
   if (resolved.env) {
     // The registry entry's env is part of how that agent must be launched, so
     // it travels with the command into every session spawned from it.

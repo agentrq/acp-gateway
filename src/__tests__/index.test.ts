@@ -14,7 +14,9 @@ import {
   isInteractiveTerminal,
   openAgentConnection,
   parseGatewayArgs,
+  assertAgentRunnable,
   helpText,
+  isRunnable,
   printHelp,
   resolveAgentCommand,
   runListAgents,
@@ -643,6 +645,48 @@ describe("index", () => {
     it("should recognise both spellings of the help flag", () => {
       expect(parseGatewayArgs(["--help"]).command).toBe("help");
       expect(parseGatewayArgs(["-h"]).command).toBe("help");
+    });
+  });
+
+  describe("isRunnable", () => {
+    it("finds a command on PATH", () => {
+      expect(isRunnable("node", { PATH: process.env.PATH }, process.platform)).toBe(true);
+    });
+
+    it("does not find one that is not there", () => {
+      expect(isRunnable("acp-gateway-no-such-command", { PATH: process.env.PATH })).toBe(false);
+      expect(isRunnable("node", { PATH: "" })).toBe(false);
+      expect(isRunnable("node", {})).toBe(false);
+    });
+
+    it("checks a path directly rather than searching PATH", () => {
+      expect(isRunnable(process.execPath, {})).toBe(true);
+      expect(isRunnable("/no/such/agent", {})).toBe(false);
+    });
+
+    it("honours PATHEXT and backslashes on Windows", () => {
+      // A bare name on Windows resolves through PATHEXT, so "npx" alone finds
+      // nothing while "npx.cmd" would.
+      expect(isRunnable("npx", { PATH: "C:\\tools", PATHEXT: ".EXE" }, "win32")).toBe(false);
+      expect(isRunnable("C:\\nope\\agent.exe", {}, "win32")).toBe(false);
+    });
+  });
+
+  describe("assertAgentRunnable", () => {
+    it("accepts a command that exists", () => {
+      expect(() => assertAgentRunnable("node", false)).not.toThrow();
+    });
+
+    it("suggests --agent when the command looks like a registry id", () => {
+      expect(() => assertAgentRunnable("antigravity-acp", false)).toThrow(
+        /run it with --agent antigravity-acp/,
+      );
+    });
+
+    it("blames the registry when the id was already resolved", () => {
+      expect(() => assertAgentRunnable("acp-gateway-no-such-runner", true)).toThrow(
+        /The registry says to run it as "acp-gateway-no-such-runner", which is not installed/,
+      );
     });
   });
 
