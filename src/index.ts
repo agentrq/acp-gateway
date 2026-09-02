@@ -149,7 +149,11 @@ export interface OpenAgentConnectionOptions {
   env?: Record<string, string>;
   /** Used in log lines to say which agent process is being talked about. */
   label: string;
-  taskId?: string;
+  /**
+   * Which task a session belongs to. One agent process serves every task, so
+   * this cannot be fixed when the connection is opened.
+   */
+  getTaskIdForSession?: (sessionId: string) => string | undefined;
   /** Runs when the agent process dies or fails to start. */
   onExit?: () => void;
 }
@@ -164,7 +168,7 @@ export async function openAgentConnection({
   mcpBridge,
   env,
   label,
-  taskId,
+  getTaskIdForSession,
   onExit,
 }: OpenAgentConnectionOptions): Promise<AgentConnection> {
   const [cmd, ...cmdArgs] = acpCmdArgs;
@@ -175,7 +179,7 @@ export async function openAgentConnection({
     env: { ...process.env, ...env },
   });
 
-  const acpClient = new AgentRQACPClient(mcpBridge, () => taskId, {
+  const acpClient = new AgentRQACPClient(mcpBridge, getTaskIdForSession, {
     permissionTimeoutMs: permissionConfig.timeoutMs,
   });
 
@@ -268,6 +272,85 @@ export async function createSessionWithAuth(
   }
 }
 
+/**
+ * The one agent process, and the sessions running on it.
+ *
+ * Spawning a process per task left one resident agent per distinct task id,
+ * reclaimed only when it happened to die: `--max-concurrency` bounds how many
+ * turns run at once, not how many agents are alive. ACP already has the right
+ * unit of isolation for this — a session — so one process now serves them all.
+ */
+interface AgentRuntime {
+  process: any;
+  connection: acp.ClientSideConnection;
+  acpClient: AgentRQACPClient;
+  initResult: acp.InitializeResponse;
+  /** sessionId → task, so replies and approvals find where they belong. */
+  sessionTasks: Map<string, string>;
+  /** sessionId → the modes it was created with, for putting a drifted one back. */
+  sessionModes: Map<string, acp.SessionModeState | null | undefined>;
+}
+
+let agentRuntime: AgentRuntime | undefined;
+let agentRuntimeStarting: Promise<AgentRuntime> | undefined;
+
+/** Forgets the agent, so the next task starts a fresh one. */
+function discardAgentRuntime(): void {
+  agentRuntime = undefined;
+  activeSessions.clear();
+}
+
+async function startAgentRuntime(
+  acpCmdArgs: string[],
+  agentrqConfig: McpServerConfig,
+  mcpBridge: MCPBridge,
+): Promise<AgentRuntime> {
+  const sessionTasks = new Map<string, string>();
+  const sessionModes = new Map<string, acp.SessionModeState | null | undefined>();
+
+  const connection = await openAgentConnection({
+    acpCmdArgs,
+    mcpBridge,
+    env: agentrqConfig.env,
+    label: "the workspace",
+    getTaskIdForSession: (sessionId) => sessionTasks.get(sessionId),
+    onExit: discardAgentRuntime,
+  });
+
+  // Every session shares this client, so the mode watcher is set once and
+  // looks up whichever session drifted.
+  connection.acpClient.setModeChangeHandler((sessionId, modeId) =>
+    handleAgentModeChange(connection.connection, sessionId, modeId, sessionModes.get(sessionId)),
+  );
+
+  agentRuntime = { ...connection, sessionTasks, sessionModes };
+  return agentRuntime;
+}
+
+/**
+ * The running agent, started on first use.
+ *
+ * Tasks arriving together must not each spawn one, so a start already under
+ * way is shared rather than repeated.
+ */
+export async function getAgentRuntime(
+  acpCmdArgs: string[],
+  agentrqConfig: McpServerConfig,
+  mcpBridge: MCPBridge,
+): Promise<AgentRuntime> {
+  if (agentRuntime) return agentRuntime;
+  agentRuntimeStarting ??= startAgentRuntime(acpCmdArgs, agentrqConfig, mcpBridge).finally(() => {
+    agentRuntimeStarting = undefined;
+  });
+  return agentRuntimeStarting;
+}
+
+/** Stops the agent, if one is running. Used when the gateway itself is done. */
+export function shutdownAgent(): void {
+  agentRuntime?.process.kill();
+  discardAgentRuntime();
+}
+
 export async function getOrCreateSession(
   taskId: string | undefined,
   acpCmdArgs: string[],
@@ -282,42 +365,33 @@ export async function getOrCreateSession(
   }
 
   const [cmd, ...cmdArgs] = acpCmdArgs;
-  const { process: agentProcess, connection, acpClient, initResult } =
-    await openAgentConnection({
-      acpCmdArgs,
-      mcpBridge,
-      env: agentrqConfig.env,
-      label: `task ${key}`,
-      taskId,
-      onExit: () => activeSessions.delete(key),
-    });
+  const runtime = await getAgentRuntime(acpCmdArgs, agentrqConfig, mcpBridge);
 
   const newSessionParams: AcpNewSessionParams = {
     cwd: process.cwd(),
-    mcpServers: mapMcpServers(configs, initResult.agentCapabilities),
+    mcpServers: mapMcpServers(configs, runtime.initResult.agentCapabilities),
   };
 
-  const sessionResult = await createSessionWithAuth(connection, newSessionParams, {
-    methods: initResult.authMethods,
+  const sessionResult = await createSessionWithAuth(runtime.connection, newSessionParams, {
+    methods: runtime.initResult.authMethods,
     launch: { command: cmd, args: cmdArgs, env: agentrqConfig.env },
     preferredId: authConfig.methodId,
     interactive: isInteractiveTerminal(),
   });
   console.error(`[acp] Created session ${sessionResult.sessionId} for task ${key}`);
 
-  await enforceHumanApprovalMode(connection, sessionResult);
-  // The mode is pinned once here, but agents may move themselves back out of
-  // it, so keep watching for the rest of the session's life.
-  acpClient.setModeChangeHandler((changedSessionId, modeId) =>
-    handleAgentModeChange(connection, changedSessionId, modeId, sessionResult.modes),
-  );
+  // "default" is a slot in this map, not a task. Treating it as one would post
+  // the agent's replies to a chat called "default".
+  if (taskId) runtime.sessionTasks.set(sessionResult.sessionId, taskId);
+  runtime.sessionModes.set(sessionResult.sessionId, sessionResult.modes);
+  await enforceHumanApprovalMode(runtime.connection, sessionResult);
 
   const sessionInfo: AgentSession = {
-    process: agentProcess,
-    connection,
-    acpClient,
+    process: runtime.process,
+    connection: runtime.connection,
+    acpClient: runtime.acpClient,
     sessionId: sessionResult.sessionId,
-    initResult,
+    initResult: runtime.initResult,
   };
   activeSessions.set(key, sessionInfo);
   return sessionInfo;
@@ -456,46 +530,6 @@ export async function handleAgentModeChange(
     modes: { availableModes: available, currentModeId },
   });
 }
-
-export function createAcpSessionSwitcher(
-  connection: acp.ClientSideConnection,
-  params: AcpNewSessionParams,
-  initialSessionId: string,
-) {
-  let currentSessionId = initialSessionId;
-  const taskSessionMap = new Map<string, string>();
-  const sessionTaskMap = new Map<string, string>();
-
-  return {
-    getSessionId(): string {
-      return currentSessionId;
-    },
-    getTaskIdForSession(sessionId: string): string | undefined {
-      return sessionTaskMap.get(sessionId);
-    },
-    async ensureForTask(taskId: string | undefined): Promise<string> {
-      if (taskId === undefined) {
-        return currentSessionId;
-      }
-
-      const existing = taskSessionMap.get(taskId);
-      if (existing) {
-        currentSessionId = existing;
-        return existing;
-      }
-
-      const next = await connection.newSession(params);
-      currentSessionId = next.sessionId;
-      taskSessionMap.set(taskId, currentSessionId);
-      sessionTaskMap.set(currentSessionId, taskId);
-      console.error(
-        `[acp] New ACP session for task ${taskId} (MCP connection unchanged): ${currentSessionId}`,
-      );
-      return currentSessionId;
-    },
-  };
-}
-
 
 export class TaskQueue {
   private activeTasks = 0;
@@ -1022,9 +1056,7 @@ async function main() {
   } catch (error) {
     console.error("[acp-gateway] Error:", error);
   } finally {
-    for (const session of activeSessions.values()) {
-      session.process.kill();
-    }
+    shutdownAgent();
     await mcpBridge.close();
     process.exit(0);
   }
@@ -1037,13 +1069,10 @@ async function main() {
  */
 export async function checkForNextTask(
   mcpBridge: MCPBridge,
-  acpCmdArgsOrConnection: string[] | acp.ClientSideConnection,
-  configsOrSessionSwitcher: McpServerConfig[] | ReturnType<typeof createAcpSessionSwitcher>,
-  agentrqConfigOrAcpClient: McpServerConfig | AgentRQACPClient,
+  acpCmdArgs: string[],
+  configs: McpServerConfig[],
+  agentrqConfig: McpServerConfig,
   taskQueue?: TaskQueue,
-  acpCmdArgs?: string[],
-  configs?: McpServerConfig[],
-  agentrqConfig?: McpServerConfig,
 ) {
   console.error("[bridge] Checking for next task via MCP server...");
   try {
@@ -1060,78 +1089,50 @@ export async function checkForNextTask(
     }>;
     const content = contentBlock[0] as { type: string; text: string };
     if (
-      content &&
-      content.text &&
-      !content.text.includes("no pending tasks exist")
+      !content ||
+      !content.text ||
+      content.text.includes("no pending tasks exist")
     ) {
-      const text = content.text;
-      const taskId = extractTaskIdFromText(text);
-      if (taskId) {
-        if (lastTaskContent.get(taskId) === text) {
-          console.log(`[bridge] Dropping repetitive checked task for ${taskId}`);
-          return;
-        }
-        lastTaskContent.set(taskId, text);
+      console.error("[bridge] No pending tasks available.");
+      return;
+    }
+
+    const text = content.text;
+    const taskId = extractTaskIdFromText(text);
+    if (taskId) {
+      if (lastTaskContent.get(taskId) === text) {
+        console.log(`[bridge] Dropping repetitive checked task for ${taskId}`);
+        return;
       }
-      console.error(
-        `[bridge] Found task: "${text.slice(0, 50).replace(/\n/g, " ")}..."`,
+      lastTaskContent.set(taskId, text);
+    }
+    console.error(
+      `[bridge] Found task: "${text.slice(0, 50).replace(/\n/g, " ")}..."`,
+    );
+
+    const runFn = async () => {
+      const session = await getOrCreateSession(
+        taskId,
+        acpCmdArgs,
+        configs,
+        agentrqConfig,
+        mcpBridge,
       );
 
-      const runFn = async () => {
-        let connectionToUse: acp.ClientSideConnection | undefined;
-        let acpClientToUse: AgentRQACPClient | undefined;
-        let sessionIdToUse: string | undefined;
+      const promptResult = await session.connection.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text }],
+      });
 
-        let actualAcpCmdArgs: string[] = [];
-        let actualConfigs: McpServerConfig[] = [];
-        let actualAgentrqConfig: McpServerConfig | undefined;
+      await session.acpClient.flushReply(session.sessionId);
+      await session.acpClient.reportStopReason(session.sessionId, promptResult.stopReason);
+      console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
+    };
 
-        if (Array.isArray(acpCmdArgsOrConnection)) {
-          actualAcpCmdArgs = acpCmdArgsOrConnection;
-          actualConfigs = configsOrSessionSwitcher as McpServerConfig[];
-          actualAgentrqConfig = agentrqConfigOrAcpClient as McpServerConfig;
-        } else {
-          connectionToUse = acpCmdArgsOrConnection as acp.ClientSideConnection;
-          acpClientToUse = agentrqConfigOrAcpClient as AgentRQACPClient;
-          const switcher = configsOrSessionSwitcher as any;
-          if (switcher && typeof switcher.ensureForTask === "function") {
-            sessionIdToUse = await switcher.ensureForTask(taskId);
-          }
-          actualAcpCmdArgs = acpCmdArgs || [];
-          actualConfigs = configs || [];
-          actualAgentrqConfig = agentrqConfig;
-        }
-
-        if (!connectionToUse) {
-          const sessionInfo = await getOrCreateSession(
-            taskId,
-            actualAcpCmdArgs,
-            actualConfigs,
-            actualAgentrqConfig!,
-            mcpBridge,
-          );
-          connectionToUse = sessionInfo.connection;
-          sessionIdToUse = sessionInfo.sessionId;
-          acpClientToUse = sessionInfo.acpClient;
-        }
-
-        const promptResult = await connectionToUse.prompt({
-          sessionId: sessionIdToUse!,
-          prompt: [{ type: "text", text }],
-        });
-
-        await acpClientToUse!.flushReply(sessionIdToUse!);
-        await acpClientToUse!.reportStopReason(sessionIdToUse!, promptResult.stopReason);
-        console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
-      };
-
-      if (taskQueue) {
-        await taskQueue.run(runFn);
-      } else {
-        await runFn();
-      }
+    if (taskQueue) {
+      await taskQueue.run(runFn);
     } else {
-      console.error("[bridge] No pending tasks available.");
+      await runFn();
     }
   } catch (err) {
     console.error("[bridge] Failed to check for next task:", err);
@@ -1149,6 +1150,17 @@ if (process.env.NODE_ENV !== "test") {
   process.on("uncaughtException", (err) => {
     console.error("[acp-gateway] Uncaught exception (continuing):", err);
   });
+
+  // The agent is a child process, but not one the OS cleans up with us: killing
+  // the gateway leaves it running, reparented and unreachable. Only main()'s
+  // own exit path stopped it, which a signal never reaches.
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      console.error(`[acp-gateway] ${signal} — stopping the agent and exiting.`);
+      shutdownAgent();
+      process.exit(0);
+    });
+  }
 
   // A rejection from main() itself means startup failed before the bridge was
   // established — that is genuinely fatal, so exit.

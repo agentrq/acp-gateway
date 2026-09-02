@@ -3,7 +3,6 @@ import { Writable, Readable } from "node:stream";
 import { EventEmitter } from "node:events";
 import * as acp from "@agentclientprotocol/sdk";
 import {
-  createAcpSessionSwitcher,
   checkForNextTask,
   mapMcpServers,
   TaskQueue,
@@ -22,6 +21,7 @@ import {
   runListAgents,
   pickHumanApprovalMode,
   enforceHumanApprovalMode,
+  shutdownAgent,
   handleAgentModeChange,
   runAgentCommand,
 } from "../index.js";
@@ -71,6 +71,14 @@ vi.mock("@agentclientprotocol/sdk", async () => {
 });
 
 describe("index", () => {
+  // One agent process now serves every task, so it outlives a single test —
+  // and would hand the next one a connection it never asked for.
+  beforeEach(() => {
+    shutdownAgent();
+    activeSessions.clear();
+    spawnedAgents.length = 0;
+  });
+
   describe("mapMcpServers", () => {
     it("should correctly map HTTP servers with headers and env", () => {
       const configs: McpServerConfig[] = [{
@@ -193,203 +201,72 @@ describe("index", () => {
     });
   });
 
-  describe("createAcpSessionSwitcher", () => {
-    let mockConnection: any;
-    let params: any;
-
-    beforeEach(() => {
-      mockConnection = {
-        newSession: vi.fn().mockResolvedValue({ sessionId: "new-session-id" }),
-      };
-      params = { cwd: "/test", mcpServers: [{ name: "s1", url: "http://s1", headers: [] }] };
-    });
-
-    it("should return initial session ID", () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      expect(switcher.getSessionId()).toBe("initial-id");
-    });
-
-    it("should return current session ID if taskId is undefined", async () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      const id = await switcher.ensureForTask(undefined);
-      expect(id).toBe("initial-id");
-      expect(mockConnection.newSession).not.toHaveBeenCalled();
-    });
-
-    it("should create a new session on first call with taskId", async () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      const id = await switcher.ensureForTask("task-1");
-      expect(id).toBe("new-session-id");
-      expect(mockConnection.newSession).toHaveBeenCalled();
-
-      // Second call with same taskId should still return same ID
-      const id2 = await switcher.ensureForTask("task-1");
-      expect(id2).toBe("new-session-id");
-      expect(mockConnection.newSession).toHaveBeenCalledTimes(1);
-    });
-
-    it("should create a new session when taskId changes", async () => {
-      params = { cwd: "/test", mcpServers: [{ name: "s1", url: "http://s1", headers: [] }] };
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-
-      // Set initial task
-      await switcher.ensureForTask("task-1");
-
-      // Change task
-      const id = await switcher.ensureForTask("task-2");
-
-      expect(id).toBe("new-session-id");
-      expect(mockConnection.newSession).toHaveBeenCalledTimes(2);
-      expect(switcher.getSessionId()).toBe("new-session-id");
-    });
-
-    it("should return existing session when a previously seen task returns", async () => {
-      mockConnection.newSession
-        .mockResolvedValueOnce({ sessionId: "session-for-task-1" })
-        .mockResolvedValueOnce({ sessionId: "session-for-task-2" });
-
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-
-      const id1 = await switcher.ensureForTask("task-1");
-      expect(id1).toBe("session-for-task-1");
-
-      const id2 = await switcher.ensureForTask("task-2");
-      expect(id2).toBe("session-for-task-2");
-
-      // task-1 returns — must reuse session-for-task-1, not create a third session
-      const id3 = await switcher.ensureForTask("task-1");
-      expect(id3).toBe("session-for-task-1");
-      expect(mockConnection.newSession).toHaveBeenCalledTimes(2);
-    });
-  });
-
-  describe("createAcpSessionSwitcher – getTaskIdForSession", () => {
-    let mockConnection: any;
-    let params: any;
-
-    beforeEach(() => {
-      mockConnection = {
-        newSession: vi.fn()
-          .mockResolvedValueOnce({ sessionId: "session-for-task-1" })
-          .mockResolvedValueOnce({ sessionId: "session-for-task-2" }),
-      };
-      params = { cwd: "/test", mcpServers: [] };
-    });
-
-    it("should return taskId for a known session", async () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      await switcher.ensureForTask("task-1");
-      expect(switcher.getTaskIdForSession("session-for-task-1")).toBe("task-1");
-    });
-
-    it("should return undefined for an unknown session", async () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      expect(switcher.getTaskIdForSession("unknown-session")).toBeUndefined();
-    });
-
-    it("should track multiple sessions independently", async () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      await switcher.ensureForTask("task-1");
-      await switcher.ensureForTask("task-2");
-      expect(switcher.getTaskIdForSession("session-for-task-1")).toBe("task-1");
-      expect(switcher.getTaskIdForSession("session-for-task-2")).toBe("task-2");
-    });
-  });
-
   describe("checkForNextTask", () => {
     let mockMcpBridge: any;
-    let mockConnection: any;
-    let mockSessionSwitcher: any;
-    let mockAcpClient: any;
+    const configs: any[] = [];
+    const agentrqConfig: any = { env: {} };
 
     beforeEach(() => {
       vi.clearAllMocks();
-      mockMcpBridge = {
-        callTool: vi.fn(),
-      };
-      mockConnection = {
-        prompt: vi.fn().mockResolvedValue({ stopReason: "complete" }),
-      };
-      mockSessionSwitcher = {
-        getSessionId: vi.fn().mockReturnValue("current-session"),
-        ensureForTask: vi.fn().mockResolvedValue("current-session"),
-      };
-      mockAcpClient = {
-        flushReply: vi.fn().mockResolvedValue(undefined),
-      };
-
-      // Mock console.error to avoid cluttering test output
+      activeSessions.clear();
+      shutdownAgent();
+      spawnedAgents.length = 0;
+      mockMcpBridge = Object.assign(new EventEmitter(), { callTool: vi.fn() });
       vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(console, "log").mockImplementation(() => {});
     });
 
-    it("should do nothing if no tasks are found", async () => {
-      mockMcpBridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "no pending tasks exist" }],
-      });
+    const found = (text: string) => ({ isError: false, content: [{ type: "text", text }] });
 
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
+    it("should do nothing if no tasks are found", async () => {
+      mockMcpBridge.callTool.mockResolvedValue(found("no pending tasks exist"));
+
+      await checkForNextTask(mockMcpBridge, ["node", "agent.js"], configs, agentrqConfig);
 
       expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getTask");
-      expect(mockConnection.prompt).not.toHaveBeenCalled();
+      expect(spawnedAgents).toHaveLength(0);
     });
 
     it("should handle error from MCP bridge", async () => {
-      mockMcpBridge.callTool.mockResolvedValue({
-        isError: true,
-        content: "some error",
-      });
+      mockMcpBridge.callTool.mockResolvedValue({ isError: true, content: "some error" });
 
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
+      await checkForNextTask(mockMcpBridge, ["node", "agent.js"], configs, agentrqConfig);
 
-      expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getTask");
-      expect(mockConnection.prompt).not.toHaveBeenCalled();
+      expect(spawnedAgents).toHaveLength(0);
     });
 
-    it("should process task and NOT recurse if task is found", async () => {
-      mockMcpBridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "Task ID: T1\ndo something" }],
-      });
+    it("should prompt the agent with the task it found", async () => {
+      mockMcpBridge.callTool.mockResolvedValue(found("Task ID: T1\ndo something"));
 
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
+      await checkForNextTask(mockMcpBridge, ["node", "agent.js"], configs, agentrqConfig);
 
-      expect(mockMcpBridge.callTool).toHaveBeenCalledTimes(1);
-      expect(mockSessionSwitcher.ensureForTask).toHaveBeenCalledWith("T1");
-      expect(mockConnection.prompt).toHaveBeenCalledWith({
-        sessionId: "current-session",
+      const session = activeSessions.get("T1")!;
+      expect(session.connection.prompt).toHaveBeenCalledWith({
+        sessionId: "test-sess-123",
         prompt: [{ type: "text", text: "Task ID: T1\ndo something" }],
       });
-      expect(mockAcpClient.flushReply).toHaveBeenCalledWith("current-session");
     });
 
     it("should handle exceptions during execution", async () => {
       mockMcpBridge.callTool.mockRejectedValue(new Error("network error"));
 
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
+      await checkForNextTask(mockMcpBridge, ["node", "agent.js"], configs, agentrqConfig);
 
       expect(console.error).toHaveBeenCalledWith(
         expect.stringContaining("Failed to check for next task"),
-        expect.any(Error)
+        expect.any(Error),
       );
     });
 
     it("should drop repetitive task messages for the same taskId", async () => {
-      mockMcpBridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "Task ID: T-Rep\nsome repetitive task" }],
-      });
+      mockMcpBridge.callTool.mockResolvedValue(found("Task ID: T-Rep\nsome repetitive task"));
 
-      // First run: should execute
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
-      expect(mockConnection.prompt).toHaveBeenCalledTimes(1);
+      await checkForNextTask(mockMcpBridge, ["node", "agent.js"], configs, agentrqConfig);
+      const prompt = activeSessions.get("T-Rep")!.connection.prompt as any;
+      expect(prompt).toHaveBeenCalledTimes(1);
 
-      // Reset mock connection call count
-      mockConnection.prompt.mockClear();
-
-      // Second run with same content: should drop and not execute
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
-      expect(mockConnection.prompt).not.toHaveBeenCalled();
+      await checkForNextTask(mockMcpBridge, ["node", "agent.js"], configs, agentrqConfig);
+      expect(prompt).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -483,6 +360,84 @@ describe("index", () => {
       expect(session).toBeDefined();
       expect(session.sessionId).toBe("test-sess-123");
       expect(activeSessions.has("T-New")).toBe(true);
+    });
+
+    it("should serve every task from one agent process", async () => {
+      const mockBridge: any = fakeBridge();
+      // Distinct session ids, so the two tasks can be told apart.
+      let n = 0;
+      vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
+        return {
+          initialize: vi.fn().mockResolvedValue({ protocolVersion: 1 }),
+          newSession: vi.fn().mockImplementation(async () => ({ sessionId: `sess-${++n}` })),
+          prompt: vi.fn(),
+        } as any;
+      } as any);
+
+      const first = await getOrCreateSession("T-A", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      const second = await getOrCreateSession("T-B", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      // Spawning per task left one resident agent per distinct task id.
+      expect(spawnedAgents).toHaveLength(1);
+      expect(first.sessionId).toBe("sess-1");
+      expect(second.sessionId).toBe("sess-2");
+      expect(first.process).toBe(second.process);
+      expect(first.connection).toBe(second.connection);
+    });
+
+    it("should start the agent once for tasks that arrive together", async () => {
+      const mockBridge: any = fakeBridge();
+
+      await Promise.all([
+        getOrCreateSession("T-P1", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+        getOrCreateSession("T-P2", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+      ]);
+
+      expect(spawnedAgents).toHaveLength(1);
+    });
+
+    it("should start a fresh agent after the old one dies", async () => {
+      const mockBridge: any = fakeBridge();
+      await getOrCreateSession("T-Died", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      expect(spawnedAgents).toHaveLength(1);
+
+      spawnedAgents[0].emit("exit", 1, null);
+      expect(activeSessions.size).toBe(0);
+
+      await getOrCreateSession("T-Died", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      expect(spawnedAgents).toHaveLength(2);
+    });
+
+    it("should not treat a task-less session as a task called default", async () => {
+      const mockBridge: any = Object.assign(fakeBridge(), { callTool: vi.fn() });
+      const session = await getOrCreateSession(
+        undefined,
+        ["node", "agent.js"],
+        [],
+        { env: {} } as any,
+        mockBridge,
+      );
+
+      // getTask can hand back a task whose id could not be read. Its replies
+      // have nowhere to go — they must not go to a chat named "default".
+      await session.acpClient.sessionUpdate({
+        sessionId: session.sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hi" } },
+      } as any);
+      await session.acpClient.flushReply(session.sessionId);
+
+      expect(mockBridge.callTool).not.toHaveBeenCalled();
+      expect(activeSessions.has("default")).toBe(true);
+    });
+
+    it("should stop the agent when the gateway is done with it", async () => {
+      const mockBridge: any = fakeBridge();
+      await getOrCreateSession("T-Stop", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      shutdownAgent();
+
+      expect(spawnedAgents[0].kill).toHaveBeenCalled();
+      expect(activeSessions.size).toBe(0);
     });
 
     it("should return cached session when already created", async () => {
