@@ -38,6 +38,15 @@ export function mapMcpServers(configs: McpServerConfig[]): acp.McpServer[] {
 }
 import { AgentRQACPClient } from "./acpClient.js";
 import {
+  describeAuthMethods,
+  isAuthRequiredError,
+  login,
+  logout,
+  supportsLogout,
+  type AuthConnection,
+  type LoginOptions,
+} from "./auth.js";
+import {
   extractTaskIdFromMeta,
   extractTaskIdFromText,
 } from "./taskIdentity.js";
@@ -49,48 +58,81 @@ export interface AgentSession {
   connection: acp.ClientSideConnection;
   acpClient: AgentRQACPClient;
   sessionId: string;
+  initResult: acp.InitializeResponse;
 }
 
 export const activeSessions = new Map<string, AgentSession>();
 
-export async function getOrCreateSession(
-  taskId: string | undefined,
-  acpCmdArgs: string[],
-  configs: McpServerConfig[],
-  agentrqConfig: McpServerConfig,
-  mcpBridge: MCPBridge,
-): Promise<AgentSession> {
-  const key = taskId || "default";
-  const existing = activeSessions.get(key);
-  if (existing) {
-    return existing;
-  }
+/** Login preferences taken from the CLI, consulted whenever an agent demands auth. */
+export const authConfig: { methodId?: string } = {};
 
+/**
+ * Whether a human is sitting in front of this process.
+ *
+ * Terminal logins hand the agent our own stdio, and the "which login method?"
+ * prompt needs someone to answer it — neither works when the gateway runs
+ * unattended under a supervisor.
+ */
+export function isInteractiveTerminal(): boolean {
+  return Boolean(process.stdin.isTTY && process.stderr.isTTY);
+}
+
+export interface AgentConnection {
+  process: any;
+  connection: acp.ClientSideConnection;
+  acpClient: AgentRQACPClient;
+  initResult: acp.InitializeResponse;
+}
+
+export interface OpenAgentConnectionOptions {
+  acpCmdArgs: string[];
+  mcpBridge: MCPBridge;
+  env?: Record<string, string>;
+  /** Used in log lines to say which agent process is being talked about. */
+  label: string;
+  taskId?: string;
+  /** Runs when the agent process dies or fails to start. */
+  onExit?: () => void;
+}
+
+/**
+ * Spawns an ACP agent, wires the JSON-RPC streams to it and completes the
+ * `initialize` handshake, returning the connection plus what the agent said
+ * about itself — including the login methods it advertises.
+ */
+export async function openAgentConnection({
+  acpCmdArgs,
+  mcpBridge,
+  env,
+  label,
+  taskId,
+  onExit,
+}: OpenAgentConnectionOptions): Promise<AgentConnection> {
   const [cmd, ...cmdArgs] = acpCmdArgs;
-  console.error(`[acp] Spawning agent for task ${key}: ${cmd} ${cmdArgs.join(" ")}`);
+  console.error(`[acp] Spawning agent for ${label}: ${cmd} ${cmdArgs.join(" ")}`);
 
   const agentProcess = spawn(cmd, cmdArgs, {
     stdio: ["pipe", "pipe", "inherit"],
-    env: { ...process.env, ...agentrqConfig.env },
+    env: { ...process.env, ...env },
   });
 
   // Guard against unhandled child-process failures. Without these listeners a
   // crashed agent (e.g. on network loss) leaves a broken stdin pipe; the next
   // write raises EPIPE as an uncaught error and takes the gateway down with it.
   agentProcess.on("error", (err: Error) => {
-    console.error(`[acp] Agent process error for task ${key}:`, err.message);
-    activeSessions.delete(key);
+    console.error(`[acp] Agent process error for ${label}:`, err.message);
+    onExit?.();
   });
   agentProcess.on("exit", (code: number | null, signal: string | null) => {
     console.error(
-      `[acp] Agent process for task ${key} exited (code=${code}, signal=${signal})`,
+      `[acp] Agent process for ${label} exited (code=${code}, signal=${signal})`,
     );
-    activeSessions.delete(key);
+    onExit?.();
   });
   // stdin can emit EPIPE when the child dies mid-write; swallow it so it
   // doesn't surface as an uncaught exception.
   agentProcess.stdin?.on("error", (err: Error) => {
-    console.error(`[acp] Agent stdin error for task ${key}:`, err.message);
+    console.error(`[acp] Agent stdin error for ${label}:`, err.message);
   });
 
   const input = Writable.toWeb(agentProcess.stdin!);
@@ -116,19 +158,82 @@ export async function getOrCreateSession(
         form: {},
         url: {},
       },
+      // Only claim terminal logins when we can actually hand the agent a
+      // terminal; otherwise the agent may offer a method we cannot run.
+      auth: {
+        terminal: isInteractiveTerminal(),
+      },
     },
   });
 
   console.error(
-    `[acp] Connected to agent for task ${key} (protocol v${initResult.protocolVersion})`,
+    `[acp] Connected to agent for ${label} (protocol v${initResult.protocolVersion})`,
   );
+  if (initResult.authMethods?.length) {
+    console.error(
+      `[auth] Agent offers these login methods:\n${describeAuthMethods(initResult.authMethods)}`,
+    );
+  }
+
+  return { process: agentProcess, connection, acpClient, initResult };
+}
+
+/**
+ * Starts a session, logging in first if the agent refuses without one.
+ *
+ * Agents only report `auth_required` when the session is requested, so this is
+ * where a first-run login belongs: authenticate once, then retry.
+ */
+export async function createSessionWithAuth(
+  connection: acp.ClientSideConnection,
+  params: AcpNewSessionParams,
+  auth: Omit<LoginOptions, "connection">,
+): Promise<acp.NewSessionResponse> {
+  try {
+    return await connection.newSession(params);
+  } catch (err) {
+    if (!isAuthRequiredError(err)) throw err;
+    console.error("[auth] Agent requires authentication before a session can start.");
+    await login({ ...auth, connection: connection as unknown as AuthConnection });
+    return await connection.newSession(params);
+  }
+}
+
+export async function getOrCreateSession(
+  taskId: string | undefined,
+  acpCmdArgs: string[],
+  configs: McpServerConfig[],
+  agentrqConfig: McpServerConfig,
+  mcpBridge: MCPBridge,
+): Promise<AgentSession> {
+  const key = taskId || "default";
+  const existing = activeSessions.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const [cmd, ...cmdArgs] = acpCmdArgs;
+  const { process: agentProcess, connection, acpClient, initResult } =
+    await openAgentConnection({
+      acpCmdArgs,
+      mcpBridge,
+      env: agentrqConfig.env,
+      label: `task ${key}`,
+      taskId,
+      onExit: () => activeSessions.delete(key),
+    });
 
   const newSessionParams: AcpNewSessionParams = {
     cwd: process.cwd(),
     mcpServers: mapMcpServers(configs),
   };
 
-  const sessionResult = await connection.newSession(newSessionParams);
+  const sessionResult = await createSessionWithAuth(connection, newSessionParams, {
+    methods: initResult.authMethods,
+    launch: { command: cmd, args: cmdArgs, env: agentrqConfig.env },
+    preferredId: authConfig.methodId,
+    interactive: isInteractiveTerminal(),
+  });
   console.error(`[acp] Created session ${sessionResult.sessionId} for task ${key}`);
 
   await enforceHumanApprovalMode(connection, sessionResult);
@@ -138,6 +243,7 @@ export async function getOrCreateSession(
     connection,
     acpClient,
     sessionId: sessionResult.sessionId,
+    initResult,
   };
   activeSessions.set(key, sessionInfo);
   return sessionInfo;
@@ -313,6 +419,125 @@ export class TaskQueue {
   }
 }
 
+/** What the gateway was asked to do, beyond bridging tasks. */
+export type GatewayCommand = "run" | "login" | "logout" | "list-auth-methods";
+
+export interface GatewayOptions {
+  maxConcurrency: number;
+  authMethodId?: string;
+  command: GatewayCommand;
+}
+
+/**
+ * Parses the gateway's own flags — everything before the `--` that introduces
+ * the agent command.
+ */
+export function parseGatewayArgs(args: string[]): GatewayOptions {
+  const options: GatewayOptions = { maxConcurrency: 2, command: "run" };
+
+  for (let i = 0; i < args.length; i++) {
+    // A following token is this flag's value only when it isn't a flag itself,
+    // so `--login` can stand alone or take a method id.
+    const next = args[i + 1];
+    const value = next !== undefined && !next.startsWith("-") ? next : undefined;
+
+    switch (args[i]) {
+      case "--max-concurrency":
+      case "--maxConcurrency": {
+        const parsed = parseInt(value ?? "", 10);
+        if (!isNaN(parsed)) {
+          options.maxConcurrency = parsed;
+          i++;
+        }
+        break;
+      }
+      case "--auth-method":
+        if (value) {
+          options.authMethodId = value;
+          i++;
+        }
+        break;
+      case "--login":
+        options.command = "login";
+        if (value) {
+          options.authMethodId = value;
+          i++;
+        }
+        break;
+      case "--logout":
+        options.command = "logout";
+        break;
+      case "--list-auth-methods":
+        options.command = "list-auth-methods";
+        break;
+    }
+  }
+
+  return options;
+}
+
+/**
+ * Runs a one-shot auth command against the agent and shuts it down again.
+ *
+ * These commands exist so a login can be done deliberately — before any task
+ * arrives — rather than only when a session is refused.
+ */
+export async function runAuthCommand(
+  command: Exclude<GatewayCommand, "run">,
+  acpCmdArgs: string[],
+  agentrqConfig: McpServerConfig,
+  mcpBridge: MCPBridge,
+  authMethodId?: string,
+): Promise<void> {
+  const [cmd, ...cmdArgs] = acpCmdArgs;
+  const agent = await openAgentConnection({
+    acpCmdArgs,
+    mcpBridge,
+    env: agentrqConfig.env,
+    label: command,
+  });
+
+  try {
+    const connection = agent.connection as unknown as AuthConnection;
+    const { authMethods, agentCapabilities } = agent.initResult;
+
+    if (command === "list-auth-methods") {
+      console.log(
+        `Authentication methods for "${acpCmdArgs.join(" ")}":\n${describeAuthMethods(authMethods)}`,
+      );
+      if (supportsLogout(agentCapabilities)) {
+        console.log("\nThe agent also supports --logout.");
+      }
+      return;
+    }
+
+    if (command === "logout") {
+      await logout(connection, agentCapabilities);
+      return;
+    }
+
+    await login({
+      connection,
+      methods: authMethods,
+      launch: { command: cmd, args: cmdArgs, env: agentrqConfig.env },
+      preferredId: authMethodId,
+      interactive: isInteractiveTerminal(),
+    });
+  } finally {
+    agent.process.kill();
+  }
+}
+
+export function printUsage(): void {
+  console.log(
+    "Usage: acp-gateway [--max-concurrency <number>] [--auth-method <id>] -- <acp-server-command> [args...]",
+  );
+  console.log("       acp-gateway --list-auth-methods -- <acp-server-command> [args...]");
+  console.log("       acp-gateway --login [method-id] -- <acp-server-command> [args...]");
+  console.log("       acp-gateway --logout -- <acp-server-command> [args...]");
+  console.log("Example: acp-gateway --max-concurrency 4 -- gemini --acp");
+}
+
 async function main() {
   console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
 
@@ -324,8 +549,7 @@ async function main() {
     cmdStartIndex !== -1 ? args.slice(cmdStartIndex + 1) : args;
 
   if (acpCmdArgs.length === 0) {
-    console.log("Usage: acp-gateway [--max-concurrency <number>] -- <acp-server-command> [args...]");
-    console.log("Example: acp-gateway --max-concurrency 4 -- gemini --acp");
+    printUsage();
     process.exit(1);
   }
 
@@ -333,23 +557,28 @@ async function main() {
   const configs = loadMcpConfig();
   const agentrqConfig = pickAgentrqServer(configs);
 
-  // Parse max concurrency from CLI args, falling back to default of 2
-  let maxConcurrency = 2;
   const gatewayArgs = cmdStartIndex !== -1 ? args.slice(0, cmdStartIndex) : [];
-  const maxConcurrencyIdx = gatewayArgs.findIndex(
-    (arg) => arg === "--max-concurrency" || arg === "--maxConcurrency",
-  );
-  if (maxConcurrencyIdx !== -1 && maxConcurrencyIdx + 1 < gatewayArgs.length) {
-    const val = parseInt(gatewayArgs[maxConcurrencyIdx + 1], 10);
-    if (!isNaN(val)) {
-      maxConcurrency = val;
-    }
-  }
+  const { maxConcurrency, command, authMethodId } = parseGatewayArgs(gatewayArgs);
+  authConfig.methodId = authMethodId;
 
   const taskQueue = new TaskQueue(maxConcurrency);
 
   // 2. Initialize MCP Bridge
   const mcpBridge = new MCPBridge(agentrqConfig);
+
+  // Auth commands talk to the agent and exit; they never start bridging tasks.
+  // They run before the bridge connects, so a first-time login still works when
+  // the workspace is unreachable — `callTool` connects on demand if the login
+  // actually needs to reach agentrq.
+  if (command !== "run") {
+    try {
+      await runAuthCommand(command, acpCmdArgs, agentrqConfig, mcpBridge, authMethodId);
+    } finally {
+      await mcpBridge.close();
+    }
+    process.exit(0);
+  }
+
   await mcpBridge.connect();
 
   try {

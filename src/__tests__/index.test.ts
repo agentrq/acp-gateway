@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Writable, Readable } from "node:stream";
+import { EventEmitter } from "node:events";
+import * as acp from "@agentclientprotocol/sdk";
 import {
   createAcpSessionSwitcher,
   checkForNextTask,
@@ -7,18 +9,33 @@ import {
   TaskQueue,
   getOrCreateSession,
   activeSessions,
+  authConfig,
+  createSessionWithAuth,
+  isInteractiveTerminal,
+  openAgentConnection,
+  parseGatewayArgs,
+  printUsage,
   pickHumanApprovalMode,
   enforceHumanApprovalMode,
+  runAuthCommand,
 } from "../index.js";
+import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
 
-vi.mock("node:child_process", () => {
+// Real emitters so the agent-process lifecycle handlers can be exercised.
+const { spawnedAgents } = vi.hoisted(() => ({ spawnedAgents: [] as any[] }));
+
+vi.mock("node:child_process", async () => {
+  const { EventEmitter } = await import("node:events");
+  const { Writable, Readable } = await import("node:stream");
   return {
-    spawn: vi.fn().mockReturnValue({
-      stdin: new Writable({ write(chunk, encoding, callback) { callback(); } }),
-      stdout: new Readable({ read() { this.push(null); } }),
-      kill: vi.fn(),
-      on: vi.fn(),
+    spawn: vi.fn(() => {
+      const child: any = new EventEmitter();
+      child.stdin = new Writable({ write(chunk, encoding, callback) { callback(); } });
+      child.stdout = new Readable({ read() { this.push(null); } });
+      child.kill = vi.fn();
+      spawnedAgents.push(child);
+      return child;
     }),
   };
 });
@@ -430,6 +447,282 @@ describe("index", () => {
           }),
         }),
       );
+    });
+
+    it("should declare whether it can host a terminal login", async () => {
+      const mockBridge: any = {};
+
+      const session = await getOrCreateSession("T-Auth-Cap", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(session.connection.initialize).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clientCapabilities: expect.objectContaining({
+            auth: { terminal: isInteractiveTerminal() },
+          }),
+        }),
+      );
+    });
+
+    it("should log in and retry when the agent refuses the session", async () => {
+      const authenticate = vi.fn().mockResolvedValue({});
+      const newSession = vi
+        .fn()
+        .mockRejectedValueOnce(
+          Object.assign(new Error("Authentication required"), { code: AUTH_REQUIRED_CODE }),
+        )
+        .mockResolvedValue({ sessionId: "authed-sess" });
+      vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
+        return {
+          initialize: vi.fn().mockResolvedValue({
+            protocolVersion: "0.1.0",
+            authMethods: [{ id: "agent-login", name: "Agent login" }],
+          }),
+          newSession,
+          authenticate,
+          prompt: vi.fn(),
+        } as any;
+      } as any);
+
+      const session = await getOrCreateSession("T-Login", ["node", "agent.js"], [], { env: {} } as any, {} as any);
+
+      expect(authenticate).toHaveBeenCalledWith({ methodId: "agent-login" });
+      expect(newSession).toHaveBeenCalledTimes(2);
+      expect(session.sessionId).toBe("authed-sess");
+    });
+
+    it("should drop the cached session when the agent process dies", async () => {
+      const mockBridge: any = {};
+      await getOrCreateSession("T-Exit", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      expect(activeSessions.has("T-Exit")).toBe(true);
+
+      spawnedAgents[spawnedAgents.length - 1].emit("exit", 1, null);
+      expect(activeSessions.has("T-Exit")).toBe(false);
+    });
+  });
+
+  describe("openAgentConnection", () => {
+    beforeEach(() => {
+      spawnedAgents.length = 0;
+    });
+
+    it("should report the agent's login methods and survive process failures", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
+        return {
+          initialize: vi.fn().mockResolvedValue({
+            protocolVersion: "0.1.0",
+            authMethods: [{ id: "agent-login", name: "Agent login" }],
+          }),
+        } as any;
+      } as any);
+
+      const onExit = vi.fn();
+      const agent = await openAgentConnection({
+        acpCmdArgs: ["node", "agent.js"],
+        mcpBridge: {} as any,
+        label: "login",
+        onExit,
+      });
+
+      expect(agent.initResult.authMethods).toHaveLength(1);
+      expect(errorSpy.mock.calls.flat().join("\n")).toContain("Agent login (agent-login)");
+
+      agent.process.emit("error", new Error("spawn failed"));
+      agent.process.stdin.emit("error", new Error("EPIPE"));
+      expect(onExit).toHaveBeenCalledTimes(1);
+
+      errorSpy.mockRestore();
+    });
+  });
+
+  describe("createSessionWithAuth", () => {
+    const auth = {
+      methods: [{ id: "agent-login", name: "Agent login" }] as any,
+      launch: { command: "node", args: ["agent.js"] },
+    };
+
+    it("should start the session directly when no login is needed", async () => {
+      const connection: any = {
+        newSession: vi.fn().mockResolvedValue({ sessionId: "s1" }),
+        authenticate: vi.fn(),
+      };
+
+      const result = await createSessionWithAuth(connection, {} as any, auth);
+
+      expect(result.sessionId).toBe("s1");
+      expect(connection.authenticate).not.toHaveBeenCalled();
+    });
+
+    it("should surface failures that are not about authentication", async () => {
+      const connection: any = {
+        newSession: vi.fn().mockRejectedValue(new Error("cwd does not exist")),
+        authenticate: vi.fn(),
+      };
+
+      await expect(createSessionWithAuth(connection, {} as any, auth)).rejects.toThrow(
+        "cwd does not exist",
+      );
+      expect(connection.authenticate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("parseGatewayArgs", () => {
+    it("should default to bridging tasks with a concurrency of 2", () => {
+      expect(parseGatewayArgs([])).toEqual({ maxConcurrency: 2, command: "run" });
+    });
+
+    it("should accept both spellings of the concurrency flag", () => {
+      expect(parseGatewayArgs(["--max-concurrency", "4"]).maxConcurrency).toBe(4);
+      expect(parseGatewayArgs(["--maxConcurrency", "8"]).maxConcurrency).toBe(8);
+    });
+
+    it("should keep the default when the concurrency value is missing or not a number", () => {
+      expect(parseGatewayArgs(["--max-concurrency"]).maxConcurrency).toBe(2);
+      expect(parseGatewayArgs(["--max-concurrency", "many"]).maxConcurrency).toBe(2);
+      expect(parseGatewayArgs(["--max-concurrency", "--logout"])).toEqual({
+        maxConcurrency: 2,
+        command: "logout",
+      });
+    });
+
+    it("should read the preferred auth method", () => {
+      expect(parseGatewayArgs(["--auth-method", "oauth"])).toEqual({
+        maxConcurrency: 2,
+        command: "run",
+        authMethodId: "oauth",
+      });
+      expect(parseGatewayArgs(["--auth-method"]).authMethodId).toBeUndefined();
+    });
+
+    it("should recognise the auth commands", () => {
+      expect(parseGatewayArgs(["--login"])).toEqual({ maxConcurrency: 2, command: "login" });
+      expect(parseGatewayArgs(["--login", "oauth"])).toEqual({
+        maxConcurrency: 2,
+        command: "login",
+        authMethodId: "oauth",
+      });
+      expect(parseGatewayArgs(["--logout"]).command).toBe("logout");
+      expect(parseGatewayArgs(["--list-auth-methods"]).command).toBe("list-auth-methods");
+    });
+
+    it("should ignore flags it does not know", () => {
+      expect(parseGatewayArgs(["--verbose", "--login"]).command).toBe("login");
+    });
+  });
+
+  describe("runAuthCommand", () => {
+    const agentrqConfig: any = { env: {} };
+    let logSpy: any;
+    let errorSpy: any;
+
+    function mockConnection(overrides: Record<string, any>, initResult: Record<string, any> = {}) {
+      const connection: Record<string, any> = {
+        initialize: vi.fn().mockResolvedValue({ protocolVersion: "0.1.0", ...initResult }),
+        ...overrides,
+      };
+      vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
+        return connection as any;
+      } as any);
+      return connection;
+    }
+
+    beforeEach(() => {
+      spawnedAgents.length = 0;
+      logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    it("should list the agent's login methods and shut the agent down again", async () => {
+      mockConnection({}, {
+        authMethods: [{ id: "agent-login", name: "Agent login" }],
+        agentCapabilities: { auth: { logout: {} } },
+      });
+
+      await runAuthCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, {} as any);
+
+      const printed = logSpy.mock.calls.flat().join("\n");
+      expect(printed).toContain("Agent login (agent-login)");
+      expect(printed).toContain("--logout");
+      expect(spawnedAgents[0].kill).toHaveBeenCalled();
+    });
+
+    it("should report agents that advertise no login", async () => {
+      mockConnection({});
+
+      await runAuthCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, {} as any);
+
+      expect(logSpy.mock.calls.flat().join("\n")).toContain("no authentication methods");
+    });
+
+    it("should log out", async () => {
+      const connection = mockConnection({ logout: vi.fn().mockResolvedValue({}) }, {
+        agentCapabilities: { auth: { logout: {} } },
+      });
+
+      await runAuthCommand("logout", ["gemini", "--acp"], agentrqConfig, {} as any);
+
+      expect(connection.logout).toHaveBeenCalledWith({});
+    });
+
+    it("should log in with the method the user named", async () => {
+      const connection = mockConnection({ authenticate: vi.fn().mockResolvedValue({}) }, {
+        authMethods: [
+          { id: "agent-login", name: "Agent login" },
+          { id: "oauth", name: "OAuth" },
+        ],
+      });
+
+      await runAuthCommand("login", ["gemini", "--acp"], agentrqConfig, {} as any, "oauth");
+
+      expect(connection.authenticate).toHaveBeenCalledWith({ methodId: "oauth" });
+    });
+
+    it("should still shut the agent down when the login fails", async () => {
+      mockConnection({ authenticate: vi.fn() }, {
+        authMethods: [{ id: "agent-login", name: "Agent login" }],
+      });
+
+      await expect(
+        runAuthCommand("login", ["gemini", "--acp"], agentrqConfig, {} as any, "missing"),
+      ).rejects.toThrow(/Unknown authentication method/);
+      expect(spawnedAgents[0].kill).toHaveBeenCalled();
+    });
+  });
+
+  describe("printUsage", () => {
+    it("should document the auth commands alongside the bridge usage", () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      printUsage();
+      const printed = logSpy.mock.calls.flat().join("\n");
+      logSpy.mockRestore();
+
+      expect(printed).toContain("--list-auth-methods");
+      expect(printed).toContain("--login [method-id]");
+      expect(printed).toContain("--logout");
+      expect(printed).toContain("--auth-method <id>");
+    });
+  });
+
+  describe("authConfig", () => {
+    it("should start out with no preferred login method", () => {
+      expect(authConfig).toEqual({});
+    });
+  });
+
+  describe("isInteractiveTerminal", () => {
+    it("should be true only when both stdin and stderr are a TTY", () => {
+      const original = { stdin: process.stdin.isTTY, stderr: process.stderr.isTTY };
+      try {
+        process.stdin.isTTY = true;
+        process.stderr.isTTY = true;
+        expect(isInteractiveTerminal()).toBe(true);
+
+        process.stderr.isTTY = false;
+        expect(isInteractiveTerminal()).toBe(false);
+      } finally {
+        process.stdin.isTTY = original.stdin;
+        process.stderr.isTTY = original.stderr;
+      }
     });
   });
 
