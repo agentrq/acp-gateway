@@ -22,6 +22,7 @@ import {
   pickHumanApprovalMode,
   enforceHumanApprovalMode,
   shutdownAgent,
+  cancelTask,
   sessionRecovery,
   handleAgentModeChange,
   runAgentCommand,
@@ -1405,6 +1406,44 @@ describe("index", () => {
       await getOrCreateSession("T-Fresh", ["node", "a.js"], [], { env: {} } as any, fakeBridge());
 
       expect(store.set).toHaveBeenCalledWith("T-Fresh", "brand-new");
+    });
+  });
+
+  describe("cancelTask", () => {
+    beforeEach(() => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    it("should stop the turn and answer what it was waiting on", async () => {
+      const session: any = {
+        sessionId: "sess-1",
+        connection: { cancel: vi.fn().mockResolvedValue(undefined) },
+        acpClient: { cancelPendingPermissions: vi.fn() },
+      };
+      activeSessions.set("T-Stop", session);
+
+      await cancelTask("T-Stop");
+
+      // Cancelling without answering leaves the tool call waiting forever.
+      expect(session.acpClient.cancelPendingPermissions).toHaveBeenCalledWith(
+        expect.stringContaining("T-Stop"),
+        "sess-1",
+      );
+      expect(session.connection.cancel).toHaveBeenCalledWith({ sessionId: "sess-1" });
+    });
+
+    it("should do nothing for a task that is not running", async () => {
+      await expect(cancelTask("T-Unknown")).resolves.toBeUndefined();
+    });
+
+    it("should survive an agent that cannot be told to stop", async () => {
+      activeSessions.set("T-Broken", {
+        sessionId: "sess-1",
+        connection: { cancel: vi.fn().mockRejectedValue(new Error("pipe closed")) },
+        acpClient: { cancelPendingPermissions: vi.fn() },
+      } as any);
+
+      await expect(cancelTask("T-Broken")).resolves.toBeUndefined();
     });
   });
 

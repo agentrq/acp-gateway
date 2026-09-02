@@ -129,17 +129,20 @@ export class AgentRQACPClient implements acp.Client {
   }
 
   /**
-   * Answers every waiting tool call with `cancelled`.
+   * Answers waiting tool calls with `cancelled`.
    *
-   * Used when the agent is gone: nothing will ever act on those answers, but
-   * the promises must settle or their task-queue slots are held forever.
+   * With `sessionId`, only that session's — one task being stopped must not
+   * answer another task's questions. Without it, every one: used when the agent
+   * itself is gone, where nothing will act on those answers but the promises
+   * must settle or their task-queue slots are held forever.
    */
-  cancelPendingPermissions(reason: string): void {
-    if (this.pendingPermissions.size === 0) return;
-    console.error(
-      `[acp] Cancelling ${this.pendingPermissions.size} waiting permission request(s): ${reason}`,
+  cancelPendingPermissions(reason: string, sessionId?: string): void {
+    const affected = [...this.pendingPermissions.values()].filter(
+      (pending) => sessionId === undefined || pending.sessionId === sessionId,
     );
-    for (const pending of [...this.pendingPermissions.values()]) {
+    if (affected.length === 0) return;
+    console.error(`[acp] Cancelling ${affected.length} waiting permission request(s): ${reason}`);
+    for (const pending of affected) {
       pending.settle({ outcome: "cancelled" });
     }
   }

@@ -78,7 +78,7 @@ describe("MCPBridge", () => {
       expect(Client).toHaveBeenCalled();
       expect(StreamableHTTPClientTransport).toHaveBeenCalled();
       expect(lastMockClient.connect).toHaveBeenCalled();
-      expect(lastMockClient.setNotificationHandler).toHaveBeenCalledTimes(2);
+      expect(lastMockClient.setNotificationHandler).toHaveBeenCalledTimes(3);
       expect((bridge as any).isConnected).toBe(true);
     });
 
@@ -274,6 +274,54 @@ describe("MCPBridge", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(reconnected).toHaveBeenCalledTimes(1);
+  });
+
+  describe("notifications from the workspace", () => {
+    /** Runs the handler the bridge registered for one notification method. */
+    async function deliver(bridge: MCPBridge, method: string, params: unknown) {
+      await bridge.connect();
+      const registered = lastMockClient.setNotificationHandler.mock.calls.find(
+        ([schema]: any[]) => schema.shape.method.value === method,
+      );
+      if (!registered) throw new Error(`no handler registered for ${method}`);
+      registered[1]({ method, params });
+    }
+
+    it("should announce a task the human sent", async () => {
+      const bridge = new MCPBridge(config);
+      const heard = vi.fn();
+      bridge.on("task", heard);
+
+      await deliver(bridge, "notifications/claude/channel", {
+        content: "do the thing",
+        meta: { chat_id: "T1" },
+      });
+
+      expect(heard).toHaveBeenCalledWith({ content: "do the thing", meta: { chat_id: "T1" } });
+    });
+
+    it("should announce a permission verdict", async () => {
+      const bridge = new MCPBridge(config);
+      const heard = vi.fn();
+      bridge.on("verdict", heard);
+
+      await deliver(bridge, "notifications/claude/channel/permission", {
+        request_id: "req-1",
+        behavior: "allow",
+      });
+
+      expect(heard).toHaveBeenCalledWith({ requestId: "req-1", behavior: "allow" });
+    });
+
+    it("should announce a task the human stopped", async () => {
+      const bridge = new MCPBridge(config);
+      const heard = vi.fn();
+      bridge.on("cancel", heard);
+
+      await deliver(bridge, "notifications/claude/channel/cancel", { task_id: "T1" });
+
+      expect(heard).toHaveBeenCalledWith({ taskId: "T1" });
+    });
   });
 
 });

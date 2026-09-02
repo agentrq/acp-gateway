@@ -1214,6 +1214,23 @@ describe("AgentRQACPClient", () => {
       await waiting;
     });
 
+    it("should answer only the session being stopped", async () => {
+      const first = client.requestPermission(params());
+      const second = client.requestPermission(
+        params({ sessionId: "sess-2", toolCall: { toolCallId: "call-2", title: "Bash" } }),
+      );
+      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(2));
+
+      // One task being stopped must not answer another task's questions.
+      client.cancelPendingPermissions("stopped", "sess-1");
+
+      expect((await first).outcome.outcome).toBe("cancelled");
+      expect(client.pendingPermissionCount).toBe(1);
+
+      client.cancelPendingPermissions("test over");
+      await second;
+    });
+
     it("should say nothing when there is nothing waiting to cancel", () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       client.cancelPendingPermissions("nothing doing");

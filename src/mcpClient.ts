@@ -143,6 +143,20 @@ export class MCPBridge extends EventEmitter {
       },
     );
 
+    // Set notification handler for a human stopping a task from the dashboard.
+    this.client.setNotificationHandler(
+      z.object({
+        method: z.literal("notifications/claude/channel/cancel"),
+        params: z.object({
+          task_id: z.string(),
+        }),
+      }),
+      (notification) => {
+        console.error("[mcp] Received cancel request");
+        this.emit("cancel", { taskId: notification.params.task_id });
+      },
+    );
+
     // Set notification handler for permission verdicts
     this.client.setNotificationHandler(
       z.object({

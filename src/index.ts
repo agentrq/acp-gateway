@@ -353,6 +353,32 @@ export async function getAgentRuntime(
   return agentRuntimeStarting;
 }
 
+/**
+ * Stops whatever the agent is doing for one task, because a human said so.
+ *
+ * Answers the tool call it may be waiting on before cancelling the turn: a
+ * cancelled turn leaves that request unanswered otherwise, and the spec treats
+ * `cancelled` as exactly the answer a client gives because it cancelled.
+ */
+export async function cancelTask(taskId: string): Promise<void> {
+  const session = activeSessions.get(taskId);
+  if (!session) {
+    console.error(`[bridge] Nothing to stop for task ${taskId}`);
+    return;
+  }
+
+  console.error(`[bridge] Stopping task ${taskId} at the human's request`);
+  session.acpClient.cancelPendingPermissions(
+    `task ${taskId} stopped from the dashboard`,
+    session.sessionId,
+  );
+  try {
+    await session.connection.cancel({ sessionId: session.sessionId });
+  } catch (err) {
+    console.error(`[bridge] Failed to stop task ${taskId}:`, err);
+  }
+}
+
 /** Stops the agent, if one is running. Used when the gateway itself is done. */
 export function shutdownAgent(): void {
   agentRuntime?.process.kill();
@@ -1119,6 +1145,11 @@ async function main() {
       }).catch((err) => {
         console.error("[bridge] Error queuing task:", err);
       });
+    });
+
+    // A human stopping a task in the dashboard.
+    mcpBridge.on("cancel", ({ taskId }: { taskId: string }) => {
+      void cancelTask(taskId);
     });
 
     // Initial check for a pending task
