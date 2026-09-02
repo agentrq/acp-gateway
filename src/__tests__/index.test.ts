@@ -22,7 +22,7 @@ import {
   runListAgents,
   pickHumanApprovalMode,
   enforceHumanApprovalMode,
-  runAuthCommand,
+  runAgentCommand,
 } from "../index.js";
 import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
@@ -790,7 +790,7 @@ describe("index", () => {
     });
   });
 
-  describe("runAuthCommand", () => {
+  describe("runAgentCommand", () => {
     const agentrqConfig: any = { env: {} };
     let logSpy: any;
     let errorSpy: any;
@@ -818,7 +818,7 @@ describe("index", () => {
         agentCapabilities: { auth: { logout: {} } },
       });
 
-      await runAuthCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, {} as any);
+      await runAgentCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, {} as any);
 
       const printed = logSpy.mock.calls.flat().join("\n");
       expect(printed).toContain("Agent login (agent-login)");
@@ -826,10 +826,31 @@ describe("index", () => {
       expect(spawnedAgents[0].kill).toHaveBeenCalled();
     });
 
+    it("should print what the agent says it supports", async () => {
+      mockConnection({}, {
+        protocolVersion: 1,
+        agentCapabilities: {
+          loadSession: true,
+          sessionCapabilities: { resume: {} },
+          mcpCapabilities: { http: true },
+        },
+      });
+
+      await runAgentCommand("agent-info", ["gemini", "--acp"], agentrqConfig, {} as any);
+
+      const printed = String(logSpy.mock.calls.at(-1)[0]);
+      expect(printed).toContain("gemini --acp");
+      expect(printed).toContain("ACP protocol version 1");
+      expect(printed).toContain("session/resume  yes");
+      expect(printed).toContain("session/close   no");
+      expect(printed).toContain("http  yes");
+      expect(spawnedAgents[0].kill).toHaveBeenCalled();
+    });
+
     it("should report agents that advertise no login", async () => {
       mockConnection({});
 
-      await runAuthCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, {} as any);
+      await runAgentCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, {} as any);
 
       expect(logSpy.mock.calls.flat().join("\n")).toContain("no authentication methods");
     });
@@ -839,7 +860,7 @@ describe("index", () => {
         agentCapabilities: { auth: { logout: {} } },
       });
 
-      await runAuthCommand("logout", ["gemini", "--acp"], agentrqConfig, {} as any);
+      await runAgentCommand("logout", ["gemini", "--acp"], agentrqConfig, {} as any);
 
       expect(connection.logout).toHaveBeenCalledWith({});
     });
@@ -852,7 +873,7 @@ describe("index", () => {
         ],
       });
 
-      await runAuthCommand("login", ["gemini", "--acp"], agentrqConfig, {} as any, "oauth");
+      await runAgentCommand("login", ["gemini", "--acp"], agentrqConfig, {} as any, "oauth");
 
       expect(connection.authenticate).toHaveBeenCalledWith({ methodId: "oauth" });
     });
@@ -863,7 +884,7 @@ describe("index", () => {
       });
 
       await expect(
-        runAuthCommand("login", ["gemini", "--acp"], agentrqConfig, {} as any, "missing"),
+        runAgentCommand("login", ["gemini", "--acp"], agentrqConfig, {} as any, "missing"),
       ).rejects.toThrow(/Unknown authentication method/);
       expect(spawnedAgents[0].kill).toHaveBeenCalled();
     });
@@ -880,6 +901,7 @@ describe("index", () => {
         new Set([
           "--agent",
           "--list-agents",
+          "--agent-info",
           "--allow-unverified-agent",
           "--registry-url",
           "--list-auth-methods",

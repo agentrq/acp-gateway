@@ -48,6 +48,7 @@ import {
   type LoginOptions,
 } from "./auth.js";
 import { resolveAgentLaunch } from "./agentInstall.js";
+import { describeAgentInfo } from "./agentInfo.js";
 import {
   describeAgents,
   fetchRegistry,
@@ -433,6 +434,7 @@ export type GatewayCommand =
   | "logout"
   | "list-auth-methods"
   | "list-agents"
+  | "agent-info"
   | "help";
 
 export interface GatewayOptions {
@@ -504,6 +506,9 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
         break;
       case "--list-agents":
         options.command = "list-agents";
+        break;
+      case "--agent-info":
+        options.command = "agent-info";
         break;
       case "--allow-unverified-agent":
         options.allowUnverifiedAgent = true;
@@ -614,12 +619,13 @@ export function assertAgentRunnable(command: string, usedRegistryId: boolean): v
 }
 
 /**
- * Runs a one-shot auth command against the agent and shuts it down again.
+ * Runs a one-shot command against the agent and shuts it down again.
  *
- * These commands exist so a login can be done deliberately — before any task
- * arrives — rather than only when a session is refused.
+ * These commands exist so a login — or a look at what the agent supports — can
+ * be done deliberately, before any task arrives, rather than only when a
+ * session is refused.
  */
-export async function runAuthCommand(
+export async function runAgentCommand(
   command: Exclude<GatewayCommand, "run">,
   acpCmdArgs: string[],
   agentrqConfig: McpServerConfig,
@@ -637,6 +643,11 @@ export async function runAuthCommand(
   try {
     const connection = agent.connection as unknown as AuthConnection;
     const { authMethods, agentCapabilities } = agent.initResult;
+
+    if (command === "agent-info") {
+      console.log(describeAgentInfo(agent.initResult, acpCmdArgs.join(" ")));
+      return;
+    }
 
     if (command === "list-auth-methods") {
       console.log(
@@ -687,6 +698,9 @@ AGENT
                               if needed, instead of a command you supply.
   --list-agents               List every agent in the registry, and how each one
                               can run on this machine. Exits.
+  --agent-info                What the agent says it supports — session
+                              lifecycle, prompt content, MCP transports and
+                              logins. Only a live handshake can tell you. Exits.
   --allow-unverified-agent    Install a registry binary that publishes no
                               checksum. Off by default: without a checksum there
                               is no way to tell what was downloaded.
@@ -712,6 +726,7 @@ EXAMPLES
   acp-gateway --agent gemini                     Run Gemini from the registry
   acp-gateway -- gemini --acp                    Run an agent you installed
   acp-gateway --list-agents                      See what the registry offers
+  acp-gateway --agent-info --agent gemini        See what that agent supports
   acp-gateway --login -- gemini --acp            Log in before running anything
   acp-gateway --max-concurrency 4 -- gemini --acp
 
@@ -798,7 +813,7 @@ async function main() {
   // actually needs to reach agentrq.
   if (command !== "run") {
     try {
-      await runAuthCommand(command, acpCmdArgs, agentrqConfig, mcpBridge, authMethodId);
+      await runAgentCommand(command, acpCmdArgs, agentrqConfig, mcpBridge, authMethodId);
     } finally {
       await mcpBridge.close();
     }
