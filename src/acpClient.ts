@@ -70,6 +70,9 @@ export class AgentRQACPClient implements acp.Client {
   // serves them all: a listener per request was only ever removed on a matching
   // verdict, so every unanswered request leaked one for the life of the process.
   private pendingPermissions = new Map<string, PendingPermission>();
+  // Sessions whose output is currently the agent replaying old history rather
+  // than saying anything new.
+  private replaySessions = new Set<string>();
   private permissionTimeoutMs: number;
   private cancelSession?: (sessionId: string) => unknown;
   private onModeChanged?: (sessionId: string, modeId: string) => unknown;
@@ -93,6 +96,23 @@ export class AgentRQACPClient implements acp.Client {
    */
   setModeChangeHandler(handler: (sessionId: string, modeId: string) => unknown): void {
     this.onModeChanged = handler;
+  }
+
+  /**
+   * Runs something while ignoring what the agent says on a session.
+   *
+   * `session/load` replays the entire prior conversation as ordinary message
+   * chunks. Buffered as usual, that would land in the task as a brand-new reply
+   * repeating everything already said.
+   */
+  async withRepliesSuppressed<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+    this.replaySessions.add(sessionId);
+    try {
+      return await fn();
+    } finally {
+      this.replaySessions.delete(sessionId);
+      this.replyBuffers.delete(sessionId);
+    }
   }
 
   /** How many tool calls are waiting on a human right now. */
@@ -436,6 +456,7 @@ export class AgentRQACPClient implements acp.Client {
         if (update.content.type === "text") {
           process.stdout.write(update.content.text);
           const sid = params.sessionId;
+          if (this.replaySessions.has(sid)) break;
           this.replyBuffers.set(sid, (this.replyBuffers.get(sid) ?? "") + update.content.text);
         }
         break;

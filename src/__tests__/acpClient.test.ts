@@ -1246,6 +1246,76 @@ describe("AgentRQACPClient", () => {
     });
   });
 
+  describe("withRepliesSuppressed", () => {
+    function clientForTask(taskId: string) {
+      return new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => taskId);
+    }
+
+    const chunk = (sessionId: string, text: string) => ({
+      sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+    }) as any;
+
+    it("should drop a replayed conversation instead of re-posting it", async () => {
+      const client = clientForTask("task-1");
+
+      await client.withRepliesSuppressed("sess-1", async () => {
+        await client.sessionUpdate(chunk("sess-1", "everything said before"));
+      });
+      await client.flushReply("sess-1");
+
+      // session/load replays the whole conversation as ordinary chunks.
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+    });
+
+    it("should keep buffering once the replay is over", async () => {
+      const client = clientForTask("task-1");
+
+      await client.withRepliesSuppressed("sess-1", async () => {
+        await client.sessionUpdate(chunk("sess-1", "old news"));
+      });
+      await client.sessionUpdate(chunk("sess-1", "something new"));
+      await client.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("reply", {
+        chatId: "task-1",
+        text: "something new",
+      });
+    });
+
+    it("should keep buffering other sessions during a replay", async () => {
+      const client = clientForTask("task-1");
+
+      await client.withRepliesSuppressed("sess-1", async () => {
+        await client.sessionUpdate(chunk("sess-2", "unrelated"));
+      });
+      await client.flushReply("sess-2");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("reply", {
+        chatId: "task-1",
+        text: "unrelated",
+      });
+    });
+
+    it("should stop suppressing even when the load fails", async () => {
+      const client = clientForTask("task-1");
+
+      await expect(
+        client.withRepliesSuppressed("sess-1", async () => {
+          throw new Error("load failed");
+        }),
+      ).rejects.toThrow("load failed");
+
+      await client.sessionUpdate(chunk("sess-1", "after the failure"));
+      await client.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("reply", {
+        chatId: "task-1",
+        text: "after the failure",
+      });
+    });
+  });
+
   describe("reportStopReason", () => {
     function clientForTask(taskId: string | undefined) {
       return new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => taskId);

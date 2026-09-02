@@ -22,6 +22,7 @@ import {
   pickHumanApprovalMode,
   enforceHumanApprovalMode,
   shutdownAgent,
+  sessionRecovery,
   handleAgentModeChange,
   runAgentCommand,
 } from "../index.js";
@@ -77,6 +78,7 @@ describe("index", () => {
     shutdownAgent();
     activeSessions.clear();
     spawnedAgents.length = 0;
+    sessionRecovery.store = undefined;
   });
 
   describe("mapMcpServers", () => {
@@ -1232,6 +1234,177 @@ describe("index", () => {
       await handleAgentModeChange(connection, "sess-modeless", "whatever", { availableModes: [] } as any);
 
       expect(connection.setSessionMode).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("recovering a session across a restart", () => {
+    /** A store that already remembers one task, as a previous run would leave. */
+    function storeRemembering(taskId: string, sessionId: string) {
+      const sessions: Record<string, string> = { [taskId]: sessionId };
+      const store = {
+        get: (id: string) => sessions[id],
+        set: vi.fn((id: string, sid: string) => {
+          sessions[id] = sid;
+        }),
+        delete: vi.fn((id: string) => {
+          delete sessions[id];
+        }),
+      };
+      sessionRecovery.store = store as any;
+      return store;
+    }
+
+    function agentThat(overrides: Record<string, any>, capabilities: Record<string, any>) {
+      const connection: Record<string, any> = {
+        initialize: vi.fn().mockResolvedValue({
+          protocolVersion: 1,
+          agentCapabilities: capabilities,
+        }),
+        newSession: vi.fn().mockResolvedValue({ sessionId: "brand-new" }),
+        setSessionMode: vi.fn().mockResolvedValue({}),
+        prompt: vi.fn(),
+        ...overrides,
+      };
+      vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
+        return connection as any;
+      } as any);
+      return connection;
+    }
+
+    beforeEach(() => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    it("should resume the session the task was using before", async () => {
+      const store = storeRemembering("T-Old", "sess-old");
+      const connection = agentThat(
+        { resumeSession: vi.fn().mockResolvedValue({ modes: null }) },
+        { sessionCapabilities: { resume: {} } },
+      );
+
+      const session = await getOrCreateSession("T-Old", ["node", "a.js"], [], { env: {} } as any, fakeBridge());
+
+      expect(connection.resumeSession).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "sess-old" }),
+      );
+      expect(connection.newSession).not.toHaveBeenCalled();
+      expect(session.sessionId).toBe("sess-old");
+      expect(store.delete).not.toHaveBeenCalled();
+    });
+
+    it("should load the session when the agent cannot resume", async () => {
+      storeRemembering("T-Old", "sess-old");
+      const connection = agentThat(
+        { loadSession: vi.fn().mockResolvedValue({ modes: null }) },
+        { loadSession: true },
+      );
+
+      const session = await getOrCreateSession("T-Old", ["node", "a.js"], [], { env: {} } as any, fakeBridge());
+
+      expect(connection.loadSession).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: "sess-old" }),
+      );
+      expect(session.sessionId).toBe("sess-old");
+    });
+
+    it("should fall back to loading when resuming fails", async () => {
+      storeRemembering("T-Old", "sess-old");
+      const connection = agentThat(
+        {
+          resumeSession: vi.fn().mockRejectedValue(new Error("gone")),
+          loadSession: vi.fn().mockResolvedValue({ modes: null }),
+        },
+        { sessionCapabilities: { resume: {} }, loadSession: true },
+      );
+
+      const session = await getOrCreateSession("T-Old", ["node", "a.js"], [], { env: {} } as any, fakeBridge());
+
+      expect(connection.loadSession).toHaveBeenCalled();
+      expect(session.sessionId).toBe("sess-old");
+    });
+
+    it("should start fresh, and forget, when the session cannot be recovered", async () => {
+      const store = storeRemembering("T-Old", "sess-old");
+      const connection = agentThat(
+        {
+          resumeSession: vi.fn().mockRejectedValue(new Error("gone")),
+          loadSession: vi.fn().mockRejectedValue(new Error("also gone")),
+        },
+        { sessionCapabilities: { resume: {} }, loadSession: true },
+      );
+
+      const session = await getOrCreateSession("T-Old", ["node", "a.js"], [], { env: {} } as any, fakeBridge());
+
+      expect(connection.newSession).toHaveBeenCalled();
+      expect(session.sessionId).toBe("brand-new");
+      expect(store.delete).toHaveBeenCalledWith("T-Old");
+      expect(store.set).toHaveBeenCalledWith("T-Old", "brand-new");
+    });
+
+    it("should not offer a remembered session to an agent that takes neither back", async () => {
+      storeRemembering("T-Old", "sess-old");
+      const connection = agentThat({ resumeSession: vi.fn(), loadSession: vi.fn() }, {});
+
+      await getOrCreateSession("T-Old", ["node", "a.js"], [], { env: {} } as any, fakeBridge());
+
+      expect(connection.resumeSession).not.toHaveBeenCalled();
+      expect(connection.loadSession).not.toHaveBeenCalled();
+      expect(connection.newSession).toHaveBeenCalled();
+    });
+
+    it("should put a recovered session back into a mode that asks the human", async () => {
+      storeRemembering("T-Old", "sess-old");
+      // Resuming can hand back the agent's own default, which often approves
+      // on the user's behalf.
+      const connection = agentThat(
+        {
+          resumeSession: vi.fn().mockResolvedValue({
+            modes: {
+              currentModeId: "auto",
+              availableModes: [
+                { id: "auto", name: "Auto approve" },
+                { id: "ask", name: "Ask first" },
+              ],
+            },
+          }),
+        },
+        { sessionCapabilities: { resume: {} } },
+      );
+
+      await getOrCreateSession("T-Old", ["node", "a.js"], [], { env: {} } as any, fakeBridge());
+
+      expect(connection.setSessionMode).toHaveBeenCalledWith({
+        sessionId: "sess-old",
+        modeId: "ask",
+      });
+    });
+
+    it("should not treat a task-less session as a task called default", async () => {
+      const store = { get: vi.fn(), set: vi.fn(), delete: vi.fn() };
+      sessionRecovery.store = store as any;
+      agentThat({}, {});
+
+      // getTask can hand back a task whose id could not be read. Its replies
+      // have nowhere to go — they must not go to a chat named "default".
+      await getOrCreateSession(undefined, ["node", "a.js"], [], { env: {} } as any, fakeBridge());
+
+      expect(store.get).not.toHaveBeenCalled();
+      expect(store.set).not.toHaveBeenCalled();
+    });
+
+    it("should remember a brand-new session for next time", async () => {
+      const sessions: Record<string, string> = {};
+      const store = {
+        get: (id: string) => sessions[id],
+        set: vi.fn(),
+        delete: vi.fn(),
+      };
+      sessionRecovery.store = store as any;
+      agentThat({}, {});
+
+      await getOrCreateSession("T-Fresh", ["node", "a.js"], [], { env: {} } as any, fakeBridge());
+
+      expect(store.set).toHaveBeenCalledWith("T-Fresh", "brand-new");
     });
   });
 

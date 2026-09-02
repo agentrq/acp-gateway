@@ -97,6 +97,7 @@ import {
 } from "./auth.js";
 import { resolveAgentLaunch } from "./agentInstall.js";
 import { describeAgentInfo } from "./agentInfo.js";
+import { SessionStore, sessionStorePath } from "./sessionStore.js";
 import {
   describeAgents,
   fetchRegistry,
@@ -124,6 +125,13 @@ export const authConfig: { methodId?: string } = {};
 
 /** How long tool calls wait for a human, taken from the CLI at startup. */
 export const permissionConfig: { timeoutMs?: number } = {};
+
+/**
+ * Where task → session pairs are remembered between runs, once main() knows
+ * which agent and workspace this gateway is for. Absent in tests, where there
+ * is nothing to recover and nothing worth writing to disk.
+ */
+export const sessionRecovery: { store?: SessionStore } = {};
 
 /**
  * Whether a human is sitting in front of this process.
@@ -351,6 +359,51 @@ export function shutdownAgent(): void {
   discardAgentRuntime();
 }
 
+/**
+ * Picks up a session the agent still has, from before this gateway started.
+ *
+ * Tries the cheaper route first: `session/resume` continues a conversation
+ * without replaying it, while `session/load` streams the entire history back.
+ * Returns undefined when the agent cannot, or will not, take the session back —
+ * the caller then starts a fresh one.
+ */
+async function recoverSession(
+  runtime: AgentRuntime,
+  sessionId: string,
+  params: AcpNewSessionParams,
+): Promise<{ sessionId: string; modes?: acp.SessionModeState | null } | undefined> {
+  const capabilities = runtime.initResult.agentCapabilities;
+  const sessionCapabilities = (capabilities as { sessionCapabilities?: Record<string, unknown> })
+    ?.sessionCapabilities;
+  const request = { sessionId, cwd: params.cwd, mcpServers: params.mcpServers };
+
+  if (sessionCapabilities?.resume) {
+    try {
+      const resumed = await runtime.connection.resumeSession(request);
+      console.error(`[acp] Resumed session ${sessionId}`);
+      return { sessionId, modes: resumed?.modes };
+    } catch (err) {
+      console.error(`[acp] Could not resume session ${sessionId}:`, err);
+    }
+  }
+
+  if (capabilities?.loadSession) {
+    try {
+      // Loading replays the whole conversation as ordinary message chunks, and
+      // buffering those would re-post the entire prior conversation as a reply.
+      const loaded = await runtime.acpClient.withRepliesSuppressed(sessionId, () =>
+        runtime.connection.loadSession(request),
+      );
+      console.error(`[acp] Loaded session ${sessionId}`);
+      return { sessionId, modes: loaded?.modes };
+    } catch (err) {
+      console.error(`[acp] Could not load session ${sessionId}:`, err);
+    }
+  }
+
+  return undefined;
+}
+
 export async function getOrCreateSession(
   taskId: string | undefined,
   acpCmdArgs: string[],
@@ -372,17 +425,40 @@ export async function getOrCreateSession(
     mcpServers: mapMcpServers(configs, runtime.initResult.agentCapabilities),
   };
 
-  const sessionResult = await createSessionWithAuth(runtime.connection, newSessionParams, {
-    methods: runtime.initResult.authMethods,
-    launch: { command: cmd, args: cmdArgs, env: agentrqConfig.env },
-    preferredId: authConfig.methodId,
-    interactive: isInteractiveTerminal(),
-  });
-  console.error(`[acp] Created session ${sessionResult.sessionId} for task ${key}`);
+  // A session the agent still holds keeps the conversation intact across a
+  // gateway restart. Without it the human replies "yes, go ahead" and the agent
+  // has no idea what "it" refers to.
+  // "default" is a slot in this map, not a task. Treating it as one would post
+  // the agent's replies to a chat called "default".
+  const remembered = taskId ? sessionRecovery.store?.get(taskId) : undefined;
+  let sessionResult:
+    | { sessionId: string; modes?: acp.SessionModeState | null }
+    | undefined;
+  if (remembered && taskId) {
+    runtime.sessionTasks.set(remembered, taskId);
+    sessionResult = await recoverSession(runtime, remembered, newSessionParams);
+    if (!sessionResult) {
+      runtime.sessionTasks.delete(remembered);
+      sessionRecovery.store?.delete(taskId);
+    }
+  }
+
+  if (!sessionResult) {
+    sessionResult = await createSessionWithAuth(runtime.connection, newSessionParams, {
+      methods: runtime.initResult.authMethods,
+      launch: { command: cmd, args: cmdArgs, env: agentrqConfig.env },
+      preferredId: authConfig.methodId,
+      interactive: isInteractiveTerminal(),
+    });
+    console.error(`[acp] Created session ${sessionResult.sessionId} for task ${key}`);
+  }
 
   // "default" is a slot in this map, not a task. Treating it as one would post
   // the agent's replies to a chat called "default".
-  if (taskId) runtime.sessionTasks.set(sessionResult.sessionId, taskId);
+  if (taskId) {
+    sessionRecovery.store?.set(taskId, sessionResult.sessionId);
+    runtime.sessionTasks.set(sessionResult.sessionId, taskId);
+  }
   runtime.sessionModes.set(sessionResult.sessionId, sessionResult.modes);
   await enforceHumanApprovalMode(runtime.connection, sessionResult);
 
@@ -975,6 +1051,9 @@ async function main() {
 
   authConfig.methodId = authMethodId;
   permissionConfig.timeoutMs = options.permissionTimeoutMs;
+  sessionRecovery.store = new SessionStore(
+    sessionStorePath(acpCmdArgs.join(" "), agentrqConfig.url ?? ""),
+  );
 
   const taskQueue = new TaskQueue(maxConcurrency);
 
