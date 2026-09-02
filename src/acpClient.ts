@@ -62,6 +62,7 @@ export class AgentRQACPClient implements acp.Client {
   private pendingPermissions = new Map<string, PendingPermission>();
   private permissionTimeoutMs: number;
   private cancelSession?: (sessionId: string) => unknown;
+  private onModeChanged?: (sessionId: string, modeId: string) => unknown;
 
   constructor(
     private mcpBridge: MCPBridge,
@@ -71,6 +72,17 @@ export class AgentRQACPClient implements acp.Client {
     this.permissionTimeoutMs = options.permissionTimeoutMs ?? DEFAULT_PERMISSION_TIMEOUT_MS;
     this.mcpBridge.on("verdict", this.onVerdict);
     this.mcpBridge.on("reconnected", this.onWorkspaceReconnected);
+  }
+
+  /**
+   * Supplies what to do when the agent changes its own session mode.
+   *
+   * The gateway pins a mode that routes approvals to the human at session
+   * creation, but agents may switch modes on their own — and back into one
+   * that approves on the user's behalf.
+   */
+  setModeChangeHandler(handler: (sessionId: string, modeId: string) => unknown): void {
+    this.onModeChanged = handler;
   }
 
   /** How many tool calls are waiting on a human right now. */
@@ -396,6 +408,10 @@ export class AgentRQACPClient implements acp.Client {
           const sid = params.sessionId;
           this.replyBuffers.set(sid, (this.replyBuffers.get(sid) ?? "") + update.content.text);
         }
+        break;
+      case "current_mode_update":
+        console.error(`[acp] Agent switched session mode to "${update.currentModeId}"`);
+        await this.onModeChanged?.(params.sessionId, update.currentModeId);
         break;
       case "tool_call_update":
         this.rememberToolCall(update);

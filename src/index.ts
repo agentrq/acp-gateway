@@ -306,6 +306,11 @@ export async function getOrCreateSession(
   console.error(`[acp] Created session ${sessionResult.sessionId} for task ${key}`);
 
   await enforceHumanApprovalMode(connection, sessionResult);
+  // The mode is pinned once here, but agents may move themselves back out of
+  // it, so keep watching for the rest of the session's life.
+  acpClient.setModeChangeHandler((changedSessionId, modeId) =>
+    handleAgentModeChange(connection, changedSessionId, modeId, sessionResult.modes),
+  );
 
   const sessionInfo: AgentSession = {
     process: agentProcess,
@@ -392,6 +397,64 @@ export async function enforceHumanApprovalMode(
       err,
     );
   }
+}
+
+/**
+ * How many times the gateway will drag one session back into a mode that asks
+ * the human. An agent that keeps switching back is not going to stop, and an
+ * unbounded fight with it would be an endless stream of setSessionMode calls.
+ */
+const MAX_MODE_REENFORCEMENTS = 3;
+
+/** sessionId → how many times its mode has already been put back. */
+const modeReenforcements = new Map<string, number>();
+
+/**
+ * Puts a session back into a mode that asks the human, after the agent moved
+ * itself out of one.
+ *
+ * Agents may change modes on their own. If one moves into a mode that approves
+ * tool calls on the user's behalf, every later tool call — including
+ * destructive ones — executes without ever reaching agentrq, and nothing
+ * anywhere says so.
+ */
+export async function handleAgentModeChange(
+  connection: acp.ClientSideConnection,
+  sessionId: string,
+  currentModeId: string,
+  modes: acp.SessionModeState | null | undefined,
+): Promise<void> {
+  const available = modes?.availableModes;
+  if (!available?.length) return;
+
+  const mode = available.find((m) => m.id === currentModeId);
+  // A mode the agent never advertised cannot be vouched for either, so it is
+  // treated the same as one that approves on our behalf.
+  if (mode && !AUTO_APPROVING_MODE.test(describeMode(mode))) {
+    modeReenforcements.delete(sessionId);
+    return;
+  }
+
+  const attempts = modeReenforcements.get(sessionId) ?? 0;
+  if (attempts >= MAX_MODE_REENFORCEMENTS) {
+    console.error(
+      `[acp] ⚠️  Agent keeps returning session ${sessionId} to mode "${currentModeId}", ` +
+        `which approves tool calls without asking. Giving up after ` +
+        `${MAX_MODE_REENFORCEMENTS} attempts — tool calls may now execute without ` +
+        `agentrq approval.`,
+    );
+    return;
+  }
+  modeReenforcements.set(sessionId, attempts + 1);
+
+  console.error(
+    `[acp] ⚠️  Agent moved session ${sessionId} into "${currentModeId}", which approves ` +
+      `tool calls without asking. Putting it back.`,
+  );
+  await enforceHumanApprovalMode(connection, {
+    sessionId,
+    modes: { availableModes: available, currentModeId },
+  });
 }
 
 export function createAcpSessionSwitcher(
