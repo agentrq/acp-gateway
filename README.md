@@ -66,6 +66,10 @@ acp-gateway -- your-acp-agent --flag1 --flag2
 You can specify gateway options before the `--` separator:
 
 - `--max-concurrency` / `--maxConcurrency` `<number>`: Sets the maximum number of concurrent tasks allowed to prompt the ACP agent at once. Defaults to `2`.
+- `--agent <registry-id>`: Runs an agent from the ACP registry instead of a command you supply yourself.
+- `--list-agents`: Prints every agent in the registry and how each one can run on this machine, then exits.
+- `--allow-unverified-agent`: Installs a registry binary that publishes no checksum. Off by default.
+- `--registry-url <url>`: Reads a different registry index (for pinning, or for testing).
 - `--auth-method <id>`: The authentication method to use when the agent asks for a login. Defaults to picking one automatically.
 - `--list-auth-methods`: Prints the login methods the agent advertises, then exits.
 - `--login [method-id]`: Logs in to the agent, then exits.
@@ -75,6 +79,48 @@ Example:
 ```bash
 acp-gateway --max-concurrency 4 -- gemini --acp
 ```
+
+### Running an Agent from the Registry
+
+The [ACP registry](https://github.com/agentclientprotocol/registry) lists agents that implement the
+protocol, and `acp-gateway` can run one by name — no installing or wiring up by hand:
+
+```bash
+acp-gateway --list-agents          # see what's published
+acp-gateway --agent gemini         # run one
+```
+
+Registry entries are distributed in three ways, and the gateway prefers them in this order:
+
+| Distribution | How it runs | Downloads anything? |
+|---|---|---|
+| `npx` | `npx -y <package> <args>` | No — npm fetches and verifies the package |
+| `uvx` | `uvx <package> <args>` | No — uv fetches and verifies the package |
+| `binary` | Archive is downloaded, checked, unpacked and cached | Yes |
+
+Package distributions come first because npm and PyPI verify what they serve. A binary is only used
+when it is the agent's only distribution.
+
+**Binaries are verified before they run.** The registry's `sha256` for the archive is optional, and
+roughly half of the published binary targets omit it. Where there is no checksum the gateway refuses
+to install rather than run something it cannot vouch for:
+
+```
+The ACP registry publishes no sha256 for "antigravity-acp" on this platform, so the download
+cannot be verified. Re-run with --allow-unverified-agent to install it anyway, or install the
+agent yourself and pass it after --.
+```
+
+Downloads are cached per agent, version and platform, so each build is fetched once:
+
+| Platform | Cache location |
+|---|---|
+| macOS / Linux | `$XDG_CACHE_HOME/acp-gateway/agents`, else `~/.cache/acp-gateway/agents` |
+| Windows | `%LOCALAPPDATA%\acp-gateway\agents` |
+
+All six platforms the registry publishes for are supported — macOS, Linux and Windows on both x86_64
+and arm64. Archives are unpacked with the system's own `tar` (and `unzip` for zips on Linux, whose
+`tar` cannot read them), so no archive libraries are added as dependencies.
 
 ### Authentication
 
@@ -175,6 +221,8 @@ Example `.mcp.json`:
 | `src/mcpClient.ts` | `EventEmitter`-based MCP client with auto-reconnection, notification handling, and tool call dispatch. |
 | `src/config.ts` | Parses `.mcp.json` from the current directory tree up to 3 levels deep. |
 | `src/auth.ts` | ACP authentication — lists the agent's login methods, detects `auth_required`, and runs agent or terminal logins. |
+| `src/registry.ts` | Reads the ACP registry index — agent lookup, host platform matching, and package launch commands. |
+| `src/agentInstall.ts` | Downloads, verifies, unpacks and caches a registry agent's binary distribution. |
 
 ## Development
 
@@ -197,10 +245,12 @@ npm test
 acp-gateway/
 ├── src/
 │   ├── acpClient.ts      # ACP Client implementation
+│   ├── agentInstall.ts    # Registry binary download / verify / cache
 │   ├── auth.ts            # ACP authentication (login / logout)
 │   ├── config.ts          # .mcp.json loader
 │   ├── index.ts           # Entry point & orchestrator
 │   ├── mcpClient.ts       # MCP Bridge with auto-reconnect
+│   ├── registry.ts        # ACP registry index client
 │   └── __tests__/         # Unit tests
 ├── package.json
 └── tsconfig.json
@@ -211,6 +261,7 @@ acp-gateway/
 - **Auto-reconnection**: The MCP transport auto-reconnects on disconnection with exponential backoff (1s → 30s max).
 - **Notification-driven tasks**: The MCP server pushes task content via `notifications/claude/channel`; `acp-gateway` reacts immediately.
 - **Permission flow**: ACP agent requests permission → `acp-gateway` forwards to MCP server → waits for verdict → resolves the ACP permission.
+- **Registry agents**: `--agent <id>` resolves through the registry index; package distributions are preferred over binaries, and a binary without a published `sha256` is refused unless explicitly allowed.
 - **Authentication**: Login methods come from the `initialize` handshake; an `auth_required` refusal triggers a login and one retry of `newSession`.
 - **File I/O**: `readTextFile` / `writeTextFile` are proxied directly to the filesystem; paths are resolved relative to `process.cwd()`.
 

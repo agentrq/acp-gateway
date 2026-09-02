@@ -46,6 +46,12 @@ import {
   type AuthConnection,
   type LoginOptions,
 } from "./auth.js";
+import { resolveAgentLaunch } from "./agentInstall.js";
+import {
+  describeAgents,
+  fetchRegistry,
+  hostPlatformTarget,
+} from "./registry.js";
 import {
   extractTaskIdFromMeta,
   extractTaskIdFromText,
@@ -420,12 +426,25 @@ export class TaskQueue {
 }
 
 /** What the gateway was asked to do, beyond bridging tasks. */
-export type GatewayCommand = "run" | "login" | "logout" | "list-auth-methods";
+export type GatewayCommand =
+  | "run"
+  | "login"
+  | "logout"
+  | "list-auth-methods"
+  | "list-agents";
 
 export interface GatewayOptions {
   maxConcurrency: number;
   authMethodId?: string;
   command: GatewayCommand;
+  /** Registry id of the agent to run, instead of a command given after `--`. */
+  agentId?: string;
+  /** Install a registry binary the registry publishes no checksum for. */
+  allowUnverifiedAgent: boolean;
+  /** A different registry index, for pinning or for testing. */
+  registryUrl?: string;
+  /** Tokens that are not gateway options — the agent command, when no `--` was used. */
+  rest: string[];
 }
 
 /**
@@ -433,7 +452,12 @@ export interface GatewayOptions {
  * the agent command.
  */
 export function parseGatewayArgs(args: string[]): GatewayOptions {
-  const options: GatewayOptions = { maxConcurrency: 2, command: "run" };
+  const options: GatewayOptions = {
+    maxConcurrency: 2,
+    command: "run",
+    allowUnverifiedAgent: false,
+    rest: [],
+  };
 
   for (let i = 0; i < args.length; i++) {
     // A following token is this flag's value only when it isn't a flag itself,
@@ -470,10 +494,77 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
       case "--list-auth-methods":
         options.command = "list-auth-methods";
         break;
+      case "--agent":
+        if (value) {
+          options.agentId = value;
+          i++;
+        }
+        break;
+      case "--list-agents":
+        options.command = "list-agents";
+        break;
+      case "--allow-unverified-agent":
+        options.allowUnverifiedAgent = true;
+        break;
+      case "--registry-url":
+        if (value) {
+          options.registryUrl = value;
+          i++;
+        }
+        break;
+      default:
+        // Anything unrecognised belongs to the agent command, which may be
+        // given without a `--` separator.
+        options.rest.push(args[i]);
     }
   }
 
   return options;
+}
+
+/**
+ * Prints every agent the registry publishes, and how each one can be run here.
+ */
+export async function runListAgents(
+  registryUrl?: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const registry = await fetchRegistry(registryUrl, fetchImpl);
+  const target = hostPlatformTarget();
+  console.log(
+    `ACP registry v${registry.version} — ${registry.agents.length} agents ` +
+      `(this machine: ${target ?? `${process.platform}/${process.arch}, unsupported`})\n`,
+  );
+  console.log(describeAgents(registry, target));
+  console.log(`\nRun one with: acp-gateway --agent <id>`);
+}
+
+/**
+ * Works out which command actually starts the agent.
+ *
+ * `--agent <id>` resolves through the registry — installing the agent when the
+ * only distribution is a binary — and otherwise the command given after `--`
+ * is used as-is.
+ */
+export async function resolveAgentCommand(
+  options: GatewayOptions,
+  explicitCommand: string[],
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ command: string[]; env?: Record<string, string> }> {
+  if (!options.agentId) return { command: explicitCommand };
+
+  const registry = await fetchRegistry(options.registryUrl, fetchImpl);
+  const spec = await resolveAgentLaunch({
+    id: options.agentId,
+    registry,
+    platformTarget: hostPlatformTarget(),
+    allowUnverified: options.allowUnverifiedAgent,
+    fetchImpl,
+  });
+  console.error(
+    `[registry] Running "${options.agentId}" via ${spec.kind}: ${spec.command} ${spec.args.join(" ")}`,
+  );
+  return { command: [spec.command, ...spec.args], env: spec.env };
 }
 
 /**
@@ -532,10 +623,13 @@ export function printUsage(): void {
   console.log(
     "Usage: acp-gateway [--max-concurrency <number>] [--auth-method <id>] -- <acp-server-command> [args...]",
   );
+  console.log("       acp-gateway --agent <registry-id> [--allow-unverified-agent]");
+  console.log("       acp-gateway --list-agents");
   console.log("       acp-gateway --list-auth-methods -- <acp-server-command> [args...]");
   console.log("       acp-gateway --login [method-id] -- <acp-server-command> [args...]");
   console.log("       acp-gateway --logout -- <acp-server-command> [args...]");
   console.log("Example: acp-gateway --max-concurrency 4 -- gemini --acp");
+  console.log("Example: acp-gateway --agent gemini");
 }
 
 async function main() {
@@ -543,27 +637,46 @@ async function main() {
 
   const args = process.argv.slice(2);
 
-  // Find where the command starts (after -- if provided, or just all args)
+  // Everything after `--` is the agent command. Without a separator the
+  // gateway's own options are still recognised and whatever is left over is
+  // the command, so `acp-gateway --agent gemini` needs no trailing `--`.
   const cmdStartIndex = args.indexOf("--");
-  const acpCmdArgs =
-    cmdStartIndex !== -1 ? args.slice(cmdStartIndex + 1) : args;
+  const gatewayArgs = cmdStartIndex !== -1 ? args.slice(0, cmdStartIndex) : args;
+  const options = parseGatewayArgs(gatewayArgs);
+  const explicitCommand =
+    cmdStartIndex !== -1 ? args.slice(cmdStartIndex + 1) : options.rest;
 
-  if (acpCmdArgs.length === 0) {
-    printUsage();
-    process.exit(1);
+  const { maxConcurrency, command, authMethodId } = options;
+
+  // Listing the registry needs neither a workspace nor an agent.
+  if (command === "list-agents") {
+    await runListAgents(options.registryUrl);
+    process.exit(0);
   }
 
   // 1. Load MCP Config
   const configs = loadMcpConfig();
   const agentrqConfig = pickAgentrqServer(configs);
 
-  const gatewayArgs = cmdStartIndex !== -1 ? args.slice(0, cmdStartIndex) : [];
-  const { maxConcurrency, command, authMethodId } = parseGatewayArgs(gatewayArgs);
+  // 2. Work out what actually starts the agent — a registry id, or the command
+  // the user gave.
+  const resolved = await resolveAgentCommand(options, explicitCommand);
+  const acpCmdArgs = resolved.command;
+  if (acpCmdArgs.length === 0) {
+    printUsage();
+    process.exit(1);
+  }
+  if (resolved.env) {
+    // The registry entry's env is part of how that agent must be launched, so
+    // it travels with the command into every session spawned from it.
+    agentrqConfig.env = { ...agentrqConfig.env, ...resolved.env };
+  }
+
   authConfig.methodId = authMethodId;
 
   const taskQueue = new TaskQueue(maxConcurrency);
 
-  // 2. Initialize MCP Bridge
+  // 3. Initialize MCP Bridge
   const mcpBridge = new MCPBridge(agentrqConfig);
 
   // Auth commands talk to the agent and exit; they never start bridging tasks.

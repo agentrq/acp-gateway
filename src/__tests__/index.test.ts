@@ -15,6 +15,8 @@ import {
   openAgentConnection,
   parseGatewayArgs,
   printUsage,
+  resolveAgentCommand,
+  runListAgents,
   pickHumanApprovalMode,
   enforceHumanApprovalMode,
   runAuthCommand,
@@ -568,7 +570,12 @@ describe("index", () => {
 
   describe("parseGatewayArgs", () => {
     it("should default to bridging tasks with a concurrency of 2", () => {
-      expect(parseGatewayArgs([])).toEqual({ maxConcurrency: 2, command: "run" });
+      expect(parseGatewayArgs([])).toEqual({
+        maxConcurrency: 2,
+        command: "run",
+        allowUnverifiedAgent: false,
+        rest: [],
+      });
     });
 
     it("should accept both spellings of the concurrency flag", () => {
@@ -579,14 +586,14 @@ describe("index", () => {
     it("should keep the default when the concurrency value is missing or not a number", () => {
       expect(parseGatewayArgs(["--max-concurrency"]).maxConcurrency).toBe(2);
       expect(parseGatewayArgs(["--max-concurrency", "many"]).maxConcurrency).toBe(2);
-      expect(parseGatewayArgs(["--max-concurrency", "--logout"])).toEqual({
+      expect(parseGatewayArgs(["--max-concurrency", "--logout"])).toMatchObject({
         maxConcurrency: 2,
         command: "logout",
       });
     });
 
     it("should read the preferred auth method", () => {
-      expect(parseGatewayArgs(["--auth-method", "oauth"])).toEqual({
+      expect(parseGatewayArgs(["--auth-method", "oauth"])).toMatchObject({
         maxConcurrency: 2,
         command: "run",
         authMethodId: "oauth",
@@ -595,8 +602,8 @@ describe("index", () => {
     });
 
     it("should recognise the auth commands", () => {
-      expect(parseGatewayArgs(["--login"])).toEqual({ maxConcurrency: 2, command: "login" });
-      expect(parseGatewayArgs(["--login", "oauth"])).toEqual({
+      expect(parseGatewayArgs(["--login"])).toMatchObject({ maxConcurrency: 2, command: "login" });
+      expect(parseGatewayArgs(["--login", "oauth"])).toMatchObject({
         maxConcurrency: 2,
         command: "login",
         authMethodId: "oauth",
@@ -605,8 +612,131 @@ describe("index", () => {
       expect(parseGatewayArgs(["--list-auth-methods"]).command).toBe("list-auth-methods");
     });
 
-    it("should ignore flags it does not know", () => {
-      expect(parseGatewayArgs(["--verbose", "--login"]).command).toBe("login");
+    it("should keep tokens it does not recognise as the agent command", () => {
+      const options = parseGatewayArgs(["--verbose", "--login"]);
+      expect(options.command).toBe("login");
+      expect(options.rest).toEqual(["--verbose"]);
+    });
+
+    it("should collect an agent command given without a -- separator", () => {
+      expect(parseGatewayArgs(["--max-concurrency", "4", "gemini", "--acp"])).toMatchObject({
+        maxConcurrency: 4,
+        rest: ["gemini", "--acp"],
+      });
+    });
+
+    it("should read the registry options", () => {
+      expect(parseGatewayArgs(["--agent", "gemini"])).toMatchObject({
+        agentId: "gemini",
+        command: "run",
+      });
+      expect(parseGatewayArgs(["--agent"]).agentId).toBeUndefined();
+      expect(parseGatewayArgs(["--list-agents"]).command).toBe("list-agents");
+      expect(parseGatewayArgs(["--allow-unverified-agent"]).allowUnverifiedAgent).toBe(true);
+      expect(
+        parseGatewayArgs(["--registry-url", "http://localhost/registry.json"]).registryUrl,
+      ).toBe("http://localhost/registry.json");
+      expect(parseGatewayArgs(["--registry-url"]).registryUrl).toBeUndefined();
+    });
+  });
+
+  describe("runListAgents", () => {
+    const registry = {
+      version: "1.0.0",
+      agents: [
+        {
+          id: "gemini",
+          name: "Gemini CLI",
+          version: "0.58.0",
+          description: "Google's CLI",
+          distribution: { npx: { package: "@google/gemini-cli", args: ["--acp"] } },
+        },
+      ],
+    };
+
+    it("should print every agent and how to run one", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue({ ok: true, json: async () => registry });
+
+      await runListAgents(undefined, fetchImpl as any);
+
+      const printed = logSpy.mock.calls.flat().join("\n");
+      logSpy.mockRestore();
+      expect(printed).toContain("ACP registry v1.0.0 — 1 agents");
+      expect(printed).toContain("gemini");
+      expect(printed).toContain("acp-gateway --agent <id>");
+    });
+
+    it("should read a registry the user pointed it at", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue({ ok: true, json: async () => registry });
+
+      await runListAgents("http://localhost/registry.json", fetchImpl as any);
+      logSpy.mockRestore();
+
+      expect(fetchImpl).toHaveBeenCalledWith("http://localhost/registry.json");
+    });
+  });
+
+  describe("resolveAgentCommand", () => {
+    const options = (overrides: Record<string, any> = {}) => ({
+      maxConcurrency: 2,
+      command: "run" as const,
+      allowUnverifiedAgent: false,
+      rest: [],
+      ...overrides,
+    });
+
+    it("should use the command given after -- when no registry id was named", async () => {
+      const fetchImpl = vi.fn();
+
+      const resolved = await resolveAgentCommand(options(), ["gemini", "--acp"], fetchImpl as any);
+
+      expect(resolved).toEqual({ command: ["gemini", "--acp"] });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("should resolve a registry id into the command that runs it", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          version: "1.0.0",
+          agents: [
+            {
+              id: "gemini",
+              name: "Gemini CLI",
+              version: "0.58.0",
+              description: "Google's CLI",
+              distribution: {
+                npx: { package: "@google/gemini-cli@0.58.0", args: ["--acp"], env: { K: "v" } },
+              },
+            },
+          ],
+        }),
+      });
+
+      const resolved = await resolveAgentCommand(
+        options({ agentId: "gemini" }),
+        [],
+        fetchImpl as any,
+      );
+      errorSpy.mockRestore();
+
+      expect(resolved.command[0]).toMatch(/^npx/);
+      expect(resolved.command.slice(1)).toEqual(["-y", "@google/gemini-cli@0.58.0", "--acp"]);
+      expect(resolved.env).toEqual({ K: "v" });
+    });
+
+    it("should surface a registry id that does not exist", async () => {
+      const fetchImpl = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ version: "1.0.0", agents: [] }),
+      });
+
+      await expect(
+        resolveAgentCommand(options({ agentId: "nope" }), [], fetchImpl as any),
+      ).rejects.toThrow(/No agent "nope" in the ACP registry/);
     });
   });
 
