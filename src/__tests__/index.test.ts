@@ -30,6 +30,11 @@ import {
   markTaskCancelled,
   isTaskCancelled,
   nextTaskSeq,
+  CLOSE_SESSION_TIMEOUT_MS,
+  supportsCloseSession,
+  closeSession,
+  closeAllSessions,
+  setupSignalHandlers,
 } from "../index.js";
 import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
@@ -1521,4 +1526,258 @@ describe("index", () => {
     });
   });
 
+  describe("session lifecycle and clean close", () => {
+    describe("supportsCloseSession", () => {
+      it("returns true when close is an object {}", () => {
+        expect(
+          supportsCloseSession({
+            sessionCapabilities: { close: {} },
+          } as any),
+        ).toBe(true);
+      });
+
+      it("returns true when close is boolean true", () => {
+        expect(
+          supportsCloseSession({
+            sessionCapabilities: { close: true as any },
+          } as any),
+        ).toBe(true);
+      });
+
+      it("returns false when close is false", () => {
+        expect(
+          supportsCloseSession({
+            sessionCapabilities: { close: false as any },
+          } as any),
+        ).toBe(false);
+      });
+
+      it("returns false when close is null or undefined", () => {
+        expect(
+          supportsCloseSession({
+            sessionCapabilities: { close: null },
+          } as any),
+        ).toBe(false);
+        expect(
+          supportsCloseSession({
+            sessionCapabilities: {},
+          } as any),
+        ).toBe(false);
+      });
+
+      it("returns false when sessionCapabilities or agentCapabilities is missing", () => {
+        expect(supportsCloseSession({} as any)).toBe(false);
+        expect(supportsCloseSession(null)).toBe(false);
+        expect(supportsCloseSession(undefined)).toBe(false);
+      });
+    });
+
+    describe("closeSession", () => {
+      let errorSpy: any;
+      beforeEach(() => {
+        errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      });
+      afterEach(() => {
+        errorSpy.mockRestore();
+      });
+
+      it("cancels turn, sends closeSession if supported, and kills process", async () => {
+        const cancelTurn = vi.fn().mockResolvedValue(undefined);
+        const closeSessionRpc = vi.fn().mockResolvedValue({});
+        const kill = vi.fn();
+
+        const session: any = {
+          sessionId: "sess-1",
+          acpClient: { cancelTurn },
+          connection: { closeSession: closeSessionRpc },
+          initResult: { agentCapabilities: { sessionCapabilities: { close: {} } } },
+          process: { kill },
+        };
+
+        await closeSession(session);
+
+        expect(cancelTurn).toHaveBeenCalledWith("sess-1");
+        expect(closeSessionRpc).toHaveBeenCalledWith({ sessionId: "sess-1" });
+        expect(kill).toHaveBeenCalled();
+      });
+
+      it("does not call closeSession RPC if not supported by agent", async () => {
+        const cancelTurn = vi.fn().mockResolvedValue(undefined);
+        const closeSessionRpc = vi.fn().mockResolvedValue({});
+        const kill = vi.fn();
+
+        const session: any = {
+          sessionId: "sess-no-close",
+          acpClient: { cancelTurn },
+          connection: { closeSession: closeSessionRpc },
+          initResult: { agentCapabilities: { sessionCapabilities: {} } },
+          process: { kill },
+        };
+
+        await closeSession(session);
+
+        expect(cancelTurn).toHaveBeenCalledWith("sess-no-close");
+        expect(closeSessionRpc).not.toHaveBeenCalled();
+        expect(kill).toHaveBeenCalled();
+      });
+
+      it("handles error during cancelTurn gracefully", async () => {
+        const cancelTurn = vi.fn().mockRejectedValue(new Error("cancel failed"));
+        const kill = vi.fn();
+
+        const session: any = {
+          sessionId: "sess-err",
+          acpClient: { cancelTurn },
+          connection: {},
+          initResult: {},
+          process: { kill },
+        };
+
+        await closeSession(session);
+
+        expect(cancelTurn).toHaveBeenCalledWith("sess-err");
+        expect(kill).toHaveBeenCalled();
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("Error cancelling turn while closing session sess-err"),
+          expect.any(Error),
+        );
+      });
+
+      it("handles error during closeSession RPC gracefully", async () => {
+        const cancelTurn = vi.fn().mockResolvedValue(undefined);
+        const closeSessionRpc = vi.fn().mockRejectedValue(new Error("close RPC failed"));
+        const kill = vi.fn();
+
+        const session: any = {
+          sessionId: "sess-err-close",
+          acpClient: { cancelTurn },
+          connection: { closeSession: closeSessionRpc },
+          initResult: { agentCapabilities: { sessionCapabilities: { close: {} } } },
+          process: { kill },
+        };
+
+        await closeSession(session);
+
+        expect(closeSessionRpc).toHaveBeenCalledWith({ sessionId: "sess-err-close" });
+        expect(kill).toHaveBeenCalled();
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("Failed to cleanly close session sess-err-close"),
+          expect.any(Error),
+        );
+      });
+
+      it("times out if closeSession RPC hangs", async () => {
+        const cancelTurn = vi.fn().mockResolvedValue(undefined);
+        const closeSessionRpc = vi.fn().mockImplementation(() => new Promise(() => {}));
+        const kill = vi.fn();
+
+        const session: any = {
+          sessionId: "sess-hang",
+          acpClient: { cancelTurn },
+          connection: { closeSession: closeSessionRpc },
+          initResult: { agentCapabilities: { sessionCapabilities: { close: {} } } },
+          process: { kill },
+        };
+
+        await closeSession(session, 10);
+
+        expect(kill).toHaveBeenCalled();
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("session/close for sess-hang did not complete in 10ms"),
+        );
+      });
+
+      it("handles missing or throwing process.kill gracefully", async () => {
+        const cancelTurn = vi.fn().mockResolvedValue(undefined);
+        const session: any = {
+          sessionId: "sess-no-proc",
+          acpClient: { cancelTurn },
+          connection: {},
+          initResult: {},
+          process: {
+            kill: vi.fn().mockImplementation(() => {
+              throw new Error("process already dead");
+            }),
+          },
+        };
+
+        await expect(closeSession(session)).resolves.not.toThrow();
+      });
+    });
+
+    describe("closeAllSessions", () => {
+      let errorSpy: any;
+      beforeEach(() => {
+        activeSessions.clear();
+        errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      });
+      afterEach(() => {
+        activeSessions.clear();
+        errorSpy.mockRestore();
+      });
+
+      it("does nothing when activeSessions is empty", async () => {
+        await closeAllSessions();
+        expect(activeSessions.size).toBe(0);
+      });
+
+      it("closes all unique active sessions in parallel and clears map", async () => {
+        const cancel1 = vi.fn().mockResolvedValue(undefined);
+        const cancel2 = vi.fn().mockResolvedValue(undefined);
+        const kill1 = vi.fn();
+        const kill2 = vi.fn();
+
+        const session1: any = {
+          sessionId: "s1",
+          acpClient: { cancelTurn: cancel1 },
+          connection: {},
+          initResult: {},
+          process: { kill: kill1 },
+        };
+        const session2: any = {
+          sessionId: "s2",
+          acpClient: { cancelTurn: cancel2 },
+          connection: {},
+          initResult: {},
+          process: { kill: kill2 },
+        };
+
+        activeSessions.set("task-1", session1);
+        activeSessions.set("task-2", session2);
+        activeSessions.set("duplicate-task-1", session1);
+
+        await closeAllSessions();
+
+        expect(activeSessions.size).toBe(0);
+        expect(cancel1).toHaveBeenCalledTimes(1);
+        expect(cancel2).toHaveBeenCalledTimes(1);
+        expect(kill1).toHaveBeenCalledTimes(1);
+        expect(kill2).toHaveBeenCalledTimes(1);
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("Cleanly closing 2 active session(s)..."),
+        );
+      });
+    });
+
+    describe("setupSignalHandlers", () => {
+      it("registers and cleans up SIGINT and SIGTERM handlers", async () => {
+        const signalHandler = vi.fn().mockResolvedValue(undefined);
+        const cleanup = setupSignalHandlers(signalHandler);
+
+        expect(process.listenerCount("SIGINT")).toBeGreaterThan(0);
+        expect(process.listenerCount("SIGTERM")).toBeGreaterThan(0);
+
+        // Emit SIGINT
+        process.emit("SIGINT");
+        expect(signalHandler).toHaveBeenCalledWith("SIGINT");
+
+        // Emit SIGTERM
+        process.emit("SIGTERM");
+        expect(signalHandler).toHaveBeenCalledWith("SIGTERM");
+
+        // Cleanup
+        cleanup();
+      });
+    });
+  });
 });
