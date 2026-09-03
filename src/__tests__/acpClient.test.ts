@@ -1210,6 +1210,29 @@ describe("AgentRQACPClient", () => {
       expect(client.pendingPermissionCount).toBe(0);
     });
 
+    it("should settle waiting permissions even if session/cancel never returns", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      // An agent wedged on its stdin: the write goes out, nothing comes back.
+      // The permissions must still settle or their queue slots are held forever.
+      client.setSessionCanceller(() => new Promise(() => {}));
+
+      const waiting = client.requestPermission(params({ sessionId: "sess-1" }));
+      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(1));
+
+      vi.useFakeTimers();
+      try {
+        const cancelling = client.cancelTurn("sess-1");
+        await vi.advanceTimersByTimeAsync(5000);
+        await cancelling;
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect((await waiting).outcome.outcome).toBe("cancelled");
+      expect(client.pendingPermissionCount).toBe(0);
+      errorSpy.mockRestore();
+    });
+
     it("should handle cancelTurn with undefined sessionId or no canceller gracefully", async () => {
       await expect(client.cancelTurn(undefined)).resolves.toBeUndefined();
 

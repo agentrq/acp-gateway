@@ -26,7 +26,10 @@ import {
   runAgentCommand,
   findActiveSession,
   handleTaskCancellation,
-  cancelledTaskIds,
+  cancelledTaskSeq,
+  markTaskCancelled,
+  isTaskCancelled,
+  nextTaskSeq,
 } from "../index.js";
 import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
@@ -1247,6 +1250,14 @@ describe("index", () => {
         expect(findActiveSession("task-new-id")).toBe(mockSession);
       });
 
+      it("should not fall back to a session that belongs to a different task", () => {
+        // Task A is running; a cancel for queued task B must not abort it.
+        const sessionA: any = { sessionId: "sess-a", acpClient: { cancelTurn: vi.fn() } };
+        activeSessions.set("task-a", sessionA);
+
+        expect(findActiveSession("task-b")).toBeUndefined();
+      });
+
       it("should return undefined if taskId is not found when multiple sessions exist", () => {
         activeSessions.set("task-1", { sessionId: "s1" } as any);
         activeSessions.set("task-2", { sessionId: "s2" } as any);
@@ -1272,26 +1283,64 @@ describe("index", () => {
         );
       });
 
-      it("should record taskId in cancelledTaskIds so queued tasks are skipped", async () => {
-        cancelledTaskIds.clear();
-        await handleTaskCancellation("task-queued-1");
-        expect(cancelledTaskIds.has("task-queued-1")).toBe(true);
-
+      it("should skip a task cancelled while it was still being fetched", async () => {
+        cancelledTaskSeq.clear();
         const promptMock = vi.fn();
         const switcher: any = { ensureForTask: vi.fn().mockResolvedValue("s-q1") };
         const acpClient: any = { flushReply: vi.fn(), reportStopReason: vi.fn() };
         const connection: any = { prompt: promptMock };
         const bridge: any = {
-          callTool: vi.fn().mockResolvedValue({
-            content: [{ type: "text", text: "task task-queued-1: do work" }],
+          // The cancel lands while the poll is in flight — the task has no
+          // session yet, so nothing but this flag can stop it.
+          callTool: vi.fn().mockImplementation(async () => {
+            await handleTaskCancellation("task-queued-1");
+            return { content: [{ type: "text", text: "task task-queued-1: do work" }] };
           }),
         };
 
         await checkForNextTask(bridge, connection, switcher, acpClient);
 
-        // Since it was cancelled, prompt should NOT be called
         expect(promptMock).not.toHaveBeenCalled();
-        expect(cancelledTaskIds.has("task-queued-1")).toBe(false);
+      });
+
+      it("should not swallow work queued after the cancellation", async () => {
+        // agentrq reuses a chat's id as the task id, so the id cancelled a
+        // moment ago is the same id the user's next message arrives under.
+        cancelledTaskSeq.clear();
+        await handleTaskCancellation("task-queued-2");
+
+        const promptMock = vi.fn().mockResolvedValue({ stopReason: "end_turn" });
+        const switcher: any = { ensureForTask: vi.fn().mockResolvedValue("s-q2") };
+        const acpClient: any = { flushReply: vi.fn(), reportStopReason: vi.fn() };
+        const connection: any = { prompt: promptMock };
+        const bridge: any = {
+          callTool: vi.fn().mockResolvedValue({
+            content: [{ type: "text", text: "task task-queued-2: fresh work" }],
+          }),
+        };
+
+        await checkForNextTask(bridge, connection, switcher, acpClient);
+
+        expect(promptMock).toHaveBeenCalled();
+      });
+
+      it("should forget the oldest cancellations rather than grow forever", async () => {
+        cancelledTaskSeq.clear();
+        for (let i = 0; i < 250; i++) markTaskCancelled(`task-${i}`);
+
+        expect(cancelledTaskSeq.size).toBe(200);
+        expect(cancelledTaskSeq.has("task-0")).toBe(false);
+        expect(cancelledTaskSeq.has("task-249")).toBe(true);
+      });
+
+      it("should only stop the notification that was queued before the cancel", async () => {
+        cancelledTaskSeq.clear();
+        const older = nextTaskSeq();
+        await handleTaskCancellation("task-two-turns");
+        const newer = nextTaskSeq();
+
+        expect(isTaskCancelled("task-two-turns", older)).toBe(true);
+        expect(isTaskCancelled("task-two-turns", newer)).toBe(false);
       });
 
       it("should log when task to cancel is not found", async () => {
@@ -1325,7 +1374,7 @@ describe("index", () => {
         expect(cancel1).not.toHaveBeenCalled();
         expect(cancel2).not.toHaveBeenCalled();
         expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("2 active sessions found (skipping to avoid aborting unrelated tasks)")
+          expect.stringContaining("but 2 sessions are active (skipping to avoid aborting unrelated tasks)")
         );
       });
     });

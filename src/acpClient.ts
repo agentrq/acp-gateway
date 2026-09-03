@@ -13,6 +13,9 @@ import * as path from "node:path";
 /** Identifies a tool call routed through an agentrq MCP server. */
 const AGENTRQ_TOOL_PATTERN = /agentrq-[a-zA-Z0-9]{11}/;
 
+/** How long to wait for `session/cancel` before settling permissions regardless. */
+const CANCEL_SESSION_TIMEOUT_MS = 5000;
+
 /**
  * What a turn ending in anything but `end_turn` means, in the human's terms.
  *
@@ -163,14 +166,36 @@ export class AgentRQACPClient implements acp.Client {
   /** Stops the agent's current turn and cancels any pending permissions for the session. */
   async cancelTurn(sessionId: string | undefined): Promise<void> {
     if (!sessionId) return;
-    if (this.cancelSession) {
-      try {
-        await this.cancelSession(sessionId);
-      } catch (err) {
-        console.error(`[acp] Failed to cancel turn for session ${sessionId}:`, err);
+    try {
+      // Cancel before answering: the spec treats `cancelled` as the answer a
+      // client gives *because* it cancelled the turn, so settling first would
+      // leave the agent free to carry on and ask again. The wait is bounded and
+      // the settle happens either way — an agent wedged on its stdin must not
+      // hold waiting permissions, and their task-queue slots, open forever.
+      if (this.cancelSession) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            Promise.resolve(this.cancelSession(sessionId)),
+            new Promise<void>((resolve) => {
+              timer = setTimeout(() => {
+                console.error(
+                  `[acp] session/cancel for ${sessionId} did not complete in ` +
+                    `${CANCEL_SESSION_TIMEOUT_MS}ms — settling permissions anyway`,
+                );
+                resolve();
+              }, CANCEL_SESSION_TIMEOUT_MS);
+            }),
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
       }
+    } catch (err) {
+      console.error(`[acp] Failed to cancel turn for session ${sessionId}:`, err);
+    } finally {
+      this.cancelPendingPermissions("task cancelled", sessionId);
     }
-    this.cancelPendingPermissions("task cancelled", sessionId);
   }
 
   async flushReply(sessionId: string): Promise<void> {
