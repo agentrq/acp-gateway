@@ -27,6 +27,16 @@ import {
 import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
 
+/**
+ * A stand-in for the workspace bridge.
+ *
+ * The ACP client registers a verdict listener on it as soon as it is built, so
+ * a bare object is not enough — the real bridge is an EventEmitter.
+ */
+function fakeBridge(): any {
+  return new EventEmitter();
+}
+
 // Real emitters so the agent-process lifecycle handlers can be exercised.
 const { spawnedAgents } = vi.hoisted(() => ({ spawnedAgents: [] as any[] }));
 
@@ -463,7 +473,7 @@ describe("index", () => {
     });
 
     it("should spawn a new session when not cached", async () => {
-      const mockBridge: any = {};
+      const mockBridge: any = fakeBridge();
       const configs: any[] = [];
       const agentrqConfig: any = { env: {} };
       
@@ -475,7 +485,7 @@ describe("index", () => {
     });
 
     it("should return cached session when already created", async () => {
-      const mockBridge: any = {};
+      const mockBridge: any = fakeBridge();
       const configs: any[] = [];
       const agentrqConfig: any = { env: {} };
 
@@ -486,7 +496,7 @@ describe("index", () => {
     });
 
     it("should declare elicitation support when initializing the ACP connection", async () => {
-      const mockBridge: any = {};
+      const mockBridge: any = fakeBridge();
       const configs: any[] = [];
       const agentrqConfig: any = { env: {} };
 
@@ -502,7 +512,7 @@ describe("index", () => {
     });
 
     it("should declare whether it can host a terminal login", async () => {
-      const mockBridge: any = {};
+      const mockBridge: any = fakeBridge();
 
       const session = await getOrCreateSession("T-Auth-Cap", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
 
@@ -535,7 +545,7 @@ describe("index", () => {
         } as any;
       } as any);
 
-      const session = await getOrCreateSession("T-Login", ["node", "agent.js"], [], { env: {} } as any, {} as any);
+      const session = await getOrCreateSession("T-Login", ["node", "agent.js"], [], { env: {} } as any, fakeBridge());
 
       expect(authenticate).toHaveBeenCalledWith({ methodId: "agent-login" });
       expect(newSession).toHaveBeenCalledTimes(2);
@@ -543,7 +553,7 @@ describe("index", () => {
     });
 
     it("should drop the cached session when the agent process dies", async () => {
-      const mockBridge: any = {};
+      const mockBridge: any = fakeBridge();
       await getOrCreateSession("T-Exit", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
       expect(activeSessions.has("T-Exit")).toBe(true);
 
@@ -571,7 +581,7 @@ describe("index", () => {
       const onExit = vi.fn();
       const agent = await openAgentConnection({
         acpCmdArgs: ["node", "agent.js"],
-        mcpBridge: {} as any,
+        mcpBridge: fakeBridge(),
         label: "login",
         onExit,
       });
@@ -622,10 +632,27 @@ describe("index", () => {
     it("should default to bridging tasks with a concurrency of 2", () => {
       expect(parseGatewayArgs([])).toEqual({
         maxConcurrency: 2,
+        permissionTimeoutMs: 30 * 60_000,
         command: "run",
         allowUnverifiedAgent: false,
         rest: [],
       });
+    });
+
+    it("should take the permission timeout in minutes", () => {
+      expect(parseGatewayArgs(["--permission-timeout", "5"]).permissionTimeoutMs).toBe(300_000);
+      // Zero is a deliberate "wait indefinitely", so it must not be ignored.
+      expect(parseGatewayArgs(["--permission-timeout", "0"]).permissionTimeoutMs).toBe(0);
+    });
+
+    it("should keep the default when the timeout makes no sense", () => {
+      expect(parseGatewayArgs(["--permission-timeout"]).permissionTimeoutMs).toBe(30 * 60_000);
+      expect(parseGatewayArgs(["--permission-timeout", "soon"]).permissionTimeoutMs).toBe(
+        30 * 60_000,
+      );
+      expect(parseGatewayArgs(["--permission-timeout", "-5"]).permissionTimeoutMs).toBe(
+        30 * 60_000,
+      );
     });
 
     it("should accept both spellings of the concurrency flag", () => {
@@ -778,6 +805,7 @@ describe("index", () => {
   describe("resolveAgentCommand", () => {
     const options = (overrides: Record<string, any> = {}) => ({
       maxConcurrency: 2,
+      permissionTimeoutMs: 30 * 60_000,
       command: "run" as const,
       allowUnverifiedAgent: false,
       rest: [],
@@ -865,7 +893,7 @@ describe("index", () => {
         agentCapabilities: { auth: { logout: {} } },
       });
 
-      await runAgentCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, {} as any);
+      await runAgentCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, fakeBridge());
 
       const printed = logSpy.mock.calls.flat().join("\n");
       expect(printed).toContain("Agent login (agent-login)");
@@ -883,7 +911,7 @@ describe("index", () => {
         },
       });
 
-      await runAgentCommand("agent-info", ["gemini", "--acp"], agentrqConfig, {} as any);
+      await runAgentCommand("agent-info", ["gemini", "--acp"], agentrqConfig, fakeBridge());
 
       const printed = String(logSpy.mock.calls.at(-1)[0]);
       expect(printed).toContain("gemini --acp");
@@ -897,7 +925,7 @@ describe("index", () => {
     it("should report agents that advertise no login", async () => {
       mockConnection({});
 
-      await runAgentCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, {} as any);
+      await runAgentCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, fakeBridge());
 
       expect(logSpy.mock.calls.flat().join("\n")).toContain("no authentication methods");
     });
@@ -907,7 +935,7 @@ describe("index", () => {
         agentCapabilities: { auth: { logout: {} } },
       });
 
-      await runAgentCommand("logout", ["gemini", "--acp"], agentrqConfig, {} as any);
+      await runAgentCommand("logout", ["gemini", "--acp"], agentrqConfig, fakeBridge());
 
       expect(connection.logout).toHaveBeenCalledWith({});
     });
@@ -920,7 +948,7 @@ describe("index", () => {
         ],
       });
 
-      await runAgentCommand("login", ["gemini", "--acp"], agentrqConfig, {} as any, "oauth");
+      await runAgentCommand("login", ["gemini", "--acp"], agentrqConfig, fakeBridge(), "oauth");
 
       expect(connection.authenticate).toHaveBeenCalledWith({ methodId: "oauth" });
     });
@@ -931,7 +959,7 @@ describe("index", () => {
       });
 
       await expect(
-        runAgentCommand("login", ["gemini", "--acp"], agentrqConfig, {} as any, "missing"),
+        runAgentCommand("login", ["gemini", "--acp"], agentrqConfig, fakeBridge(), "missing"),
       ).rejects.toThrow(/Unknown authentication method/);
       expect(spawnedAgents[0].kill).toHaveBeenCalled();
     });
@@ -956,6 +984,7 @@ describe("index", () => {
           "--logout",
           "--auth-method",
           "--max-concurrency",
+          "--permission-timeout",
           "--help",
         ]),
       );

@@ -19,6 +19,25 @@ const AGENTRQ_TOOL_PATTERN = /agentrq-[a-zA-Z0-9]{11}/;
  * Without this the workspace sees the agent's partial answer and nothing else,
  * so a refused or truncated turn is indistinguishable from a finished one.
  */
+/**
+ * How long a tool call waits for a human before the turn is given up on.
+ *
+ * Humans are slow — this is not a network timeout — but it must exist: a wait
+ * with no end holds a task-queue slot for the life of the process, and at low
+ * concurrency one unanswered approval is enough to stop the workspace.
+ */
+export const DEFAULT_PERMISSION_TIMEOUT_MS = 30 * 60 * 1000;
+
+/** A permission request that has been sent to agentrq and has no verdict yet. */
+interface PendingPermission {
+  /** Exactly what was sent, kept so it can be re-sent if the session changes. */
+  payload: Record<string, unknown>;
+  sessionId?: string;
+  options: acp.PermissionOption[];
+  /** Answers the agent once, and forgets the request. */
+  settle: (outcome: acp.RequestPermissionOutcome) => void;
+}
+
 const STOP_REASON_NOTES: Record<string, string> = {
   refusal: "⚠️ The agent refused to continue this turn.",
   max_tokens: "⚠️ The agent stopped mid-turn: it ran out of output tokens.",
@@ -37,10 +56,71 @@ export class AgentRQACPClient implements acp.Client {
   // otherwise leave us unable to tell an agentrq MCP call from anything else.
   private toolCallDetails = new Map<string, { title?: string; rawInput?: unknown }>();
 
+  // request_id → the tool call waiting on a human. One shared verdict listener
+  // serves them all: a listener per request was only ever removed on a matching
+  // verdict, so every unanswered request leaked one for the life of the process.
+  private pendingPermissions = new Map<string, PendingPermission>();
+  private permissionTimeoutMs: number;
+  private cancelSession?: (sessionId: string) => unknown;
+
   constructor(
     private mcpBridge: MCPBridge,
     private getTaskIdForSession: (sessionId: string) => string | undefined = () => undefined,
-  ) {}
+    options: { permissionTimeoutMs?: number } = {},
+  ) {
+    this.permissionTimeoutMs = options.permissionTimeoutMs ?? DEFAULT_PERMISSION_TIMEOUT_MS;
+    this.mcpBridge.on("verdict", this.onVerdict);
+  }
+
+  /** How many tool calls are waiting on a human right now. */
+  get pendingPermissionCount(): number {
+    return this.pendingPermissions.size;
+  }
+
+  /**
+   * Supplies the way to stop a turn, which only exists once the agent
+   * connection has been built around this client.
+   */
+  setSessionCanceller(cancel: (sessionId: string) => unknown): void {
+    this.cancelSession = cancel;
+  }
+
+  /**
+   * Answers every waiting tool call with `cancelled`.
+   *
+   * Used when the agent is gone: nothing will ever act on those answers, but
+   * the promises must settle or their task-queue slots are held forever.
+   */
+  cancelPendingPermissions(reason: string): void {
+    if (this.pendingPermissions.size === 0) return;
+    console.error(
+      `[acp] Cancelling ${this.pendingPermissions.size} waiting permission request(s): ${reason}`,
+    );
+    for (const pending of [...this.pendingPermissions.values()]) {
+      pending.settle({ outcome: "cancelled" });
+    }
+  }
+
+  /** Delivers a verdict to whichever tool call is waiting on it, if any. */
+  private onVerdict = (data: { requestId: string; behavior: string }): void => {
+    const pending = this.pendingPermissions.get(data.requestId);
+    if (!pending) {
+      console.error(`[acp] Verdict for ${data.requestId} arrived with nothing waiting on it`);
+      return;
+    }
+    console.error(`✅ Permission verdict received: ${data.behavior}`);
+    pending.settle(this.outcomeForVerdict(pending.options, data.behavior));
+  };
+
+  /** Stops the agent's current turn, where there is a connection to stop it on. */
+  private async cancelTurn(sessionId: string | undefined): Promise<void> {
+    if (!sessionId || !this.cancelSession) return;
+    try {
+      await this.cancelSession(sessionId);
+    } catch (err) {
+      console.error(`[acp] Failed to cancel turn for session ${sessionId}:`, err);
+    }
+  }
 
   async flushReply(sessionId: string): Promise<void> {
     const text = this.replyBuffers.get(sessionId) ?? "";
@@ -97,21 +177,21 @@ export class AgentRQACPClient implements acp.Client {
   async requestPermission(
     params: acp.RequestPermissionRequest
   ): Promise<acp.RequestPermissionResponse> {
-    const requestId = params.toolCall.toolCallId;
+    const toolCallId = params.toolCall.toolCallId;
     // Fall back to what the earlier session update reported for this same tool
     // call: the permission request itself may carry no title or input.
-    const remembered = this.toolCallDetails.get(requestId);
-    this.toolCallDetails.delete(requestId);
+    const remembered = this.toolCallDetails.get(toolCallId);
+    this.toolCallDetails.delete(toolCallId);
     const toolTitle = params.toolCall.title ?? remembered?.title ?? "Unknown Tool";
     const rawInput = params.toolCall.rawInput ?? remembered?.rawInput;
 
     // Auto-allow tool calls that contain the pattern: agentrq-<11 chars a-zA-Z0-9>
     if (AGENTRQ_TOOL_PATTERN.test(toolTitle)) {
-      console.error(`\n🔓 ACP Auto-allowing tool call: ${toolTitle} (ID: ${requestId})`);
-      const option = params.options.find(o => 
+      console.error(`\n🔓 ACP Auto-allowing tool call: ${toolTitle} (ID: ${toolCallId})`);
+      const option = params.options.find(o =>
         o.kind.startsWith("allow") ||
-        o.name.toLowerCase().includes("allow") || 
-        o.name.toLowerCase().includes("yes") || 
+        o.name.toLowerCase().includes("allow") ||
+        o.name.toLowerCase().includes("yes") ||
         o.name.toLowerCase().includes("approve")
       );
       const optionId = option?.optionId ?? params.options[0].optionId;
@@ -123,9 +203,15 @@ export class AgentRQACPClient implements acp.Client {
       };
     }
 
-    console.error(`\n🔐 ACP Permission requested: ${toolTitle} (ID: ${requestId})`);
+    console.error(`\n🔐 ACP Permission requested: ${toolTitle} (ID: ${toolCallId})`);
 
-    const taskId = params.sessionId ? this.getTaskIdForSession(params.sessionId) : undefined;
+    const sessionId = params.sessionId as string | undefined;
+    // agentrq keys its own bookkeeping on the request id alone, across the whole
+    // workspace. Tool call ids are only unique within a session, and agents
+    // commonly number them from one, so two tasks running at once could
+    // otherwise have a verdict land on the wrong tool call.
+    const requestId = sessionId ? `${sessionId}:${toolCallId}` : toolCallId;
+    const taskId = sessionId ? this.getTaskIdForSession(sessionId) : undefined;
     const payload = {
       request_id: requestId,
       task_id: taskId,
@@ -155,71 +241,90 @@ export class AgentRQACPClient implements acp.Client {
       return { outcome: { outcome: "cancelled" } };
     }
 
-    // 2. Wait for the verdict from the MCP server
+    // 2. Wait for the verdict from the MCP server — but not forever.
     console.error(`⌛ Waiting for human approval in the agentrq dashboard...`);
-    
-    return new Promise((resolve) => {
-      const handler = (data: { requestId: string; behavior: string }) => {
-        if (data.requestId === requestId) {
-          // Cleanup this listener
-          this.mcpBridge.off("verdict", handler);
-          
-          console.error(`✅ Permission verdict received: ${data.behavior}`);
 
-          // A verdict from agentrq covers exactly one tool call. Never select
-          // a "persistent" option (ACP's "allow_always"/"reject_always" kinds,
-          // or an equivalent "remember"/"don't ask again" option by name) —
-          // picking one would make the *spawned agent* remember the decision
-          // and stop sending requestPermission for matching future tool
-          // calls, so those calls would never reach agentrq again. Every
-          // subsequent call must still be forwarded and re-approved there.
-          const isPersistent = (o: acp.PermissionOption) =>
-            /always|remember|don'?t ask/i.test(o.kind) || /always|remember|don'?t ask/i.test(o.name);
-          const onceOptions = params.options.filter(o => !isPersistent(o));
+    return new Promise<acp.RequestPermissionResponse>((resolve) => {
+      const timer =
+        this.permissionTimeoutMs > 0
+          ? setTimeout(() => {
+              console.error(
+                `[acp] ⌛ No verdict for ${requestId} after ` +
+                  `${Math.round(this.permissionTimeoutMs / 60000)} min — cancelling the turn.`,
+              );
+              // Cancel as well as answering: the spec treats `cancelled` as the
+              // answer a client gives *because* it cancelled the turn. Answering
+              // alone would leave the agent free to carry on and ask again.
+              void this.cancelTurn(sessionId);
+              settle({ outcome: "cancelled" });
+            }, this.permissionTimeoutMs)
+          : undefined;
 
-          // Map "allow"/"deny" to the correct ACP option. Per the ACP spec,
-          // PermissionOptionKind is one of "allow_once" | "allow_always" |
-          // "reject_once" | "reject_always" — there is no "deny_*" kind, so a
-          // deny verdict must match on "reject" to find a spec-compliant option.
-          const isAllow = data.behavior === "allow";
-          const option = onceOptions.find(o => {
-            const name = o.name.toLowerCase();
-            return isAllow
-              ? o.kind.startsWith("allow") || name.includes("allow") || name.includes("yes") || name.includes("approve")
-              : o.kind.startsWith("reject") || name.includes("deny") || name.includes("reject") || name.includes("no");
-          });
-
-          // Falling back to onceOptions[0] unconditionally is unsafe for a
-          // deny verdict: ACP conventionally lists allow options first, so an
-          // unmatched deny could silently resolve to an allow option and
-          // approve a tool call the human explicitly denied. Only ever fall
-          // back to a non-persistent option that is not itself an allow-kind;
-          // if no safe option exists at all (e.g. only "always" options were
-          // offered), cancel instead of guessing.
-          let outcome: acp.RequestPermissionOutcome;
-          if (option) {
-            outcome = { outcome: "selected", optionId: option.optionId };
-          } else if (isAllow) {
-            outcome = onceOptions[0]
-              ? { outcome: "selected", optionId: onceOptions[0].optionId }
-              : { outcome: "cancelled" };
-          } else {
-            const safeFallback = onceOptions.find(o => !o.kind.startsWith("allow"));
-            outcome = safeFallback
-              ? { outcome: "selected", optionId: safeFallback.optionId }
-              : { outcome: "cancelled" };
-          }
-
-          console.error(
-            `[acp] Selected permission option: ${"optionId" in outcome ? outcome.optionId : "cancelled"} (${option?.name ?? "default"})`
-          );
-
-          resolve({ outcome });
-        }
+      const settle = (outcome: acp.RequestPermissionOutcome): void => {
+        if (timer) clearTimeout(timer);
+        this.pendingPermissions.delete(requestId);
+        console.error(
+          `[acp] Selected permission option: ${"optionId" in outcome ? outcome.optionId : "cancelled"}`,
+        );
+        resolve({ outcome });
       };
 
-      this.mcpBridge.on("verdict", handler);
+      this.pendingPermissions.set(requestId, {
+        payload,
+        sessionId,
+        options: params.options,
+        settle,
+      });
     });
+  }
+
+  /**
+   * Turns a workspace verdict into one of the options the agent offered.
+   *
+   * A verdict from agentrq covers exactly one tool call. Never select a
+   * "persistent" option (ACP's "allow_always"/"reject_always" kinds, or an
+   * equivalent "remember"/"don't ask again" option by name) — picking one would
+   * make the *spawned agent* remember the decision and stop sending
+   * requestPermission for matching future tool calls, so those calls would
+   * never reach agentrq again. Every subsequent call must still be forwarded
+   * and re-approved there.
+   */
+  private outcomeForVerdict(
+    options: acp.PermissionOption[],
+    behavior: string,
+  ): acp.RequestPermissionOutcome {
+    const isPersistent = (o: acp.PermissionOption) =>
+      /always|remember|don'?t ask/i.test(o.kind) || /always|remember|don'?t ask/i.test(o.name);
+    const onceOptions = options.filter(o => !isPersistent(o));
+
+    // Map "allow"/"deny" to the correct ACP option. Per the ACP spec,
+    // PermissionOptionKind is one of "allow_once" | "allow_always" |
+    // "reject_once" | "reject_always" — there is no "deny_*" kind, so a
+    // deny verdict must match on "reject" to find a spec-compliant option.
+    const isAllow = behavior === "allow";
+    const option = onceOptions.find(o => {
+      const name = o.name.toLowerCase();
+      return isAllow
+        ? o.kind.startsWith("allow") || name.includes("allow") || name.includes("yes") || name.includes("approve")
+        : o.kind.startsWith("reject") || name.includes("deny") || name.includes("reject") || name.includes("no");
+    });
+    if (option) return { outcome: "selected", optionId: option.optionId };
+
+    // Falling back to onceOptions[0] unconditionally is unsafe for a deny
+    // verdict: ACP conventionally lists allow options first, so an unmatched
+    // deny could silently resolve to an allow option and approve a tool call
+    // the human explicitly denied. Only ever fall back to a non-persistent
+    // option that is not itself an allow-kind; if no safe option exists at all
+    // (e.g. only "always" options were offered), cancel instead of guessing.
+    if (isAllow) {
+      return onceOptions[0]
+        ? { outcome: "selected", optionId: onceOptions[0].optionId }
+        : { outcome: "cancelled" };
+    }
+    const safeFallback = onceOptions.find(o => !o.kind.startsWith("allow"));
+    return safeFallback
+      ? { outcome: "selected", optionId: safeFallback.optionId }
+      : { outcome: "cancelled" };
   }
 
   /**
