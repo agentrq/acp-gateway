@@ -26,6 +26,7 @@ import {
   runAgentCommand,
   findActiveSession,
   handleTaskCancellation,
+  cancelledTaskIds,
 } from "../index.js";
 import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
@@ -1239,17 +1240,18 @@ describe("index", () => {
         expect(findActiveSession(undefined)).toBe(mockSession);
       });
 
-      it("should return undefined if no taskId provided and multiple or zero sessions exist", () => {
-        expect(findActiveSession(undefined)).toBeUndefined();
+      it("should fallback to default keyed session when taskId is given but only 1 session exists", () => {
+        const mockSession: any = { sessionId: "s1", acpClient: { cancelTurn: vi.fn() } };
+        activeSessions.set("default", mockSession);
 
-        activeSessions.set("task-1", { sessionId: "s1" } as any);
-        activeSessions.set("task-2", { sessionId: "s2" } as any);
-        expect(findActiveSession(undefined)).toBeUndefined();
+        expect(findActiveSession("task-new-id")).toBe(mockSession);
       });
 
-      it("should return undefined if taskId is not found", () => {
+      it("should return undefined if taskId is not found when multiple sessions exist", () => {
         activeSessions.set("task-1", { sessionId: "s1" } as any);
+        activeSessions.set("task-2", { sessionId: "s2" } as any);
         expect(findActiveSession("task-nonexistent")).toBeUndefined();
+        expect(findActiveSession(undefined)).toBeUndefined();
       });
     });
 
@@ -1270,6 +1272,28 @@ describe("index", () => {
         );
       });
 
+      it("should record taskId in cancelledTaskIds so queued tasks are skipped", async () => {
+        cancelledTaskIds.clear();
+        await handleTaskCancellation("task-queued-1");
+        expect(cancelledTaskIds.has("task-queued-1")).toBe(true);
+
+        const promptMock = vi.fn();
+        const switcher: any = { ensureForTask: vi.fn().mockResolvedValue("s-q1") };
+        const acpClient: any = { flushReply: vi.fn(), reportStopReason: vi.fn() };
+        const connection: any = { prompt: promptMock };
+        const bridge: any = {
+          callTool: vi.fn().mockResolvedValue({
+            content: [{ type: "text", text: "task task-queued-1: do work" }],
+          }),
+        };
+
+        await checkForNextTask(bridge, connection, switcher, acpClient);
+
+        // Since it was cancelled, prompt should NOT be called
+        expect(promptMock).not.toHaveBeenCalled();
+        expect(cancelledTaskIds.has("task-queued-1")).toBe(false);
+      });
+
       it("should log when task to cancel is not found", async () => {
         await handleTaskCancellation("task-missing");
 
@@ -1278,18 +1302,30 @@ describe("index", () => {
         );
       });
 
-      it("should cancel all active sessions when taskId is omitted", async () => {
+      it("should cancel the single session when taskId is omitted and only 1 session exists", async () => {
+        const cancel1 = vi.fn().mockResolvedValue(undefined);
+        activeSessions.set("t1", { sessionId: "s1", acpClient: { cancelTurn: cancel1 } } as any);
+
+        await handleTaskCancellation(undefined, "single shutdown");
+
+        expect(cancel1).toHaveBeenCalledWith("s1");
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("Received cancellation with no taskId (single shutdown). Cancelling active session s1...")
+        );
+      });
+
+      it("should fail closed and not cancel anything when taskId is omitted and multiple sessions exist", async () => {
         const cancel1 = vi.fn().mockResolvedValue(undefined);
         const cancel2 = vi.fn().mockResolvedValue(undefined);
         activeSessions.set("t1", { sessionId: "s1", acpClient: { cancelTurn: cancel1 } } as any);
         activeSessions.set("t2", { sessionId: "s2", acpClient: { cancelTurn: cancel2 } } as any);
 
-        await handleTaskCancellation(undefined, "server shutdown");
+        await handleTaskCancellation(undefined, "multiple active");
 
-        expect(cancel1).toHaveBeenCalledWith("s1");
-        expect(cancel2).toHaveBeenCalledWith("s2");
+        expect(cancel1).not.toHaveBeenCalled();
+        expect(cancel2).not.toHaveBeenCalled();
         expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("Received cancellation with no taskId (server shutdown), cancelling all active sessions")
+          expect.stringContaining("2 active sessions found (skipping to avoid aborting unrelated tasks)")
         );
       });
     });

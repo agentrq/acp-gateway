@@ -108,6 +108,7 @@ import {
 } from "./taskIdentity.js";
 
 const lastTaskContent = new Map<string, string>();
+export const cancelledTaskIds = new Set<string>();
 
 export interface AgentSession {
   process: any;
@@ -333,8 +334,11 @@ export function findActiveSession(taskId?: string): AgentSession | undefined {
     for (const session of activeSessions.values()) {
       if (session.sessionId === taskId) return session;
     }
-  }
-  if (!taskId && activeSessions.size === 1) {
+    // If there is exactly one active session (e.g. keyed "default"), fall back to it
+    if (activeSessions.size === 1) {
+      return activeSessions.values().next().value;
+    }
+  } else if (activeSessions.size === 1) {
     return activeSessions.values().next().value;
   }
   return undefined;
@@ -349,11 +353,11 @@ export async function handleTaskCancellation(
   reason?: string,
 ): Promise<void> {
   if (taskId) {
-    lastTaskContent.delete(taskId);
+    cancelledTaskIds.add(taskId);
     const session = findActiveSession(taskId);
     if (!session) {
       console.error(
-        `[bridge] Received cancellation for task ${taskId}, but no active session found`,
+        `[bridge] Received cancellation for task ${taskId}, but no active session found (queued tasks will be skipped)`,
       );
       return;
     }
@@ -362,15 +366,19 @@ export async function handleTaskCancellation(
     );
     await session.acpClient.cancelTurn(session.sessionId);
   } else {
-    console.error(
-      `[bridge] Received cancellation with no taskId${reason ? ` (${reason})` : ""}, cancelling all active sessions`,
-    );
-    for (const session of activeSessions.values()) {
+    const session = findActiveSession(undefined);
+    if (session) {
+      console.error(
+        `[bridge] Received cancellation with no taskId${reason ? ` (${reason})` : ""}. Cancelling active session ${session.sessionId}...`,
+      );
       await session.acpClient.cancelTurn(session.sessionId);
+    } else {
+      console.error(
+        `[bridge] Received cancellation with no taskId${reason ? ` (${reason})` : ""}, but ${activeSessions.size} active sessions found (skipping to avoid aborting unrelated tasks)`,
+      );
     }
   }
 }
-
 
 type AcpNewSessionParams = Parameters<
   acp.ClientSideConnection["newSession"]
@@ -1028,6 +1036,13 @@ async function main() {
         "\n[bridge] Incoming task from MCP server. Forwarding to ACP agent...",
       );
       taskQueue.run(async () => {
+        if (taskId && cancelledTaskIds.has(taskId)) {
+          console.error(
+            `[bridge] Task ${taskId} was cancelled before execution started, skipping`,
+          );
+          cancelledTaskIds.delete(taskId);
+          return;
+        }
         try {
           const sessionInfo = await getOrCreateSession(
             taskId,
@@ -1036,6 +1051,14 @@ async function main() {
             agentrqConfig,
             mcpBridge,
           );
+          if (taskId && cancelledTaskIds.has(taskId)) {
+            console.error(
+              `[bridge] Task ${taskId} was cancelled during session setup, cancelling session`,
+            );
+            cancelledTaskIds.delete(taskId);
+            await sessionInfo.acpClient.cancelTurn(sessionInfo.sessionId);
+            return;
+          }
           const result = await sessionInfo.connection.prompt({
             sessionId: sessionInfo.sessionId,
             prompt: [{ type: "text", text: content }],
@@ -1134,6 +1157,13 @@ export async function checkForNextTask(
       );
 
       const runFn = async () => {
+        if (taskId && cancelledTaskIds.has(taskId)) {
+          console.error(
+            `[bridge] Task ${taskId} was cancelled before execution started, skipping`,
+          );
+          cancelledTaskIds.delete(taskId);
+          return;
+        }
         let connectionToUse: acp.ClientSideConnection | undefined;
         let acpClientToUse: AgentRQACPClient | undefined;
         let sessionIdToUse: string | undefined;

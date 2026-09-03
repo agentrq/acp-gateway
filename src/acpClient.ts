@@ -108,7 +108,7 @@ export class AgentRQACPClient implements acp.Client {
     if (this.pendingPermissions.size === 0) return;
     const toCancel = sessionId
       ? [...this.pendingPermissions.values()].filter(
-          (p) => !p.sessionId || p.sessionId === sessionId,
+          (p) => p.sessionId === sessionId,
         )
       : [...this.pendingPermissions.values()];
 
@@ -163,13 +163,14 @@ export class AgentRQACPClient implements acp.Client {
   /** Stops the agent's current turn and cancels any pending permissions for the session. */
   async cancelTurn(sessionId: string | undefined): Promise<void> {
     if (!sessionId) return;
-    this.cancelPendingPermissions("task cancelled", sessionId);
-    if (!this.cancelSession) return;
-    try {
-      await this.cancelSession(sessionId);
-    } catch (err) {
-      console.error(`[acp] Failed to cancel turn for session ${sessionId}:`, err);
+    if (this.cancelSession) {
+      try {
+        await this.cancelSession(sessionId);
+      } catch (err) {
+        console.error(`[acp] Failed to cancel turn for session ${sessionId}:`, err);
+      }
     }
+    this.cancelPendingPermissions("task cancelled", sessionId);
   }
 
   async flushReply(sessionId: string): Promise<void> {

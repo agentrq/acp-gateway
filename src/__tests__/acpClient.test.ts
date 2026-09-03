@@ -1161,15 +1161,19 @@ describe("AgentRQACPClient", () => {
     it("should cancel only the pending permissions for the specified session", async () => {
       const waitSess1 = client.requestPermission(params({ sessionId: "sess-1", toolCall: { toolCallId: "call-1", title: "Bash" } }));
       const waitSess2 = client.requestPermission(params({ sessionId: "sess-2", toolCall: { toolCallId: "call-2", title: "Bash" } }));
-      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(2));
+      const waitNoSess = client.requestPermission(params({ sessionId: undefined, toolCall: { toolCallId: "call-3", title: "Bash" } }));
+      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(3));
 
       client.cancelPendingPermissions("task cancelled", "sess-1");
 
       expect((await waitSess1).outcome.outcome).toBe("cancelled");
-      expect(client.pendingPermissionCount).toBe(1);
+      expect(client.pendingPermissionCount).toBe(2);
 
-      answerWith("allow");
+      // Requests with undefined sessionId should NOT be cancelled by a session-scoped cancel
+      mcpBridge.emit("verdict", { requestId: "sess-2:call-2", behavior: "allow" });
       expect((await waitSess2).outcome.outcome).toBe("selected");
+      mcpBridge.emit("verdict", { requestId: "call-3", behavior: "allow" });
+      expect((await waitNoSess).outcome.outcome).toBe("selected");
       expect(client.pendingPermissionCount).toBe(0);
     });
 
@@ -1184,16 +1188,24 @@ describe("AgentRQACPClient", () => {
       expect((await waiting).outcome.outcome).toBe("selected");
     });
 
-    it("should cancel turn and pending permissions via cancelTurn", async () => {
-      const cancelSession = vi.fn().mockResolvedValue(undefined);
+    it("should send session/cancel RPC before settling pending permissions", async () => {
+      const callOrder: string[] = [];
+      const cancelSession = vi.fn().mockImplementation(async () => {
+        callOrder.push("cancelRPC");
+      });
       client.setSessionCanceller(cancelSession);
 
-      const waiting = client.requestPermission(params({ sessionId: "sess-1" }));
+      const waiting = client.requestPermission(params({ sessionId: "sess-1" })).then((res) => {
+        callOrder.push("settledPermission");
+        return res;
+      });
       await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(1));
 
       await client.cancelTurn("sess-1");
+      const res = await waiting;
 
-      expect((await waiting).outcome.outcome).toBe("cancelled");
+      expect(callOrder).toEqual(["cancelRPC", "settledPermission"]);
+      expect(res.outcome.outcome).toBe("cancelled");
       expect(cancelSession).toHaveBeenCalledWith("sess-1");
       expect(client.pendingPermissionCount).toBe(0);
     });

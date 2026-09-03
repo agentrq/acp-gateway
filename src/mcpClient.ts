@@ -170,6 +170,7 @@ export class MCPBridge extends EventEmitter {
             chat_id: z.string().optional(),
             reason: z.string().optional(),
             meta: z.any().optional(),
+            _meta: z.any().optional(),
           })
           .passthrough()
           .optional(),
@@ -181,7 +182,8 @@ export class MCPBridge extends EventEmitter {
           params.task_id ||
           params.taskId ||
           params.chat_id ||
-          extractTaskIdFromMeta(params.meta);
+          extractTaskIdFromMeta(params.meta) ||
+          extractTaskIdFromMeta(params._meta);
         this.emit("cancel", { taskId, reason: params.reason });
       },
     );

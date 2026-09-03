@@ -262,14 +262,22 @@ describe("MCPBridge", () => {
   });
 
   describe("task cancellation notifications", () => {
+  function getCancelNotificationHandler() {
+    for (const call of lastMockClient.setNotificationHandler.mock.calls) {
+      const schema = call[0];
+      try {
+        const parsed = schema.safeParse({ method: "notifications/claude/channel/cancel" });
+        if (parsed.success) return call[1];
+      } catch {}
+    }
+    return undefined;
+  }
+
     it("should emit cancel event when notifications/claude/channel/cancel is received with task_id", async () => {
       const bridge = new MCPBridge(config);
       await bridge.connect();
 
-      const cancelHandler = lastMockClient.setNotificationHandler.mock.calls.find(
-        (call: any[]) => call[0]?.shape?.method?._def?.value === "notifications/claude/channel/cancel" ||
-                         call[1] && call[0]?.description?.includes?.("cancel")
-      )?.[1] || lastMockClient.setNotificationHandler.mock.calls[2][1];
+      const cancelHandler = getCancelNotificationHandler();
 
       const onCancel = vi.fn();
       bridge.on("cancel", onCancel);
@@ -285,11 +293,11 @@ describe("MCPBridge", () => {
       });
     });
 
-    it("should extract taskId from taskId, chat_id, or meta", async () => {
+        it("should extract taskId from taskId, chat_id, or meta", async () => {
       const bridge = new MCPBridge(config);
       await bridge.connect();
 
-      const cancelHandler = lastMockClient.setNotificationHandler.mock.calls[2][1];
+      const cancelHandler = getCancelNotificationHandler();
       const onCancel = vi.fn();
       bridge.on("cancel", onCancel);
 
@@ -320,6 +328,16 @@ describe("MCPBridge", () => {
       });
       expect(onCancel).toHaveBeenLastCalledWith({
         taskId: "meta-789",
+        reason: undefined,
+      });
+
+      // _meta.chat_id (MCP standard location)
+      cancelHandler({
+        method: "notifications/claude/channel/cancel",
+        params: { _meta: { chat_id: "meta-under" } },
+      });
+      expect(onCancel).toHaveBeenLastCalledWith({
+        taskId: "meta-under",
         reason: undefined,
       });
 
