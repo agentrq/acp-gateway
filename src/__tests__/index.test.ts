@@ -502,6 +502,39 @@ describe("index", () => {
       expect(session1).toBe(session2);
     });
 
+    it("should pass clientInfo with package name and version when initializing the ACP connection", async () => {
+      const mockBridge: any = fakeBridge();
+      const configs: any[] = [];
+      const agentrqConfig: any = { env: {} };
+
+      const session = await getOrCreateSession("T-ClientInfo", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
+
+      expect(session.connection.initialize).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clientInfo: expect.objectContaining({
+            name: "@agentrq/acp-gateway",
+            version: expect.any(String),
+          }),
+        }),
+      );
+    });
+
+    it("should declare plan capability when initializing the ACP connection", async () => {
+      const mockBridge: any = fakeBridge();
+      const configs: any[] = [];
+      const agentrqConfig: any = { env: {} };
+
+      const session = await getOrCreateSession("T-Plan", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
+
+      expect(session.connection.initialize).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clientCapabilities: expect.objectContaining({
+            plan: {},
+          }),
+        }),
+      );
+    });
+
     it("should declare elicitation support when initializing the ACP connection", async () => {
       const mockBridge: any = fakeBridge();
       const configs: any[] = [];
@@ -572,6 +605,35 @@ describe("index", () => {
   describe("openAgentConnection", () => {
     beforeEach(() => {
       spawnedAgents.length = 0;
+    });
+
+    it("should pass clientInfo and plan capability in initialize handshake", async () => {
+      const initSpy = vi.fn().mockResolvedValue({
+        protocolVersion: "0.1.0",
+      });
+      vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
+        return {
+          initialize: initSpy,
+        } as any;
+      } as any);
+
+      await openAgentConnection({
+        acpCmdArgs: ["node", "agent.js"],
+        mcpBridge: fakeBridge(),
+        label: "init-test",
+      });
+
+      expect(initSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clientInfo: expect.objectContaining({
+            name: "@agentrq/acp-gateway",
+            version: expect.any(String),
+          }),
+          clientCapabilities: expect.objectContaining({
+            plan: {},
+          }),
+        }),
+      );
     });
 
     it("should report the agent's login methods and survive process failures", async () => {

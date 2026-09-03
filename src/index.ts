@@ -258,6 +258,10 @@ export async function openAgentConnection({
 
   const initResult = await connection.initialize({
     protocolVersion: acp.PROTOCOL_VERSION,
+    clientInfo: {
+      name: pkg.name,
+      version: pkg.version,
+    },
     clientCapabilities: {
       fs: {
         readTextFile: true,
@@ -267,6 +271,7 @@ export async function openAgentConnection({
         form: {},
         url: {},
       },
+      plan: {},
       // Only claim terminal logins when we can actually hand the agent a
       // terminal; otherwise the agent may offer a method we cannot run.
       auth: {
