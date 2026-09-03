@@ -323,6 +323,55 @@ export async function getOrCreateSession(
   return sessionInfo;
 }
 
+/**
+ * Finds the active agent session for a given task ID (or returns the single active session if none specified).
+ */
+export function findActiveSession(taskId?: string): AgentSession | undefined {
+  if (taskId) {
+    const direct = activeSessions.get(taskId);
+    if (direct) return direct;
+    for (const session of activeSessions.values()) {
+      if (session.sessionId === taskId) return session;
+    }
+  }
+  if (!taskId && activeSessions.size === 1) {
+    return activeSessions.values().next().value;
+  }
+  return undefined;
+}
+
+/**
+ * Handles task cancellation events from the MCP server.
+ * Cancels the ACP session/turn and immediately cancels any pending permissions.
+ */
+export async function handleTaskCancellation(
+  taskId?: string,
+  reason?: string,
+): Promise<void> {
+  if (taskId) {
+    lastTaskContent.delete(taskId);
+    const session = findActiveSession(taskId);
+    if (!session) {
+      console.error(
+        `[bridge] Received cancellation for task ${taskId}, but no active session found`,
+      );
+      return;
+    }
+    console.error(
+      `[bridge] Cancelling session ${session.sessionId} for task ${taskId}${reason ? ` (${reason})` : ""}`,
+    );
+    await session.acpClient.cancelTurn(session.sessionId);
+  } else {
+    console.error(
+      `[bridge] Received cancellation with no taskId${reason ? ` (${reason})` : ""}, cancelling all active sessions`,
+    );
+    for (const session of activeSessions.values()) {
+      await session.acpClient.cancelTurn(session.sessionId);
+    }
+  }
+}
+
+
 type AcpNewSessionParams = Parameters<
   acp.ClientSideConnection["newSession"]
 >[0];
@@ -1005,6 +1054,13 @@ async function main() {
         }
       }).catch((err) => {
         console.error("[bridge] Error queuing task:", err);
+      });
+    });
+
+    // Listen for task cancellation events from the MCP bridge
+    mcpBridge.on("cancel", ({ taskId, reason }: { taskId?: string; reason?: string }) => {
+      handleTaskCancellation(taskId, reason).catch((err) => {
+        console.error("[bridge] Error handling task cancellation:", err);
       });
     });
 

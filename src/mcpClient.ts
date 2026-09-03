@@ -10,6 +10,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { EventEmitter } from "node:events";
 import { z } from "zod";
 import type { McpServerConfig } from "./config.js";
+import { extractTaskIdFromMeta } from "./taskIdentity.js";
 
 export class MCPBridge extends EventEmitter {
   private client: Client | null = null;
@@ -156,6 +157,32 @@ export class MCPBridge extends EventEmitter {
         console.error("[mcp] Received permission verdict");
         const { request_id, behavior } = notification.params;
         this.emit("verdict", { requestId: request_id, behavior });
+      },
+    );
+    // Set notification handler for task cancellation
+    this.client.setNotificationHandler(
+      z.object({
+        method: z.literal("notifications/claude/channel/cancel"),
+        params: z
+          .object({
+            task_id: z.string().optional(),
+            taskId: z.string().optional(),
+            chat_id: z.string().optional(),
+            reason: z.string().optional(),
+            meta: z.any().optional(),
+          })
+          .passthrough()
+          .optional(),
+      }),
+      (notification) => {
+        console.error("[mcp] Received task cancellation notification");
+        const params = notification.params ?? {};
+        const taskId =
+          params.task_id ||
+          params.taskId ||
+          params.chat_id ||
+          extractTaskIdFromMeta(params.meta);
+        this.emit("cancel", { taskId, reason: params.reason });
       },
     );
   }

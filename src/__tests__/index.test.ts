@@ -24,6 +24,8 @@ import {
   enforceHumanApprovalMode,
   handleAgentModeChange,
   runAgentCommand,
+  findActiveSession,
+  handleTaskCancellation,
 } from "../index.js";
 import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
@@ -1201,6 +1203,98 @@ describe("index", () => {
       );
     });
   });
+
+  describe("task cancellation handling", () => {
+    let errorSpy: any;
+
+    beforeEach(() => {
+      activeSessions.clear();
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      activeSessions.clear();
+      errorSpy.mockRestore();
+    });
+
+    describe("findActiveSession", () => {
+      it("should find session by direct task key", () => {
+        const mockSession: any = { sessionId: "sess-1", acpClient: { cancelTurn: vi.fn() } };
+        activeSessions.set("task-1", mockSession);
+
+        expect(findActiveSession("task-1")).toBe(mockSession);
+      });
+
+      it("should find session by sessionId match", () => {
+        const mockSession: any = { sessionId: "sess-custom", acpClient: { cancelTurn: vi.fn() } };
+        activeSessions.set("key-other", mockSession);
+
+        expect(findActiveSession("sess-custom")).toBe(mockSession);
+      });
+
+      it("should return the single session if no taskId is provided", () => {
+        const mockSession: any = { sessionId: "sess-only", acpClient: { cancelTurn: vi.fn() } };
+        activeSessions.set("default", mockSession);
+
+        expect(findActiveSession(undefined)).toBe(mockSession);
+      });
+
+      it("should return undefined if no taskId provided and multiple or zero sessions exist", () => {
+        expect(findActiveSession(undefined)).toBeUndefined();
+
+        activeSessions.set("task-1", { sessionId: "s1" } as any);
+        activeSessions.set("task-2", { sessionId: "s2" } as any);
+        expect(findActiveSession(undefined)).toBeUndefined();
+      });
+
+      it("should return undefined if taskId is not found", () => {
+        activeSessions.set("task-1", { sessionId: "s1" } as any);
+        expect(findActiveSession("task-nonexistent")).toBeUndefined();
+      });
+    });
+
+    describe("handleTaskCancellation", () => {
+      it("should cancel turn on the matched active session", async () => {
+        const cancelTurn = vi.fn().mockResolvedValue(undefined);
+        const mockSession: any = {
+          sessionId: "sess-100",
+          acpClient: { cancelTurn },
+        };
+        activeSessions.set("task-100", mockSession);
+
+        await handleTaskCancellation("task-100", "cancelled by user");
+
+        expect(cancelTurn).toHaveBeenCalledWith("sess-100");
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("Cancelling session sess-100 for task task-100 (cancelled by user)")
+        );
+      });
+
+      it("should log when task to cancel is not found", async () => {
+        await handleTaskCancellation("task-missing");
+
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("Received cancellation for task task-missing, but no active session found")
+        );
+      });
+
+      it("should cancel all active sessions when taskId is omitted", async () => {
+        const cancel1 = vi.fn().mockResolvedValue(undefined);
+        const cancel2 = vi.fn().mockResolvedValue(undefined);
+        activeSessions.set("t1", { sessionId: "s1", acpClient: { cancelTurn: cancel1 } } as any);
+        activeSessions.set("t2", { sessionId: "s2", acpClient: { cancelTurn: cancel2 } } as any);
+
+        await handleTaskCancellation(undefined, "server shutdown");
+
+        expect(cancel1).toHaveBeenCalledWith("s1");
+        expect(cancel2).toHaveBeenCalledWith("s2");
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("Received cancellation with no taskId (server shutdown), cancelling all active sessions")
+        );
+      });
+    });
+  });
+
   describe("handleAgentModeChange", () => {
     const modes: any = {
       currentModeId: "ask",
