@@ -48,8 +48,7 @@ npm install -g @agentrq/acp-gateway
 
 ### Quick Start
 
-Run `acp-gateway` from your agentrq workspace root (the directory containing `.mcp.json`):
-
+Run `acp-gateway` from your agentrq workspace root (the directory containing `.mcp.json`):\n
 ```bash
 # From workspace root
 acp-gateway -- gemini --acp
@@ -60,6 +59,10 @@ Or with a custom command:
 ```bash
 acp-gateway -- your-acp-agent --flag1 --flag2
 ```
+
+### End-to-End Demo & Walkthrough
+
+For a complete step-by-step walkthrough showing how `acp-gateway` connects an agentrq workspace to `antigravity-acp` to solve tasks, see [docs/demo.md](docs/demo.md).
 
 ### CLI Options
 
@@ -182,20 +185,20 @@ Example `.mcp.json`:
 
 ```
 ┌─────────────┐       ACP (JSON-RPC)       ┌──────────────────┐
-│  ACP Agent  │ ◄─────────────────────────► │                  │
-│  (Gemini)   │                               │   acp-gateway    │
-└─────────────┘                               │                  │
-                                              │  MCP Bridge      │
-                                              │                  │
-┌─────────────────────────────────────────────┤                  │
-│                                             │                  │
-│                                             │                  │
-│                                             ▼                  │
-│                              ┌──────────────────────────┐     │
-│                              │  agentrq MCP Server      │     │
-│                              │  (HTTP / StreamableHTTP) │     │
-│                              └──────────────────────────┘     │
-└────────────────────────────────────────────────────────────────┘
+│  ACP Agent  │ ◄────────────────────────► │                  │
+│  (Gemini)   │                            │   acp-gateway    │
+└─────────────┘                            │                  │
+                                           │  MCP Bridge      │
+                                           │                  │
+┌──────────────────────────────────────────┤                  │
+│                                          │                  │
+│                                          │                  │
+│                                          ▼                  │
+│                           ┌──────────────────────────┐      │
+│                           │  agentrq MCP Server      │      │
+│                           │  (HTTP / StreamableHTTP) │      │
+│                           └──────────────────────────┘      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### Flow
@@ -244,6 +247,8 @@ npm test
 
 ```
 acp-gateway/
+├── docs/
+│   └── demo.md            # End-to-end demo walkthrough
 ├── src/
 │   ├── acpClient.ts      # ACP Client implementation
 │   ├── agentInstall.ts    # Registry binary download / verify / cache
