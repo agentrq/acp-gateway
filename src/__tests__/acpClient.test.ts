@@ -1157,6 +1157,103 @@ describe("AgentRQACPClient", () => {
       await waiting;
     });
 
+
+    it("should cancel only the pending permissions for the specified session", async () => {
+      const waitSess1 = client.requestPermission(params({ sessionId: "sess-1", toolCall: { toolCallId: "call-1", title: "Bash" } }));
+      const waitSess2 = client.requestPermission(params({ sessionId: "sess-2", toolCall: { toolCallId: "call-2", title: "Bash" } }));
+      const waitNoSess = client.requestPermission(params({ sessionId: undefined, toolCall: { toolCallId: "call-3", title: "Bash" } }));
+      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(3));
+
+      client.cancelPendingPermissions("task cancelled", "sess-1");
+
+      expect((await waitSess1).outcome.outcome).toBe("cancelled");
+      expect(client.pendingPermissionCount).toBe(2);
+
+      // Requests with undefined sessionId should NOT be cancelled by a session-scoped cancel
+      mcpBridge.emit("verdict", { requestId: "sess-2:call-2", behavior: "allow" });
+      expect((await waitSess2).outcome.outcome).toBe("selected");
+      mcpBridge.emit("verdict", { requestId: "call-3", behavior: "allow" });
+      expect((await waitNoSess).outcome.outcome).toBe("selected");
+      expect(client.pendingPermissionCount).toBe(0);
+    });
+
+    it("should do nothing if sessionId does not match any waiting permissions", async () => {
+      const waiting = client.requestPermission(params({ sessionId: "sess-1" }));
+      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(1));
+
+      client.cancelPendingPermissions("task cancelled", "sess-999");
+      expect(client.pendingPermissionCount).toBe(1);
+
+      answerWith("allow");
+      expect((await waiting).outcome.outcome).toBe("selected");
+    });
+
+    it("should send session/cancel RPC before settling pending permissions", async () => {
+      const callOrder: string[] = [];
+      const cancelSession = vi.fn().mockImplementation(async () => {
+        callOrder.push("cancelRPC");
+      });
+      client.setSessionCanceller(cancelSession);
+
+      const waiting = client.requestPermission(params({ sessionId: "sess-1" })).then((res) => {
+        callOrder.push("settledPermission");
+        return res;
+      });
+      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(1));
+
+      await client.cancelTurn("sess-1");
+      const res = await waiting;
+
+      expect(callOrder).toEqual(["cancelRPC", "settledPermission"]);
+      expect(res.outcome.outcome).toBe("cancelled");
+      expect(cancelSession).toHaveBeenCalledWith("sess-1");
+      expect(client.pendingPermissionCount).toBe(0);
+    });
+
+    it("should settle waiting permissions even if session/cancel never returns", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      // An agent wedged on its stdin: the write goes out, nothing comes back.
+      // The permissions must still settle or their queue slots are held forever.
+      client.setSessionCanceller(() => new Promise(() => {}));
+
+      const waiting = client.requestPermission(params({ sessionId: "sess-1" }));
+      await vi.waitFor(() => expect(client.pendingPermissionCount).toBe(1));
+
+      vi.useFakeTimers();
+      try {
+        const cancelling = client.cancelTurn("sess-1");
+        await vi.advanceTimersByTimeAsync(5000);
+        await cancelling;
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect((await waiting).outcome.outcome).toBe("cancelled");
+      expect(client.pendingPermissionCount).toBe(0);
+      errorSpy.mockRestore();
+    });
+
+    it("should handle cancelTurn with undefined sessionId or no canceller gracefully", async () => {
+      await expect(client.cancelTurn(undefined)).resolves.toBeUndefined();
+
+      const freshClient = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-1");
+      await expect(freshClient.cancelTurn("sess-1")).resolves.toBeUndefined();
+    });
+
+    it("should log error if cancelSession rejects during cancelTurn", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      client.setSessionCanceller(() => {
+        throw new Error("cancel RPC failed");
+      });
+
+      await client.cancelTurn("sess-1");
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to cancel turn for session sess-1:"),
+        expect.any(Error)
+      );
+      errorSpy.mockRestore();
+    });
+
     it("should say nothing when there is nothing waiting to cancel", () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       client.cancelPendingPermissions("nothing doing");

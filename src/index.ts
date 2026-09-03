@@ -109,6 +109,46 @@ import {
 
 const lastTaskContent = new Map<string, string>();
 
+// Cancellations are remembered by *where they fall in the stream of events*
+// rather than as a one-shot flag. agentrq reuses a chat's id as the task id, so
+// a flag that outlived the cancellation it describes would swallow the user's
+// next message on that chat; ordered this way, a task is skipped only when the
+// cancel arrived after it was queued. Wall-clock time is too coarse to order
+// two events in the same millisecond, so this is a plain counter.
+let taskSeq = 0;
+export const nextTaskSeq = (): number => ++taskSeq;
+export const cancelledTaskSeq = new Map<string, number>();
+// A cancel for a task that never runs (a stale id, a task that already
+// finished) leaves an entry behind, so keep the map from growing without bound.
+const MAX_REMEMBERED_CANCELLATIONS = 200;
+
+/** Records that `taskId` has just been cancelled. */
+export function markTaskCancelled(taskId: string): void {
+  // Re-inserting moves the id to the end, so eviction stays oldest-first.
+  cancelledTaskSeq.delete(taskId);
+  cancelledTaskSeq.set(taskId, nextTaskSeq());
+  while (cancelledTaskSeq.size > MAX_REMEMBERED_CANCELLATIONS) {
+    const oldest = cancelledTaskSeq.keys().next().value as string;
+    cancelledTaskSeq.delete(oldest);
+  }
+}
+
+/**
+ * Whether a task queued at `queuedSeq` has since been cancelled.
+ *
+ * Two notifications for the same task id can be queued at once, so the check is
+ * against the point each was queued: cancelling the older one must not stop the
+ * newer one from running.
+ */
+export function isTaskCancelled(
+  taskId: string | undefined,
+  queuedSeq: number,
+): boolean {
+  if (!taskId) return false;
+  const seq = cancelledTaskSeq.get(taskId);
+  return seq !== undefined && seq > queuedSeq;
+}
+
 export interface AgentSession {
   process: any;
   connection: acp.ClientSideConnection;
@@ -321,6 +361,69 @@ export async function getOrCreateSession(
   };
   activeSessions.set(key, sessionInfo);
   return sessionInfo;
+}
+
+/**
+ * Finds the active agent session for a given task ID (or returns the single active session if none specified).
+ */
+export function findActiveSession(taskId?: string): AgentSession | undefined {
+  if (taskId) {
+    const direct = activeSessions.get(taskId);
+    if (direct) return direct;
+    for (const session of activeSessions.values()) {
+      if (session.sessionId === taskId) return session;
+    }
+    // A session opened from a notification that carried no task id is keyed
+    // "default"; when it is the only one running, an id-carrying cancel can
+    // only have meant it. Never fall back to a session keyed under a
+    // *different* task id — that would abort an unrelated task.
+    const untracked = activeSessions.get("default");
+    if (untracked && activeSessions.size === 1) {
+      return untracked;
+    }
+  } else if (activeSessions.size === 1) {
+    return activeSessions.values().next().value;
+  }
+  return undefined;
+}
+
+/**
+ * Handles task cancellation events from the MCP server.
+ * Cancels the ACP session/turn and immediately cancels any pending permissions.
+ */
+export async function handleTaskCancellation(
+  taskId?: string,
+  reason?: string,
+): Promise<void> {
+  if (taskId) {
+    markTaskCancelled(taskId);
+    const session = findActiveSession(taskId);
+    if (!session) {
+      console.error(
+        `[bridge] Received cancellation for task ${taskId}, but no active session found (queued tasks will be skipped)`,
+      );
+      return;
+    }
+    console.error(
+      `[bridge] Cancelling session ${session.sessionId} for task ${taskId}${reason ? ` (${reason})` : ""}`,
+    );
+    await session.acpClient.cancelTurn(session.sessionId);
+  } else {
+    const session = findActiveSession(undefined);
+    if (session) {
+      console.error(
+        `[bridge] Received cancellation with no taskId${reason ? ` (${reason})` : ""}. Cancelling active session ${session.sessionId}...`,
+      );
+      await session.acpClient.cancelTurn(session.sessionId);
+    } else {
+      console.error(
+        `[bridge] Received cancellation with no taskId${reason ? ` (${reason})` : ""}` +
+          (activeSessions.size === 0
+            ? ", and no sessions are active"
+            : `, but ${activeSessions.size} sessions are active (skipping to avoid aborting unrelated tasks)`),
+      );
+    }
+  }
 }
 
 type AcpNewSessionParams = Parameters<
@@ -978,7 +1081,14 @@ async function main() {
       console.error(
         "\n[bridge] Incoming task from MCP server. Forwarding to ACP agent...",
       );
+      const queuedSeq = nextTaskSeq();
       taskQueue.run(async () => {
+        if (isTaskCancelled(taskId, queuedSeq)) {
+          console.error(
+            `[bridge] Task ${taskId} was cancelled before execution started, skipping`,
+          );
+          return;
+        }
         try {
           const sessionInfo = await getOrCreateSession(
             taskId,
@@ -987,6 +1097,13 @@ async function main() {
             agentrqConfig,
             mcpBridge,
           );
+          if (isTaskCancelled(taskId, queuedSeq)) {
+            console.error(
+              `[bridge] Task ${taskId} was cancelled during session setup, cancelling session`,
+            );
+            await sessionInfo.acpClient.cancelTurn(sessionInfo.sessionId);
+            return;
+          }
           const result = await sessionInfo.connection.prompt({
             sessionId: sessionInfo.sessionId,
             prompt: [{ type: "text", text: content }],
@@ -1005,6 +1122,13 @@ async function main() {
         }
       }).catch((err) => {
         console.error("[bridge] Error queuing task:", err);
+      });
+    });
+
+    // Listen for task cancellation events from the MCP bridge
+    mcpBridge.on("cancel", ({ taskId, reason }: { taskId?: string; reason?: string }) => {
+      handleTaskCancellation(taskId, reason).catch((err) => {
+        console.error("[bridge] Error handling task cancellation:", err);
       });
     });
 
@@ -1046,6 +1170,9 @@ export async function checkForNextTask(
   agentrqConfig?: McpServerConfig,
 ) {
   console.error("[bridge] Checking for next task via MCP server...");
+  // Stamped before the fetch, so a cancel that arrives while `getTask` is in
+  // flight (or while the session is being opened) still stops the task.
+  const queuedSeq = nextTaskSeq();
   try {
     const result = await mcpBridge.callTool("getTask");
 
@@ -1078,6 +1205,12 @@ export async function checkForNextTask(
       );
 
       const runFn = async () => {
+        if (isTaskCancelled(taskId, queuedSeq)) {
+          console.error(
+            `[bridge] Task ${taskId} was cancelled before execution started, skipping`,
+          );
+          return;
+        }
         let connectionToUse: acp.ClientSideConnection | undefined;
         let acpClientToUse: AgentRQACPClient | undefined;
         let sessionIdToUse: string | undefined;
@@ -1113,6 +1246,17 @@ export async function checkForNextTask(
           connectionToUse = sessionInfo.connection;
           sessionIdToUse = sessionInfo.sessionId;
           acpClientToUse = sessionInfo.acpClient;
+        }
+
+        // Spawning the agent and opening the session takes seconds; a cancel
+        // that lands in that window has no turn to stop yet, so check again
+        // before handing the agent the work.
+        if (isTaskCancelled(taskId, queuedSeq)) {
+          console.error(
+            `[bridge] Task ${taskId} was cancelled during session setup, cancelling session`,
+          );
+          await acpClientToUse?.cancelTurn(sessionIdToUse);
+          return;
         }
 
         const promptResult = await connectionToUse.prompt({

@@ -24,6 +24,12 @@ import {
   enforceHumanApprovalMode,
   handleAgentModeChange,
   runAgentCommand,
+  findActiveSession,
+  handleTaskCancellation,
+  cancelledTaskSeq,
+  markTaskCancelled,
+  isTaskCancelled,
+  nextTaskSeq,
 } from "../index.js";
 import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
@@ -1201,6 +1207,179 @@ describe("index", () => {
       );
     });
   });
+
+  describe("task cancellation handling", () => {
+    let errorSpy: any;
+
+    beforeEach(() => {
+      activeSessions.clear();
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      activeSessions.clear();
+      errorSpy.mockRestore();
+    });
+
+    describe("findActiveSession", () => {
+      it("should find session by direct task key", () => {
+        const mockSession: any = { sessionId: "sess-1", acpClient: { cancelTurn: vi.fn() } };
+        activeSessions.set("task-1", mockSession);
+
+        expect(findActiveSession("task-1")).toBe(mockSession);
+      });
+
+      it("should find session by sessionId match", () => {
+        const mockSession: any = { sessionId: "sess-custom", acpClient: { cancelTurn: vi.fn() } };
+        activeSessions.set("key-other", mockSession);
+
+        expect(findActiveSession("sess-custom")).toBe(mockSession);
+      });
+
+      it("should return the single session if no taskId is provided", () => {
+        const mockSession: any = { sessionId: "sess-only", acpClient: { cancelTurn: vi.fn() } };
+        activeSessions.set("default", mockSession);
+
+        expect(findActiveSession(undefined)).toBe(mockSession);
+      });
+
+      it("should fallback to default keyed session when taskId is given but only 1 session exists", () => {
+        const mockSession: any = { sessionId: "s1", acpClient: { cancelTurn: vi.fn() } };
+        activeSessions.set("default", mockSession);
+
+        expect(findActiveSession("task-new-id")).toBe(mockSession);
+      });
+
+      it("should not fall back to a session that belongs to a different task", () => {
+        // Task A is running; a cancel for queued task B must not abort it.
+        const sessionA: any = { sessionId: "sess-a", acpClient: { cancelTurn: vi.fn() } };
+        activeSessions.set("task-a", sessionA);
+
+        expect(findActiveSession("task-b")).toBeUndefined();
+      });
+
+      it("should return undefined if taskId is not found when multiple sessions exist", () => {
+        activeSessions.set("task-1", { sessionId: "s1" } as any);
+        activeSessions.set("task-2", { sessionId: "s2" } as any);
+        expect(findActiveSession("task-nonexistent")).toBeUndefined();
+        expect(findActiveSession(undefined)).toBeUndefined();
+      });
+    });
+
+    describe("handleTaskCancellation", () => {
+      it("should cancel turn on the matched active session", async () => {
+        const cancelTurn = vi.fn().mockResolvedValue(undefined);
+        const mockSession: any = {
+          sessionId: "sess-100",
+          acpClient: { cancelTurn },
+        };
+        activeSessions.set("task-100", mockSession);
+
+        await handleTaskCancellation("task-100", "cancelled by user");
+
+        expect(cancelTurn).toHaveBeenCalledWith("sess-100");
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("Cancelling session sess-100 for task task-100 (cancelled by user)")
+        );
+      });
+
+      it("should skip a task cancelled while it was still being fetched", async () => {
+        cancelledTaskSeq.clear();
+        const promptMock = vi.fn();
+        const switcher: any = { ensureForTask: vi.fn().mockResolvedValue("s-q1") };
+        const acpClient: any = { flushReply: vi.fn(), reportStopReason: vi.fn() };
+        const connection: any = { prompt: promptMock };
+        const bridge: any = {
+          // The cancel lands while the poll is in flight — the task has no
+          // session yet, so nothing but this flag can stop it.
+          callTool: vi.fn().mockImplementation(async () => {
+            await handleTaskCancellation("task-queued-1");
+            return { content: [{ type: "text", text: "task task-queued-1: do work" }] };
+          }),
+        };
+
+        await checkForNextTask(bridge, connection, switcher, acpClient);
+
+        expect(promptMock).not.toHaveBeenCalled();
+      });
+
+      it("should not swallow work queued after the cancellation", async () => {
+        // agentrq reuses a chat's id as the task id, so the id cancelled a
+        // moment ago is the same id the user's next message arrives under.
+        cancelledTaskSeq.clear();
+        await handleTaskCancellation("task-queued-2");
+
+        const promptMock = vi.fn().mockResolvedValue({ stopReason: "end_turn" });
+        const switcher: any = { ensureForTask: vi.fn().mockResolvedValue("s-q2") };
+        const acpClient: any = { flushReply: vi.fn(), reportStopReason: vi.fn() };
+        const connection: any = { prompt: promptMock };
+        const bridge: any = {
+          callTool: vi.fn().mockResolvedValue({
+            content: [{ type: "text", text: "task task-queued-2: fresh work" }],
+          }),
+        };
+
+        await checkForNextTask(bridge, connection, switcher, acpClient);
+
+        expect(promptMock).toHaveBeenCalled();
+      });
+
+      it("should forget the oldest cancellations rather than grow forever", async () => {
+        cancelledTaskSeq.clear();
+        for (let i = 0; i < 250; i++) markTaskCancelled(`task-${i}`);
+
+        expect(cancelledTaskSeq.size).toBe(200);
+        expect(cancelledTaskSeq.has("task-0")).toBe(false);
+        expect(cancelledTaskSeq.has("task-249")).toBe(true);
+      });
+
+      it("should only stop the notification that was queued before the cancel", async () => {
+        cancelledTaskSeq.clear();
+        const older = nextTaskSeq();
+        await handleTaskCancellation("task-two-turns");
+        const newer = nextTaskSeq();
+
+        expect(isTaskCancelled("task-two-turns", older)).toBe(true);
+        expect(isTaskCancelled("task-two-turns", newer)).toBe(false);
+      });
+
+      it("should log when task to cancel is not found", async () => {
+        await handleTaskCancellation("task-missing");
+
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("Received cancellation for task task-missing, but no active session found")
+        );
+      });
+
+      it("should cancel the single session when taskId is omitted and only 1 session exists", async () => {
+        const cancel1 = vi.fn().mockResolvedValue(undefined);
+        activeSessions.set("t1", { sessionId: "s1", acpClient: { cancelTurn: cancel1 } } as any);
+
+        await handleTaskCancellation(undefined, "single shutdown");
+
+        expect(cancel1).toHaveBeenCalledWith("s1");
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("Received cancellation with no taskId (single shutdown). Cancelling active session s1...")
+        );
+      });
+
+      it("should fail closed and not cancel anything when taskId is omitted and multiple sessions exist", async () => {
+        const cancel1 = vi.fn().mockResolvedValue(undefined);
+        const cancel2 = vi.fn().mockResolvedValue(undefined);
+        activeSessions.set("t1", { sessionId: "s1", acpClient: { cancelTurn: cancel1 } } as any);
+        activeSessions.set("t2", { sessionId: "s2", acpClient: { cancelTurn: cancel2 } } as any);
+
+        await handleTaskCancellation(undefined, "multiple active");
+
+        expect(cancel1).not.toHaveBeenCalled();
+        expect(cancel2).not.toHaveBeenCalled();
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("but 2 sessions are active (skipping to avoid aborting unrelated tasks)")
+        );
+      });
+    });
+  });
+
   describe("handleAgentModeChange", () => {
     const modes: any = {
       currentModeId: "ask",

@@ -78,7 +78,7 @@ describe("MCPBridge", () => {
       expect(Client).toHaveBeenCalled();
       expect(StreamableHTTPClientTransport).toHaveBeenCalled();
       expect(lastMockClient.connect).toHaveBeenCalled();
-      expect(lastMockClient.setNotificationHandler).toHaveBeenCalledTimes(2);
+      expect(lastMockClient.setNotificationHandler).toHaveBeenCalledTimes(3);
       expect((bridge as any).isConnected).toBe(true);
     });
 
@@ -260,6 +260,99 @@ describe("MCPBridge", () => {
       });
     });
   });
+
+  describe("task cancellation notifications", () => {
+  function getCancelNotificationHandler() {
+    for (const call of lastMockClient.setNotificationHandler.mock.calls) {
+      const schema = call[0];
+      try {
+        const parsed = schema.safeParse({ method: "notifications/claude/channel/cancel" });
+        if (parsed.success) return call[1];
+      } catch {}
+    }
+    return undefined;
+  }
+
+    it("should emit cancel event when notifications/claude/channel/cancel is received with task_id", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const cancelHandler = getCancelNotificationHandler();
+
+      const onCancel = vi.fn();
+      bridge.on("cancel", onCancel);
+
+      cancelHandler({
+        method: "notifications/claude/channel/cancel",
+        params: { task_id: "task-123", reason: "user aborted" },
+      });
+
+      expect(onCancel).toHaveBeenCalledWith({
+        taskId: "task-123",
+        reason: "user aborted",
+      });
+    });
+
+        it("should extract taskId from taskId, chat_id, or meta", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const cancelHandler = getCancelNotificationHandler();
+      const onCancel = vi.fn();
+      bridge.on("cancel", onCancel);
+
+      // taskId property
+      cancelHandler({
+        method: "notifications/claude/channel/cancel",
+        params: { taskId: "task-camel" },
+      });
+      expect(onCancel).toHaveBeenLastCalledWith({
+        taskId: "task-camel",
+        reason: undefined,
+      });
+
+      // chat_id property
+      cancelHandler({
+        method: "notifications/claude/channel/cancel",
+        params: { chat_id: "chat-456" },
+      });
+      expect(onCancel).toHaveBeenLastCalledWith({
+        taskId: "chat-456",
+        reason: undefined,
+      });
+
+      // meta.chat_id
+      cancelHandler({
+        method: "notifications/claude/channel/cancel",
+        params: { meta: { chat_id: "meta-789" } },
+      });
+      expect(onCancel).toHaveBeenLastCalledWith({
+        taskId: "meta-789",
+        reason: undefined,
+      });
+
+      // _meta.chat_id (MCP standard location)
+      cancelHandler({
+        method: "notifications/claude/channel/cancel",
+        params: { _meta: { chat_id: "meta-under" } },
+      });
+      expect(onCancel).toHaveBeenLastCalledWith({
+        taskId: "meta-under",
+        reason: undefined,
+      });
+
+      // empty params
+      cancelHandler({
+        method: "notifications/claude/channel/cancel",
+        params: undefined,
+      });
+      expect(onCancel).toHaveBeenLastCalledWith({
+        taskId: undefined,
+        reason: undefined,
+      });
+    });
+  });
+
   it("should announce a reconnection, but not a first connection", async () => {
     const bridge = new MCPBridge(config);
     const reconnected = vi.fn();
