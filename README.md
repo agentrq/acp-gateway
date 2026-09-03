@@ -252,6 +252,7 @@ acp-gateway/
 │   ├── index.ts           # Entry point & orchestrator
 │   ├── mcpClient.ts       # MCP Bridge with auto-reconnect
 │   ├── registry.ts        # ACP registry index client
+│   ├── telemetry.ts       # Thought / plan / usage rendering
 │   └── __tests__/         # Unit tests
 ├── package.json
 └── tsconfig.json
@@ -262,6 +263,7 @@ acp-gateway/
 - **Auto-reconnection**: The MCP transport auto-reconnects on disconnection with exponential backoff (1s → 30s max).
 - **Notification-driven tasks**: The MCP server pushes task content via `notifications/claude/channel`; `acp-gateway` reacts immediately.
 - **Permission flow**: ACP agent requests permission → `acp-gateway` forwards to MCP server → waits for verdict → resolves the ACP permission.
+- **Streaming telemetry**: Reasoning, execution plans and token/cost counters are forwarded on `notifications/claude/channel/telemetry`. Reasoning is batched into one block per boundary (the agent starts answering, calls a tool, or revises its plan) rather than one message per token; plans go out as they change; only the last usage snapshot of a turn is reported. Sends are queued off the ACP stream, so a workspace that is slow or unreachable never stalls the agent.
 - **Registry agents**: `--agent <id>` resolves through the registry index; package distributions are preferred over binaries, and a binary without a published `sha256` is refused unless explicitly allowed.
 - **Authentication**: Login methods come from the `initialize` handshake; an `auth_required` refusal triggers a login and one retry of `newSession`.
 - **File I/O**: `readTextFile` / `writeTextFile` are proxied directly to the filesystem; paths are resolved relative to `process.cwd()`.

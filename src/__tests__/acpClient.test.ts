@@ -1385,4 +1385,419 @@ describe("AgentRQACPClient", () => {
       ).rejects.toThrow("write failed");
     });
   });
+  describe("streaming telemetry", () => {
+    /** Every telemetry notification the bridge was asked to send, in order. */
+    function telemetrySent() {
+      return mcpBridge.sendNotification.mock.calls
+        .filter((c: any[]) => c[0] === "notifications/claude/channel/telemetry")
+        .map((c: any[]) => c[1]);
+    }
+
+    function newClient(taskId = "task-123") {
+      mcpBridge.callTool = vi
+        .fn()
+        .mockResolvedValue({ isError: false, content: [] });
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      return new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => taskId,
+      );
+    }
+
+    function thought(text: string) {
+      return {
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text },
+        },
+      } as any;
+    }
+
+    it("batches thought chunks into one block per boundary", async () => {
+      const c = newClient();
+
+      await c.sessionUpdate(thought("Let me "));
+      await c.sessionUpdate(thought("check the config."));
+      // Nothing goes out mid-block: one notification per token is unusable.
+      expect(telemetrySent()).toHaveLength(0);
+
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call",
+          title: "read_file",
+          status: "pending",
+          toolCallId: "tc-1",
+        },
+      } as any);
+      await c.flushReply("sess-1");
+
+      const thoughts = telemetrySent().filter((p: any) => p.kind === "thought");
+      expect(thoughts).toHaveLength(1);
+      expect(thoughts[0]).toMatchObject({
+        task_id: "task-123",
+        session_id: "sess-1",
+        kind: "thought",
+        text: "Let me check the config.",
+      });
+    });
+
+    it("closes off a reasoning block when the agent starts answering", async () => {
+      const c = newClient();
+
+      await c.sessionUpdate(thought("Thinking first."));
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "The answer." },
+        },
+      } as any);
+      await c.sessionUpdate(thought("Second thought."));
+      await c.flushReply("sess-1");
+
+      expect(
+        telemetrySent()
+          .filter((p: any) => p.kind === "thought")
+          .map((p: any) => p.text),
+      ).toEqual(["Thinking first.", "Second thought."]);
+    });
+
+    it("keeps reasoning out of the reply the human sees", async () => {
+      const c = newClient();
+
+      await c.sessionUpdate(thought("Internal reasoning."));
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Done." },
+        },
+      } as any);
+      await c.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("reply", {
+        chatId: "task-123",
+        text: "Done.",
+      });
+    });
+
+    it("ignores non-text thought chunks", async () => {
+      const c = newClient();
+
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "image", data: "…" },
+        },
+      } as any);
+      await c.flushReply("sess-1");
+
+      expect(telemetrySent()).toHaveLength(0);
+    });
+
+    it("does not report whitespace-only reasoning", async () => {
+      const c = newClient();
+
+      await c.sessionUpdate(thought("   \n  "));
+      await c.flushReply("sess-1");
+
+      expect(telemetrySent()).toHaveLength(0);
+    });
+
+    it("reports a legacy plan update as soon as it arrives", async () => {
+      const c = newClient();
+
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            { content: "Read the config", priority: "high", status: "completed" },
+            { content: "Add tests", priority: "low", status: "pending" },
+          ],
+        },
+      } as any);
+      // Plans are queued, not awaited on the stream's hot path.
+      await c.flushReply("sess-1");
+
+      expect(telemetrySent()).toEqual([
+        {
+          task_id: "task-123",
+          session_id: "sess-1",
+          kind: "plan",
+          text: "- ✅ Read the config\n- ⬜ Add tests",
+          data: {
+            planId: "default",
+            planType: "items",
+            entries: [
+              {
+                content: "Read the config",
+                priority: "high",
+                status: "completed",
+              },
+              { content: "Add tests", priority: "low", status: "pending" },
+            ],
+          },
+        },
+      ]);
+    });
+
+    it("reports an ID-keyed plan update", async () => {
+      const c = newClient();
+
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "plan_update",
+          plan: {
+            type: "markdown",
+            planId: "plan-7",
+            content: "## Steps\n1. Ship it",
+          },
+        },
+      } as any);
+      await c.flushReply("sess-1");
+
+      expect(telemetrySent()[0]).toMatchObject({
+        kind: "plan",
+        text: "## Steps\n1. Ship it",
+        data: {
+          planId: "plan-7",
+          planType: "markdown",
+          content: "## Steps\n1. Ship it",
+        },
+      });
+    });
+
+    it("reports a withdrawn plan so the human sees it was dropped", async () => {
+      const c = newClient();
+
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: { sessionUpdate: "plan_removed", planId: "plan-7" },
+      } as any);
+      await c.flushReply("sess-1");
+
+      expect(telemetrySent()[0]).toMatchObject({
+        kind: "plan",
+        text: "Plan withdrawn.",
+        data: { planId: "plan-7", removed: true },
+      });
+    });
+
+    it("puts reasoning in front of the plan it explains", async () => {
+      const c = newClient();
+
+      await c.sessionUpdate(thought("I should plan this out."));
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: { sessionUpdate: "plan", entries: [] },
+      } as any);
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: { sessionUpdate: "plan_removed", planId: "default" },
+      } as any);
+      await c.flushReply("sess-1");
+
+      expect(telemetrySent().map((p: any) => p.kind)).toEqual([
+        "thought",
+        "plan",
+        "plan",
+      ]);
+    });
+
+    it("reports only the last usage snapshot, once the turn is over", async () => {
+      const c = newClient();
+
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: { sessionUpdate: "usage_update", used: 100, size: 200_000 },
+      } as any);
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "usage_update",
+          used: 50_000,
+          size: 200_000,
+          cost: { amount: 0.42, currency: "USD" },
+        },
+      } as any);
+      // Each snapshot supersedes the last, so none go out mid-turn.
+      expect(telemetrySent()).toHaveLength(0);
+
+      await c.flushReply("sess-1");
+
+      expect(telemetrySent()).toEqual([
+        {
+          task_id: "task-123",
+          session_id: "sess-1",
+          kind: "usage",
+          text: "Context 50,000 / 200,000 tokens (25%) · 0.42 USD",
+          data: {
+            used: 50_000,
+            size: 200_000,
+            percent: 25,
+            cost: { amount: 0.42, currency: "USD" },
+          },
+        },
+      ]);
+    });
+
+    it("does not report the same usage snapshot on a later turn", async () => {
+      const c = newClient();
+
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: { sessionUpdate: "usage_update", used: 100, size: 200_000 },
+      } as any);
+      await c.flushReply("sess-1");
+      mcpBridge.sendNotification.mockClear();
+
+      await c.flushReply("sess-1");
+      expect(telemetrySent()).toHaveLength(0);
+    });
+
+    it("orders reasoning, the reply, then the usage footer", async () => {
+      const c = newClient();
+      const order: string[] = [];
+      mcpBridge.sendNotification = vi.fn(async (_m: string, p: any) => {
+        order.push(p.kind);
+      });
+      mcpBridge.callTool = vi.fn(async () => {
+        order.push("reply");
+        return { isError: false, content: [] };
+      });
+
+      await c.sessionUpdate(thought("Reasoning."));
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Answer." },
+        },
+      } as any);
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: { sessionUpdate: "usage_update", used: 1, size: 100 },
+      } as any);
+      await c.flushReply("sess-1");
+
+      expect(order).toEqual(["thought", "reply", "usage"]);
+    });
+
+    it("drops telemetry when the session has no task to attach it to", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const c = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+      );
+
+      await c.sessionUpdate(thought("Nowhere to put this."));
+      await c.flushReply("sess-1");
+
+      expect(telemetrySent()).toHaveLength(0);
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("dropping thought telemetry"),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("still delivers the reply when telemetry cannot be sent", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const c = newClient();
+      mcpBridge.sendNotification.mockRejectedValue(new Error("offline"));
+
+      await c.sessionUpdate(thought("Reasoning."));
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Answer." },
+        },
+      } as any);
+      await c.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("reply", {
+        chatId: "task-123",
+        text: "Answer.",
+      });
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to send thought telemetry"),
+        expect.anything(),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("keeps sending telemetry after one send has failed", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const c = newClient();
+      mcpBridge.sendNotification
+        .mockRejectedValueOnce(new Error("offline"))
+        .mockResolvedValue(undefined);
+
+      await c.sessionUpdate(thought("First block."));
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call",
+          title: "read_file",
+          status: "pending",
+          toolCallId: "tc-1",
+        },
+      } as any);
+      await c.sessionUpdate(thought("Second block."));
+      await c.flushReply("sess-1");
+
+      expect(telemetrySent().map((p: any) => p.text)).toEqual([
+        "First block.",
+        "Second block.",
+      ]);
+      consoleSpy.mockRestore();
+    });
+
+    it("survives a queued send that throws outright", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      // Looking up the task is the gateway's own callback, and it is the one
+      // step outside sendTelemetry's own error handling.
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => {
+        throw new Error("task lookup blew up");
+      });
+
+      await c.sessionUpdate(thought("Reasoning."));
+      await expect(c.flushReply("sess-1")).resolves.toBeUndefined();
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Telemetry send failed"),
+        expect.anything(),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("keeps each session's telemetry to itself", async () => {
+      const c = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        (sessionId: string) => `task-${sessionId}`,
+      );
+
+      await c.sessionUpdate(thought("Session one."));
+      await c.sessionUpdate({
+        sessionId: "sess-2",
+        update: {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "Session two." },
+        },
+      } as any);
+      await c.flushReply("sess-2");
+
+      expect(telemetrySent()).toHaveLength(1);
+      expect(telemetrySent()[0]).toMatchObject({
+        task_id: "task-sess-2",
+        text: "Session two.",
+      });
+    });
+  });
+
 });
