@@ -159,6 +159,114 @@ export interface AgentSession {
 
 export const activeSessions = new Map<string, AgentSession>();
 
+/** How long to wait for `session/close` RPC before terminating the session process regardless. */
+export const CLOSE_SESSION_TIMEOUT_MS = 2000;
+
+/** Whether the agent advertised `session.close` capability during initialize. */
+export function supportsCloseSession(
+  agentCapabilities: acp.InitializeResponse["agentCapabilities"] | null | undefined,
+): boolean {
+  const sessions = (
+    agentCapabilities as
+      | { sessionCapabilities?: { close?: unknown } }
+      | null
+      | undefined
+  )?.sessionCapabilities;
+  return sessions?.close !== undefined && sessions?.close !== null && sessions?.close !== false;
+}
+
+/**
+ * Cleanly closes an active agent session:
+ * 1. Cancels any in-flight prompt turn and pending permissions for the session.
+ * 2. Calls `session/close` RPC on the connection if the agent supports it (with timeout).
+ * 3. Kills the agent child process.
+ */
+export async function closeSession(
+  session: AgentSession,
+  timeoutMs: number = CLOSE_SESSION_TIMEOUT_MS,
+): Promise<void> {
+  if (session.acpClient && typeof session.acpClient.cancelTurn === "function") {
+    try {
+      await session.acpClient.cancelTurn(session.sessionId);
+    } catch (err) {
+      console.error(
+        `[acp] Error cancelling turn while closing session ${session.sessionId}:`,
+        err,
+      );
+    }
+  }
+
+  if (
+    supportsCloseSession(session.initResult?.agentCapabilities) &&
+    typeof session.connection?.closeSession === "function"
+  ) {
+    try {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.resolve(
+          session.connection.closeSession({ sessionId: session.sessionId }),
+        ),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            console.error(
+              `[acp] session/close for ${session.sessionId} did not complete in ${timeoutMs}ms`,
+            );
+            resolve();
+          }, timeoutMs);
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+    } catch (err) {
+      console.error(
+        `[acp] Failed to cleanly close session ${session.sessionId}:`,
+        err,
+      );
+    }
+  }
+
+  try {
+    session.process?.kill?.();
+  } catch (err) {
+    // Process might already be dead or exited
+  }
+}
+
+/**
+ * Cleanly closes all active sessions in parallel and clears the activeSessions map.
+ */
+export async function closeAllSessions(
+  timeoutMs: number = CLOSE_SESSION_TIMEOUT_MS,
+): Promise<void> {
+  const sessions = Array.from(new Set(activeSessions.values()));
+  activeSessions.clear();
+  if (sessions.length === 0) return;
+  console.error(`[acp] Cleanly closing ${sessions.length} active session(s)...`);
+  await Promise.all(sessions.map((session) => closeSession(session, timeoutMs)));
+}
+
+/**
+ * Registers signal handlers (SIGINT, SIGTERM) to trigger graceful shutdown.
+ * Returns a teardown function to unregister the handlers.
+ */
+export function setupSignalHandlers(
+  onSignal: (signal: string) => Promise<void> | void,
+): () => void {
+  const sigintHandler = () => {
+    void onSignal("SIGINT");
+  };
+  const sigtermHandler = () => {
+    void onSignal("SIGTERM");
+  };
+
+  process.on("SIGINT", sigintHandler);
+  process.on("SIGTERM", sigtermHandler);
+
+  return () => {
+    process.off("SIGINT", sigintHandler);
+    process.off("SIGTERM", sigtermHandler);
+  };
+}
+
 /** Login preferences taken from the CLI, consulted whenever an agent demands auth. */
 export const authConfig: { methodId?: string } = {};
 
@@ -1070,6 +1178,34 @@ async function main() {
 
   await mcpBridge.connect();
 
+  let cleanupPromise: Promise<void> | null = null;
+  const cleanup = async (signal?: string) => {
+    if (cleanupPromise) return cleanupPromise;
+    cleanupPromise = (async () => {
+      if (signal) {
+        console.error(
+          `\n[acp-gateway] Received ${signal}, closing active sessions and shutting down...`,
+        );
+      }
+      try {
+        await closeAllSessions();
+      } catch (err) {
+        console.error("[acp-gateway] Error closing active sessions:", err);
+      }
+      try {
+        await mcpBridge.close();
+      } catch (err) {
+        console.error("[acp-gateway] Error closing MCP bridge:", err);
+      }
+    })();
+    return cleanupPromise;
+  };
+
+  const removeSignalHandlers = setupSignalHandlers(async (signal) => {
+    await cleanup(signal);
+    process.exit(0);
+  });
+
   try {
     // Bridge: MCP -> ACP
     // When the MCP server sends a notification to 'notifications/claude/channel',
@@ -1151,10 +1287,8 @@ async function main() {
   } catch (error) {
     console.error("[acp-gateway] Error:", error);
   } finally {
-    for (const session of activeSessions.values()) {
-      session.process.kill();
-    }
-    await mcpBridge.close();
+    removeSignalHandlers();
+    await cleanup();
     process.exit(0);
   }
 }
@@ -1167,7 +1301,7 @@ async function main() {
 export async function checkForNextTask(
   mcpBridge: MCPBridge,
   acpCmdArgsOrConnection: string[] | acp.ClientSideConnection,
-  configsOrSessionSwitcher: McpServerConfig[] | ReturnType<typeof createAcpSessionSwitcher>,
+  configsOrSessionSwitcher: McpServerConfig[] | ReturnType<typeof createAcpSessionSwitcher> | unknown,
   agentrqConfigOrAcpClient: McpServerConfig | AgentRQACPClient,
   taskQueue?: TaskQueue,
   acpCmdArgs?: string[],
@@ -1306,4 +1440,3 @@ if (process.env.NODE_ENV !== "test") {
     process.exit(1);
   });
 }
-
