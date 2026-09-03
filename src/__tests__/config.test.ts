@@ -36,6 +36,61 @@ describe("config", () => {
       });
     });
 
+    it("should pass an sse server through as its own transport", () => {
+      vi.mocked(resolve).mockImplementation((...args: string[]) => args.join("/"));
+      vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
+        mcpServers: { "events": { type: "sse", url: "http://example.com/sse" } }
+      }));
+
+      expect(loadMcpConfig("/dummy")[0].type).toBe("sse");
+    });
+
+    it("should refuse a transport it cannot hand to an agent", () => {
+      vi.mocked(resolve).mockImplementation((...args: string[]) => args.join("/"));
+      vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
+        mcpServers: { "odd": { type: "websocket", url: "ws://example.com" } }
+      }));
+
+      // Silently treating this as stdio produced a server with no command and
+      // an agent that could not say what was wrong.
+      expect(() => loadMcpConfig("/dummy")).toThrow(/transport "websocket"/);
+      expect(() => loadMcpConfig("/dummy")).toThrow(/http, sse, stdio/);
+    });
+
+    it("should refuse an entry missing the field its transport needs", () => {
+      vi.mocked(resolve).mockImplementation((...args: string[]) => args.join("/"));
+      vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
+        mcpServers: { "agentrq": { type: "http" } }
+      }));
+      expect(() => loadMcpConfig("/dummy")).toThrow(/is http but has no url/);
+
+      vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
+        mcpServers: { "local": { type: "stdio", args: ["x"] } }
+      }));
+      expect(() => loadMcpConfig("/dummy")).toThrow(/is stdio but has no command/);
+    });
+
+    it("should report a mistake in the file it found rather than looking further up", () => {
+      vi.mocked(resolve).mockImplementation((...args: string[]) => args.join("/"));
+      vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
+        mcpServers: { "odd": { type: "websocket", url: "ws://example.com" } }
+      }));
+
+      expect(() => loadMcpConfig("/dummy")).not.toThrow(/Could not find/);
+    });
+
+    it("should keep looking when a candidate file cannot be read or parsed", () => {
+      vi.mocked(resolve).mockImplementation((...args: string[]) => args.join("/"));
+      vi.mocked(readFileSync)
+        .mockImplementationOnce(() => { throw new Error("ENOENT"); })
+        .mockReturnValueOnce("{ not json")
+        .mockReturnValue(JSON.stringify({
+          mcpServers: { "agentrq": { type: "http", url: "http://localhost:8080" } }
+        }) as any);
+
+      expect(loadMcpConfig("/dummy")[0].name).toBe("agentrq");
+    });
+
     it("should handle missing mcpServers in JSON", () => {
       vi.mocked(resolve).mockImplementation((...args: string[]) => args.join("/"));
       vi.mocked(readFileSync).mockReturnValue(JSON.stringify({}));

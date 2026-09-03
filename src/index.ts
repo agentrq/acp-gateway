@@ -15,27 +15,75 @@ const pkg = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
 );
 
-import { loadMcpConfig, pickAgentrqServer, type McpServerConfig } from "./config.js";
+import {
+  loadMcpConfig,
+  pickAgentrqServer,
+  type McpServerConfig,
+  type McpTransport,
+} from "./config.js";
 import { MCPBridge } from "./mcpClient.js";
 
-export function mapMcpServers(configs: McpServerConfig[]): acp.McpServer[] {
-  return configs.map((cfg): acp.McpServer => {
-    if (cfg.type === "http") {
+/**
+ * What the agent said about a transport, if anything.
+ *
+ * stdio is the one transport every agent must support. For the others the
+ * answer is only trustworthy when the agent actually stated it: an agent that
+ * advertises no MCP capabilities at all is far more likely to be terse than to
+ * be unable to reach an HTTP server, and dropping its servers on that reading
+ * would take the workspace's own MCP server away from it.
+ */
+function transportSupport(
+  transport: McpTransport,
+  agentCapabilities: acp.AgentCapabilities | null | undefined,
+): "required" | "declared" | "refused" | "unstated" {
+  if (transport === "stdio") return "required";
+  const declared = (agentCapabilities?.mcpCapabilities as Record<string, unknown> | undefined)?.[
+    transport
+  ];
+  if (declared === true) return "declared";
+  if (declared === false) return "refused";
+  return "unstated";
+}
+
+export function mapMcpServers(
+  configs: McpServerConfig[],
+  agentCapabilities?: acp.AgentCapabilities | null,
+): acp.McpServer[] {
+  return configs
+    .filter((cfg) => {
+      const support = transportSupport(cfg.type, agentCapabilities);
+      if (support === "refused") {
+        console.error(
+          `[acp] ⚠️  Not passing MCP server "${cfg.name}" to the agent: it is ${cfg.type}, ` +
+            `and the agent says it does not support that transport. Passing it anyway ` +
+            `risks the agent refusing the whole session.`,
+        );
+        return false;
+      }
+      if (support === "unstated") {
+        console.error(
+          `[acp] MCP server "${cfg.name}" is ${cfg.type}, which the agent does not ` +
+            `advertise either way — passing it and letting the agent decide.`,
+        );
+      }
+      return true;
+    })
+    .map((cfg): acp.McpServer => {
+      if (cfg.type === "stdio") {
+        return {
+          name: cfg.name,
+          command: cfg.command!,
+          args: cfg.args ?? [],
+          env: Object.entries(cfg.env || {}).map(([name, value]) => ({ name, value })) as any,
+        };
+      }
       return {
-        type: "http",
+        type: cfg.type,
         name: cfg.name,
         url: cfg.url!,
         headers: Object.entries(cfg.headers || {}).map(([name, value]) => ({ name, value })) as any,
       };
-    } else {
-      return {
-        name: cfg.name,
-        command: cfg.command!,
-        args: cfg.args ?? [],
-        env: Object.entries(cfg.env || {}).map(([name, value]) => ({ name, value })) as any,
-      };
-    }
-  });
+    });
 }
 import { AgentRQACPClient } from "./acpClient.js";
 import {
@@ -233,7 +281,7 @@ export async function getOrCreateSession(
 
   const newSessionParams: AcpNewSessionParams = {
     cwd: process.cwd(),
-    mcpServers: mapMcpServers(configs),
+    mcpServers: mapMcpServers(configs, initResult.agentCapabilities),
   };
 
   const sessionResult = await createSessionWithAuth(connection, newSessionParams, {
@@ -853,6 +901,10 @@ async function main() {
           });
 
           await sessionInfo.acpClient.flushReply(sessionInfo.sessionId);
+          await sessionInfo.acpClient.reportStopReason(
+            sessionInfo.sessionId,
+            result.stopReason,
+          );
           console.error(
             `\n[acp] Agent completed task. Reason: ${result.stopReason}`,
           );
@@ -977,6 +1029,7 @@ export async function checkForNextTask(
         });
 
         await acpClientToUse!.flushReply(sessionIdToUse!);
+        await acpClientToUse!.reportStopReason(sessionIdToUse!, promptResult.stopReason);
         console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
       };
 

@@ -1107,6 +1107,57 @@ describe("AgentRQACPClient", () => {
     });
   });
 
+  describe("reportStopReason", () => {
+    function clientForTask(taskId: string | undefined) {
+      return new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => taskId);
+    }
+
+    it("should say nothing when the agent simply finished", async () => {
+      await clientForTask("task-1").reportStopReason("sess-1", "end_turn");
+
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+    });
+
+    it("should tell the workspace when a turn was refused or cut short", async () => {
+      const client = clientForTask("task-1");
+
+      await client.reportStopReason("sess-1", "refusal");
+      await client.reportStopReason("sess-1", "max_tokens");
+      await client.reportStopReason("sess-1", "max_turn_requests");
+      await client.reportStopReason("sess-1", "cancelled");
+
+      const texts = mcpBridge.callTool.mock.calls.map((c: any[]) => c[1].text);
+      expect(mcpBridge.callTool.mock.calls.every((c: any[]) => c[0] === "reply")).toBe(true);
+      expect(texts[0]).toContain("refused");
+      expect(texts[1]).toContain("ran out of output tokens");
+      expect(texts[2]).toContain("model requests");
+      expect(texts[3]).toContain("cancelled");
+    });
+
+    it("should still report a stop reason it does not recognise", async () => {
+      await clientForTask("task-1").reportStopReason("sess-1", "something_new");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("reply", {
+        chatId: "task-1",
+        text: expect.stringContaining("something_new"),
+      });
+    });
+
+    it("should skip a session with no task behind it", async () => {
+      await clientForTask(undefined).reportStopReason("sess-1", "refusal");
+
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+    });
+
+    it("should survive a workspace that cannot be reached", async () => {
+      mcpBridge.callTool.mockRejectedValue(new Error("offline"));
+
+      await expect(
+        clientForTask("task-1").reportStopReason("sess-1", "refusal"),
+      ).resolves.toBeUndefined();
+    });
+  });
+
   describe("file operations", () => {
     it("should read text files", async () => {
       vi.mocked(path.resolve).mockReturnValue("/mock/path/file.txt");

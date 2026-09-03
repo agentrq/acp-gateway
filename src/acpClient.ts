@@ -13,6 +13,20 @@ import * as path from "node:path";
 /** Identifies a tool call routed through an agentrq MCP server. */
 const AGENTRQ_TOOL_PATTERN = /agentrq-[a-zA-Z0-9]{11}/;
 
+/**
+ * What a turn ending in anything but `end_turn` means, in the human's terms.
+ *
+ * Without this the workspace sees the agent's partial answer and nothing else,
+ * so a refused or truncated turn is indistinguishable from a finished one.
+ */
+const STOP_REASON_NOTES: Record<string, string> = {
+  refusal: "⚠️ The agent refused to continue this turn.",
+  max_tokens: "⚠️ The agent stopped mid-turn: it ran out of output tokens.",
+  max_turn_requests:
+    "⚠️ The agent stopped mid-turn: it reached its limit on model requests for a single turn.",
+  cancelled: "⚠️ The turn was cancelled before the agent finished.",
+};
+
 export class AgentRQACPClient implements acp.Client {
   private replyBuffers = new Map<string, string>();
   // chatId → text sent by the agent via the reply MCP tool (for dedup in flushReply)
@@ -51,6 +65,32 @@ export class AgentRQACPClient implements acp.Client {
       console.error(`[acp] Forwarded agent reply to task ${taskId}`);
     } catch (err) {
       console.error(`[acp] Failed to forward reply to task ${taskId}:`, err);
+    }
+  }
+
+  /**
+   * Tells the workspace when a turn ended for any reason other than the agent
+   * finishing what it was asked. Call after flushReply, so the note follows
+   * whatever the agent did manage to say.
+   */
+  async reportStopReason(sessionId: string, stopReason: string): Promise<void> {
+    if (stopReason === "end_turn") return;
+
+    const taskId = this.getTaskIdForSession(sessionId);
+    if (!taskId) {
+      console.error(`[acp] No task ID for session ${sessionId}, not reporting "${stopReason}"`);
+      return;
+    }
+
+    const text =
+      STOP_REASON_NOTES[stopReason] ??
+      `⚠️ The agent stopped for a reason this gateway does not recognise: ${stopReason}.`;
+
+    try {
+      await this.mcpBridge.callTool("reply", { chatId: taskId, text });
+      console.error(`[acp] Reported stop reason "${stopReason}" to task ${taskId}`);
+    } catch (err) {
+      console.error(`[acp] Failed to report stop reason to task ${taskId}:`, err);
     }
   }
 

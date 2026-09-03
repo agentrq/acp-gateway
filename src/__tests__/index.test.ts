@@ -96,6 +96,53 @@ describe("index", () => {
       }]);
     });
 
+    it("should map an sse server as its own transport", () => {
+      const configs: McpServerConfig[] = [{
+        type: "sse",
+        name: "events",
+        url: "http://localhost:8000/sse",
+      }];
+
+      expect(mapMcpServers(configs, { mcpCapabilities: { sse: true } } as any)).toEqual([{
+        type: "sse",
+        name: "events",
+        url: "http://localhost:8000/sse",
+        headers: [],
+      }]);
+    });
+
+    it("should leave out a transport the agent says it does not support", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const configs: McpServerConfig[] = [
+        { type: "http", name: "remote", url: "http://localhost:8000" },
+        { type: "stdio", name: "local", command: "npx" },
+      ];
+
+      // An agent may refuse the whole session/new rather than skip one entry.
+      const result = mapMcpServers(configs, {
+        mcpCapabilities: { http: false, sse: false },
+      } as any);
+
+      expect(result.map((s: any) => s.name)).toEqual(["local"]);
+      expect(errorSpy.mock.calls.flat().join("\n")).toContain(
+        'Not passing MCP server "remote"',
+      );
+      errorSpy.mockRestore();
+    });
+
+    it("should still hand over a transport the agent never mentions", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const configs: McpServerConfig[] = [
+        { type: "http", name: "remote", url: "http://localhost:8000" },
+      ];
+
+      // A terse agent is likelier than one that genuinely cannot reach HTTP,
+      // and dropping this would take the workspace's own server away from it.
+      expect(mapMcpServers(configs, {} as any).map((s: any) => s.name)).toEqual(["remote"]);
+      expect(mapMcpServers(configs).map((s: any) => s.name)).toEqual(["remote"]);
+      errorSpy.mockRestore();
+    });
+
     it("should correctly map stdio servers", () => {
       const configs: McpServerConfig[] = [{
         type: "stdio",
