@@ -1166,6 +1166,29 @@ describe("AgentRQACPClient", () => {
     });
   });
 
+  describe("session mode changes", () => {
+    it("should hand a mode change to whoever is watching for it", async () => {
+      const onMode = vi.fn();
+      client.setModeChangeHandler(onMode);
+
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: { sessionUpdate: "current_mode_update", currentModeId: "auto" },
+      } as any);
+
+      expect(onMode).toHaveBeenCalledWith("sess-1", "auto");
+    });
+
+    it("should not mind a mode change nobody is watching for", async () => {
+      await expect(
+        client.sessionUpdate({
+          sessionId: "sess-1",
+          update: { sessionUpdate: "current_mode_update", currentModeId: "auto" },
+        } as any),
+      ).resolves.toBeUndefined();
+    });
+  });
+
   describe("reportStopReason", () => {
     function clientForTask(taskId: string | undefined) {
       return new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => taskId);

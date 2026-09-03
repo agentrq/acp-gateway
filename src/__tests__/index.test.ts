@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Writable, Readable } from "node:stream";
 import { EventEmitter } from "node:events";
 import * as acp from "@agentclientprotocol/sdk";
@@ -22,6 +22,7 @@ import {
   runListAgents,
   pickHumanApprovalMode,
   enforceHumanApprovalMode,
+  handleAgentModeChange,
   runAgentCommand,
 } from "../index.js";
 import { AUTH_REQUIRED_CODE } from "../auth.js";
@@ -1200,4 +1201,83 @@ describe("index", () => {
       );
     });
   });
+  describe("handleAgentModeChange", () => {
+    const modes: any = {
+      currentModeId: "ask",
+      availableModes: [
+        { id: "ask", name: "Ask first" },
+        { id: "auto", name: "Auto approve" },
+      ],
+    };
+
+    let errorSpy: any;
+    beforeEach(() => {
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+    afterEach(() => errorSpy.mockRestore());
+
+    it("should leave a mode that still asks the human alone", async () => {
+      const connection: any = { setSessionMode: vi.fn() };
+
+      await handleAgentModeChange(connection, "sess-ok", "ask", modes);
+
+      expect(connection.setSessionMode).not.toHaveBeenCalled();
+    });
+
+    it("should put the session back when the agent starts approving for us", async () => {
+      const connection: any = { setSessionMode: vi.fn().mockResolvedValue({}) };
+
+      await handleAgentModeChange(connection, "sess-drift", "auto", modes);
+
+      expect(connection.setSessionMode).toHaveBeenCalledWith({
+        sessionId: "sess-drift",
+        modeId: "ask",
+      });
+    });
+
+    it("should treat a mode the agent never advertised as untrusted", async () => {
+      const connection: any = { setSessionMode: vi.fn().mockResolvedValue({}) };
+
+      await handleAgentModeChange(connection, "sess-unknown", "something-new", modes);
+
+      expect(connection.setSessionMode).toHaveBeenCalledWith({
+        sessionId: "sess-unknown",
+        modeId: "ask",
+      });
+    });
+
+    it("should stop fighting an agent that keeps switching back", async () => {
+      const connection: any = { setSessionMode: vi.fn().mockResolvedValue({}) };
+
+      for (let i = 0; i < 5; i++) {
+        await handleAgentModeChange(connection, "sess-stubborn", "auto", modes);
+      }
+
+      // An unbounded fight would be an endless stream of setSessionMode calls.
+      expect(connection.setSessionMode).toHaveBeenCalledTimes(3);
+      expect(errorSpy.mock.calls.flat().join("\n")).toContain("Giving up after 3 attempts");
+    });
+
+    it("should start counting again once the session is back in a safe mode", async () => {
+      const connection: any = { setSessionMode: vi.fn().mockResolvedValue({}) };
+
+      await handleAgentModeChange(connection, "sess-recovered", "auto", modes);
+      await handleAgentModeChange(connection, "sess-recovered", "ask", modes);
+      for (let i = 0; i < 4; i++) {
+        await handleAgentModeChange(connection, "sess-recovered", "auto", modes);
+      }
+
+      expect(connection.setSessionMode).toHaveBeenCalledTimes(4);
+    });
+
+    it("should do nothing for an agent that offers no modes at all", async () => {
+      const connection: any = { setSessionMode: vi.fn() };
+
+      await handleAgentModeChange(connection, "sess-modeless", "whatever", undefined);
+      await handleAgentModeChange(connection, "sess-modeless", "whatever", { availableModes: [] } as any);
+
+      expect(connection.setSessionMode).not.toHaveBeenCalled();
+    });
+  });
+
 });
