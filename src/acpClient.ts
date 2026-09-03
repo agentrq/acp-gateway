@@ -7,6 +7,17 @@
 
 import * as acp from "@agentclientprotocol/sdk";
 import type { MCPBridge } from "./mcpClient.js";
+import {
+  TELEMETRY_NOTIFICATION_METHOD,
+  formatPlan,
+  formatUsage,
+  planFromEntries,
+  planTelemetryData,
+  usageTelemetryData,
+  type NormalizedPlan,
+  type TelemetryKind,
+  type TelemetryPayload,
+} from "./telemetry.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -51,6 +62,18 @@ const STOP_REASON_NOTES: Record<string, string> = {
 
 export class AgentRQACPClient implements acp.Client {
   private replyBuffers = new Map<string, string>();
+  // sessionId → reasoning accumulated since the last boundary. Thought tokens
+  // stream one at a time and are deliberately kept out of replyBuffers: they
+  // are not the answer, and folding them in would both corrupt the reply and
+  // break the dedup against the agent's own `reply` tool call.
+  private thoughtBuffers = new Map<string, string>();
+  // sessionId → the most recent usage snapshot. Only the last one is worth
+  // reporting: each supersedes the one before it.
+  private latestUsage = new Map<string, acp.UsageUpdate>();
+  // Telemetry sends, run one after another so the workspace sees them in the
+  // order the agent produced them, and off the ACP stream's critical path so a
+  // slow or unreachable workspace never stalls the agent mid-turn.
+  private telemetryChain: Promise<void> = Promise.resolve();
   // chatId → text sent by the agent via the reply MCP tool (for dedup in flushReply)
   private agentReplies = new Map<string, string>();
   // toolCallId → details seen on session updates. A `tool_call` update always
@@ -198,7 +221,126 @@ export class AgentRQACPClient implements acp.Client {
     }
   }
 
+  /**
+   * Ends the turn: everything the agent produced besides its answer goes out
+   * around the answer itself.
+   *
+   * The reasoning that led to the answer has to precede it, and the token and
+   * cost counters read as a footer, so they follow.
+   */
   async flushReply(sessionId: string): Promise<void> {
+    await this.flushThought(sessionId);
+    await this.deliverReply(sessionId);
+    await this.flushUsage(sessionId);
+  }
+
+  /**
+   * Queues whatever reasoning has accumulated for sending, and waits for the
+   * telemetry queue to drain.
+   *
+   * Taking the buffer here rather than inside the queued send is what keeps a
+   * reasoning block whole: anything the agent thinks after this point belongs
+   * to the next block.
+   */
+  private async flushThought(sessionId: string): Promise<void> {
+    this.queueThoughtFlush(sessionId);
+    await this.telemetryChain;
+  }
+
+  /**
+   * Closes off the current reasoning block, if there is one.
+   *
+   * Called wherever the agent stops thinking and does something else — starts
+   * answering, calls a tool, revises its plan — so a block of reasoning
+   * reaches the human while it still explains what is about to happen, rather
+   * than arriving in one lump at the end of the turn.
+   */
+  private queueThoughtFlush(sessionId: string): void {
+    const thought = this.thoughtBuffers.get(sessionId);
+    if (!thought?.trim()) return;
+    this.thoughtBuffers.delete(sessionId);
+    this.queueTelemetry(() =>
+      this.sendTelemetry(sessionId, "thought", thought, {}),
+    );
+  }
+
+  /** Reports the last usage snapshot of the turn, if the agent sent any. */
+  private async flushUsage(sessionId: string): Promise<void> {
+    const usage = this.latestUsage.get(sessionId);
+    this.latestUsage.delete(sessionId);
+    if (!usage) return;
+    await this.sendTelemetry(
+      sessionId,
+      "usage",
+      formatUsage(usage),
+      usageTelemetryData(usage),
+    );
+  }
+
+  /** Reports a plan the agent has just published or revised. */
+  private queuePlan(sessionId: string, plan: NormalizedPlan): void {
+    this.queueThoughtFlush(sessionId);
+    this.queueTelemetry(() =>
+      this.sendTelemetry(
+        sessionId,
+        "plan",
+        formatPlan(plan),
+        planTelemetryData(plan),
+      ),
+    );
+  }
+
+  /** Adds a send to the tail of the telemetry queue. */
+  private queueTelemetry(send: () => Promise<void>): void {
+    this.telemetryChain = this.telemetryChain
+      .catch(() => {})
+      .then(send)
+      .catch((err) => {
+        console.error(`[acp] Telemetry send failed:`, err);
+      });
+  }
+
+  /**
+   * Forwards one piece of telemetry to the workspace.
+   *
+   * Never throws: telemetry is not the answer, so a workspace that cannot take
+   * it right now must not cost the agent its turn.
+   */
+  private async sendTelemetry(
+    sessionId: string,
+    kind: TelemetryKind,
+    text: string,
+    data: Record<string, unknown>,
+  ): Promise<void> {
+    const taskId = this.getTaskIdForSession(sessionId);
+    if (!taskId) {
+      console.error(
+        `[acp] No task ID for session ${sessionId}, dropping ${kind} telemetry`,
+      );
+      return;
+    }
+
+    const payload: TelemetryPayload = {
+      task_id: taskId,
+      session_id: sessionId,
+      kind,
+      text,
+      data,
+    };
+    try {
+      await this.mcpBridge.sendNotification(
+        TELEMETRY_NOTIFICATION_METHOD,
+        payload,
+      );
+    } catch (err) {
+      console.error(
+        `[acp] Failed to send ${kind} telemetry for session ${sessionId}:`,
+        err,
+      );
+    }
+  }
+
+  private async deliverReply(sessionId: string): Promise<void> {
     const text = this.replyBuffers.get(sessionId) ?? "";
     this.replyBuffers.delete(sessionId);
     if (!text.trim()) return;
@@ -443,10 +585,41 @@ export class AgentRQACPClient implements acp.Client {
     switch (update.sessionUpdate) {
       case "agent_message_chunk":
         if (update.content.type === "text") {
+          // The agent has stopped thinking and started answering.
+          this.queueThoughtFlush(params.sessionId);
           process.stdout.write(update.content.text);
           const sid = params.sessionId;
           this.replyBuffers.set(sid, (this.replyBuffers.get(sid) ?? "") + update.content.text);
         }
+        break;
+      case "agent_thought_chunk":
+        if (update.content.type === "text") {
+          const sid = params.sessionId;
+          this.thoughtBuffers.set(
+            sid,
+            (this.thoughtBuffers.get(sid) ?? "") + update.content.text,
+          );
+        }
+        break;
+      case "plan":
+        this.queuePlan(params.sessionId, planFromEntries(update.entries));
+        break;
+      case "plan_update":
+        this.queuePlan(params.sessionId, update.plan);
+        break;
+      case "plan_removed":
+        this.queueThoughtFlush(params.sessionId);
+        this.queueTelemetry(() =>
+          this.sendTelemetry(params.sessionId, "plan", "Plan withdrawn.", {
+            planId: update.planId,
+            removed: true,
+          }),
+        );
+        break;
+      case "usage_update":
+        // Each snapshot supersedes the last; only the final one is reported,
+        // at the end of the turn.
+        this.latestUsage.set(params.sessionId, update);
         break;
       case "current_mode_update":
         console.error(`[acp] Agent switched session mode to "${update.currentModeId}"`);
@@ -456,6 +629,8 @@ export class AgentRQACPClient implements acp.Client {
         this.rememberToolCall(update);
         break;
       case "tool_call": {
+        // Reasoning that explains a tool call belongs in front of it.
+        this.queueThoughtFlush(params.sessionId);
         this.rememberToolCall(update);
         if (update.title && AGENTRQ_TOOL_PATTERN.test(update.title)) {
           // Track completed reply calls so flushReply can skip exact duplicates
