@@ -661,9 +661,16 @@ export class AgentRQACPClient implements acp.Client {
     sessionId: string,
     configOptions: acp.SessionConfigOption[],
   ): void {
-    const modelsResult = extractModels(configOptions);
-    if (!modelsResult) return;
-    void this.sendModelsToWorkspace(sessionId, modelsResult);
+    try {
+      const modelsResult = extractModels(configOptions);
+      if (!modelsResult) return;
+      void this.sendModelsToWorkspace(sessionId, modelsResult);
+    } catch (err) {
+      console.error(
+        `[acp] Failed to process config_option_update for session ${sessionId}:`,
+        err,
+      );
+    }
   }
 
   async sendModelsToWorkspace(
@@ -671,6 +678,12 @@ export class AgentRQACPClient implements acp.Client {
     modelsResult: AgentModelsResult,
   ): Promise<void> {
     const taskId = this.getTaskIdForSession(sessionId);
+    if (!taskId) {
+      console.error(
+        `[acp] No task ID for session ${sessionId}, not sending models notification`,
+      );
+      return;
+    }
     const payload = {
       task_id: taskId,
       session_id: sessionId,

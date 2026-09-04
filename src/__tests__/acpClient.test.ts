@@ -1869,6 +1869,26 @@ describe("AgentRQACPClient", () => {
       );
     });
 
+    it("skips models notification when no task ID is found for session", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const c = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+      );
+
+      await c.sendModelsToWorkspace("sess-notask", {
+        configId: "model",
+        currentModelId: "gpt-4",
+        models: [{ id: "gpt-4", name: "GPT-4", current: true }],
+      });
+
+      expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("No task ID for session sess-notask, not sending models notification"),
+      );
+      consoleSpy.mockRestore();
+    });
+
     it("handles error when sending models notification fails", async () => {
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       mcpBridge.sendNotification.mockRejectedValue(new Error("network error"));

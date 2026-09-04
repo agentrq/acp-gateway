@@ -389,11 +389,6 @@ export async function openAgentConnection({
         url: {},
       },
       plan: {},
-      session: {
-        configOptions: {
-          boolean: {},
-        },
-      },
       // Only claim terminal logins when we can actually hand the agent a
       // terminal; otherwise the agent may offer a method we cannot run.
       auth: {
@@ -472,42 +467,46 @@ export async function getOrCreateSession(
   });
   console.error(`[acp] Created session ${sessionResult.sessionId} for task ${key}`);
 
-  const modelsResult = extractModels(sessionResult.configOptions);
-  if (modelsResult) {
-    if (modelConfig.modelId && modelConfig.modelId !== modelsResult.currentModelId) {
-      const targetModel = modelsResult.models.find(
-        (m) => m.id === modelConfig.modelId || m.name === modelConfig.modelId,
-      );
-      if (targetModel) {
-        try {
-          const updateRes = await setSessionModel(
-            connection,
-            sessionResult.sessionId,
-            modelsResult.configId,
-            targetModel.id,
+  try {
+    const modelsResult = extractModels(sessionResult.configOptions);
+    if (modelsResult) {
+      if (modelConfig.modelId && modelConfig.modelId !== modelsResult.currentModelId) {
+        const targetModel = modelsResult.models.find(
+          (m) => m.id === modelConfig.modelId || m.name === modelConfig.modelId,
+        );
+        if (targetModel) {
+          try {
+            const updateRes = await setSessionModel(
+              connection,
+              sessionResult.sessionId,
+              modelsResult.configId,
+              targetModel.id,
+            );
+            const updatedModels = extractModels(updateRes.configOptions) ?? {
+              ...modelsResult,
+              currentModelId: targetModel.id,
+              models: modelsResult.models.map((m) => ({
+                ...m,
+                current: m.id === targetModel.id,
+              })),
+            };
+            void acpClient.sendModelsToWorkspace(sessionResult.sessionId, updatedModels);
+          } catch (err) {
+            console.error(`[acp] Failed to set requested model "${modelConfig.modelId}":`, err);
+            void acpClient.sendModelsToWorkspace(sessionResult.sessionId, modelsResult);
+          }
+        } else {
+          console.error(
+            `[acp] Requested model "${modelConfig.modelId}" not found in available models: ${modelsResult.models.map((m) => m.id).join(", ")}`,
           );
-          const updatedModels = extractModels(updateRes.configOptions) ?? {
-            ...modelsResult,
-            currentModelId: targetModel.id,
-            models: modelsResult.models.map((m) => ({
-              ...m,
-              current: m.id === targetModel.id,
-            })),
-          };
-          void acpClient.sendModelsToWorkspace(sessionResult.sessionId, updatedModels);
-        } catch (err) {
-          console.error(`[acp] Failed to set requested model "${modelConfig.modelId}":`, err);
           void acpClient.sendModelsToWorkspace(sessionResult.sessionId, modelsResult);
         }
       } else {
-        console.error(
-          `[acp] Requested model "${modelConfig.modelId}" not found in available models: ${modelsResult.models.map((m) => m.id).join(", ")}`,
-        );
         void acpClient.sendModelsToWorkspace(sessionResult.sessionId, modelsResult);
       }
-    } else {
-      void acpClient.sendModelsToWorkspace(sessionResult.sessionId, modelsResult);
     }
+  } catch (err) {
+    console.error(`[acp] Failed to extract or configure models for session ${sessionResult.sessionId}:`, err);
   }
 
   await enforceHumanApprovalMode(connection, sessionResult);
@@ -894,6 +893,8 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
         if (value) {
           options.modelId = value;
           i++;
+        } else {
+          console.error("[acp] Warning: --model provided without a valid model identifier; ignoring.");
         }
         break;
       case "--login":

@@ -10,7 +10,7 @@ import {
 
 describe("models", () => {
   describe("isModelConfigOption", () => {
-    it("should return true for category 'model' or 'model_config'", () => {
+    it("should return true for category 'model'", () => {
       expect(
         isModelConfigOption({
           id: "custom_opt",
@@ -18,50 +18,97 @@ describe("models", () => {
           type: "select",
           category: "model",
           currentValue: "m1",
-          options: [],
-        } as any),
-      ).toBe(true);
-
-      expect(
-        isModelConfigOption({
-          id: "custom_opt",
-          name: "Custom",
-          type: "select",
-          category: "model_config",
-          currentValue: "m1",
-          options: [],
+          options: [{ value: "m1" }],
         } as any),
       ).toBe(true);
     });
 
-    it("should return true when id or name contains 'model'", () => {
+    it("should return false for category 'model_config' or 'thought_level'", () => {
+      expect(
+        isModelConfigOption({
+          id: "model_config",
+          name: "Configuration",
+          type: "select",
+          category: "model_config",
+          currentValue: "m1",
+          options: [{ value: "m1" }],
+        } as any),
+      ).toBe(false);
+
+      expect(
+        isModelConfigOption({
+          id: "thought_level",
+          name: "Thinking Mode",
+          type: "select",
+          category: "thought_level",
+          currentValue: "high",
+          options: [{ value: "high" }],
+        } as any),
+      ).toBe(false);
+    });
+
+    it("should return false when type is not select", () => {
+      expect(
+        isModelConfigOption({
+          id: "model",
+          name: "Model",
+          type: "boolean",
+          category: "model",
+          currentValue: true,
+        } as any),
+      ).toBe(false);
+    });
+
+    it("should return false for reasoning, thinking, or effort options", () => {
+      expect(
+        isModelConfigOption({
+          id: "model_reasoning_effort",
+          name: "Reasoning Effort",
+          type: "select",
+          currentValue: "medium",
+          options: [{ value: "medium" }],
+        } as any),
+      ).toBe(false);
+
+      expect(
+        isModelConfigOption({
+          id: "model_thinking",
+          name: "Extended Thinking",
+          type: "select",
+          currentValue: "on",
+          options: [{ value: "on" }],
+        } as any),
+      ).toBe(false);
+    });
+
+    it("should return true for model IDs or names", () => {
       expect(
         isModelConfigOption({
           id: "model",
           name: "LLM",
           type: "select",
           currentValue: "m1",
-          options: [],
+          options: [{ value: "m1" }],
         } as any),
       ).toBe(true);
 
       expect(
         isModelConfigOption({
-          id: "select_model",
-          name: "Selection",
+          id: "model_id",
+          name: "LLM Selection",
           type: "select",
           currentValue: "m1",
-          options: [],
+          options: [{ value: "m1" }],
         } as any),
       ).toBe(true);
 
       expect(
         isModelConfigOption({
-          id: "opt1",
-          name: "Language Model",
+          id: "llm",
+          name: "Select Model",
           type: "select",
           currentValue: "m1",
-          options: [],
+          options: [{ value: "m1" }],
         } as any),
       ).toBe(true);
     });
@@ -74,7 +121,7 @@ describe("models", () => {
           type: "select",
           category: "ui",
           currentValue: "dark",
-          options: [],
+          options: [{ value: "dark" }],
         } as any),
       ).toBe(false);
     });
@@ -100,7 +147,7 @@ describe("models", () => {
       expect(extractModels(configOptions)).toBeUndefined();
     });
 
-    it("should return undefined if model config option is boolean type", () => {
+    it("should return undefined if only boolean config option is present", () => {
       const configOptions: acp.SessionConfigOption[] = [
         {
           id: "model_enabled",
@@ -110,6 +157,80 @@ describe("models", () => {
         } as any,
       ];
       expect(extractModels(configOptions)).toBeUndefined();
+    });
+
+    it("should skip non-select options and pick the real select model option", () => {
+      const configOptions: acp.SessionConfigOption[] = [
+        {
+          id: "model_thinking",
+          name: "Extended thinking",
+          type: "boolean",
+          currentValue: true,
+        } as any,
+        {
+          id: "llm",
+          name: "Model",
+          type: "select",
+          currentValue: "gpt-4o",
+          options: [
+            { value: "gpt-4", name: "GPT-4" },
+            { value: "gpt-4o", name: "GPT-4o" },
+          ],
+        } as any,
+      ];
+
+      const result = extractModels(configOptions);
+      expect(result).toBeDefined();
+      expect(result?.configId).toBe("llm");
+      expect(result?.currentModelId).toBe("gpt-4o");
+      expect(result?.models).toHaveLength(2);
+    });
+
+    it("should prioritize category 'model' over auxiliary model_config selectors", () => {
+      const configOptions: acp.SessionConfigOption[] = [
+        {
+          id: "model_reasoning_effort",
+          name: "Reasoning Effort",
+          category: "model_config",
+          type: "select",
+          currentValue: "medium",
+          options: [{ value: "low" }, { value: "medium" }, { value: "high" }],
+        } as any,
+        {
+          id: "active_model",
+          name: "Active Model",
+          category: "model",
+          type: "select",
+          currentValue: "claude-3-7-sonnet",
+          options: [
+            { value: "claude-3-7-sonnet", name: "Claude 3.7 Sonnet" },
+            { value: "claude-3-5-haiku", name: "Claude 3.5 Haiku" },
+          ],
+        } as any,
+      ];
+
+      const result = extractModels(configOptions);
+      expect(result).toBeDefined();
+      expect(result?.configId).toBe("active_model");
+      expect(result?.currentModelId).toBe("claude-3-7-sonnet");
+      expect(result?.models[0].id).toBe("claude-3-7-sonnet");
+    });
+
+    it("should handle malformed or empty options safely", () => {
+      const configOptions: acp.SessionConfigOption[] = [
+        {
+          id: "model",
+          name: "Model",
+          type: "select",
+          options: [null as any, undefined as any, { value: "m1" }],
+        } as any,
+      ];
+
+      const result = extractModels(configOptions);
+      expect(result).toBeDefined();
+      expect(result?.models).toEqual([
+        { id: "m1", name: "m1", description: undefined, current: false },
+      ]);
     });
 
     it("should extract flat list of model options with current model", () => {
@@ -157,8 +278,9 @@ describe("models", () => {
     it("should extract grouped model options", () => {
       const configOptions: acp.SessionConfigOption[] = [
         {
-          id: "model_config",
+          id: "model",
           name: "Select Model",
+          category: "model",
           type: "select",
           currentValue: "claude-3-7-sonnet",
           options: [
@@ -189,7 +311,7 @@ describe("models", () => {
 
       const result = extractModels(configOptions);
       expect(result).toBeDefined();
-      expect(result?.configId).toBe("model_config");
+      expect(result?.configId).toBe("model");
       expect(result?.currentModelId).toBe("claude-3-7-sonnet");
       expect(result?.models).toEqual([
         {

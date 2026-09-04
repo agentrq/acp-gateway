@@ -68,6 +68,8 @@ You can specify gateway options before the `--` separator:
 - `--max-concurrency` / `--maxConcurrency` `<number>`: Sets the maximum number of concurrent tasks allowed to prompt the ACP agent at once. Defaults to `2`.
 - `--agent <registry-id>`: Runs an agent from the ACP registry instead of a command you supply yourself.
 - `--list-agents`: Prints every agent in the registry and how each one can run on this machine, then exits.
+- `--list-models`: Prints the models supported by the agent, then exits.
+- `--model <model-id>`: Selects a specific model for the session.
 - `--allow-unverified-agent`: Installs a registry binary that publishes no checksum. Off by default.
 - `--registry-url <url>`: Reads a different registry index (for pinning, or for testing).
 - `--auth-method <id>`: The authentication method to use when the agent asks for a login. Defaults to picking one automatically.
