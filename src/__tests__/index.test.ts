@@ -10,6 +10,7 @@ import {
   getOrCreateSession,
   activeSessions,
   authConfig,
+  modelConfig,
   createSessionWithAuth,
   isInteractiveTerminal,
   openAgentConnection,
@@ -46,7 +47,10 @@ import type { McpServerConfig } from "../config.js";
  * a bare object is not enough — the real bridge is an EventEmitter.
  */
 function fakeBridge(): any {
-  return new EventEmitter();
+  const emitter: any = new EventEmitter();
+  emitter.sendNotification = vi.fn().mockResolvedValue(undefined);
+  emitter.callTool = vi.fn().mockResolvedValue({ isError: false, content: [] });
+  return emitter;
 }
 
 // Real emitters so the agent-process lifecycle handlers can be exercised.
@@ -597,6 +601,64 @@ describe("index", () => {
       expect(session.sessionId).toBe("authed-sess");
     });
 
+    it("should forward models to workspace on session creation and set model if configured", async () => {
+      const mockBridge: any = fakeBridge();
+      const setSessionConfigOption = vi.fn().mockResolvedValue({
+        configOptions: [
+          {
+            id: "model",
+            name: "Model",
+            type: "select",
+            currentValue: "gpt-4o",
+            options: [
+              { value: "gpt-4", name: "GPT-4" },
+              { value: "gpt-4o", name: "GPT-4o" },
+            ],
+          },
+        ],
+      });
+      vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
+        return {
+          initialize: vi.fn().mockResolvedValue({ protocolVersion: "0.1.0" }),
+          newSession: vi.fn().mockResolvedValue({
+            sessionId: "model-sess",
+            configOptions: [
+              {
+                id: "model",
+                name: "Model",
+                type: "select",
+                currentValue: "gpt-4",
+                options: [
+                  { value: "gpt-4", name: "GPT-4" },
+                  { value: "gpt-4o", name: "GPT-4o" },
+                ],
+              },
+            ],
+          }),
+          setSessionConfigOption,
+          prompt: vi.fn(),
+        } as any;
+      } as any);
+
+      modelConfig.modelId = "gpt-4o";
+      const session = await getOrCreateSession("T-Model", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(setSessionConfigOption).toHaveBeenCalledWith({
+        sessionId: "model-sess",
+        configId: "model",
+        value: "gpt-4o",
+      });
+      expect(mockBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/models",
+        expect.objectContaining({
+          task_id: "T-Model",
+          session_id: "model-sess",
+          current_model: "gpt-4o",
+        }),
+      );
+      modelConfig.modelId = undefined;
+    });
+
     it("should drop the cached session when the agent process dies", async () => {
       const mockBridge: any = fakeBridge();
       await getOrCreateSession("T-Exit", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
@@ -790,6 +852,15 @@ describe("index", () => {
       expect(parseGatewayArgs(["--registry-url"]).registryUrl).toBeUndefined();
     });
 
+    it("should recognise model options", () => {
+      expect(parseGatewayArgs(["--list-models"])).toMatchObject({ command: "list-models" });
+      expect(parseGatewayArgs(["--model", "claude-3-7-sonnet"])).toMatchObject({
+        command: "run",
+        modelId: "claude-3-7-sonnet",
+      });
+      expect(parseGatewayArgs(["--model"]).modelId).toBeUndefined();
+    });
+
     it("should recognise both spellings of the help flag", () => {
       expect(parseGatewayArgs(["--help"]).command).toBe("help");
       expect(parseGatewayArgs(["-h"]).command).toBe("help");
@@ -975,6 +1046,69 @@ describe("index", () => {
       expect(spawnedAgents[0].kill).toHaveBeenCalled();
     });
 
+    it("should list models from configOptions and cleanly close session", async () => {
+      mockConnection({
+        newSession: vi.fn().mockResolvedValue({
+          sessionId: "m-sess",
+          configOptions: [
+            {
+              id: "model",
+              name: "Model",
+              type: "select",
+              currentValue: "claude-3-7-sonnet",
+              options: [
+                { value: "claude-3-7-sonnet", name: "Claude 3.7 Sonnet" },
+                { value: "claude-3-5-haiku", name: "Claude 3.5 Haiku" },
+              ],
+            },
+          ],
+        }),
+      });
+
+      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+
+      const printed = logSpy.mock.calls.flat().join("\n");
+      expect(printed).toContain("Models supported by \"gemini --acp\":");
+      expect(printed).toContain("claude-3-7-sonnet");
+      expect(printed).toContain("Claude 3.7 Sonnet");
+      expect(spawnedAgents[0].kill).toHaveBeenCalled();
+    });
+
+    it("should list models from unstable_listProviders fallback", async () => {
+      mockConnection({
+        newSession: vi.fn().mockResolvedValue({ sessionId: "m-sess", configOptions: [] }),
+        unstable_listProviders: vi.fn().mockResolvedValue({
+          providers: [
+            {
+              providerId: "anthropic",
+              supported: ["claude-sonnet"],
+            },
+          ],
+        }),
+      }, {
+        agentCapabilities: { providers: true },
+      });
+
+      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+
+      const printed = logSpy.mock.calls.flat().join("\n");
+      expect(printed).toContain("Configurable providers for \"gemini --acp\":");
+      expect(printed).toContain("claude-sonnet");
+      expect(spawnedAgents[0].kill).toHaveBeenCalled();
+    });
+
+    it("should report when agent advertises no models", async () => {
+      mockConnection({
+        newSession: vi.fn().mockResolvedValue({ sessionId: "m-sess", configOptions: [] }),
+      });
+
+      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+
+      const printed = logSpy.mock.calls.flat().join("\n");
+      expect(printed).toContain("No configurable models advertised by \"gemini --acp\".");
+      expect(spawnedAgents[0].kill).toHaveBeenCalled();
+    });
+
     it("should print what the agent says it supports", async () => {
       mockConnection({}, {
         protocolVersion: 1,
@@ -1053,6 +1187,8 @@ describe("index", () => {
           "--agent-info",
           "--allow-unverified-agent",
           "--registry-url",
+          "--list-models",
+          "--model",
           "--list-auth-methods",
           "--login",
           "--logout",

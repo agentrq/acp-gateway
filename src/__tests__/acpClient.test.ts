@@ -1800,4 +1800,115 @@ describe("AgentRQACPClient", () => {
     });
   });
 
+  describe("models support", () => {
+    it("forwards models to workspace on config_option_update", async () => {
+      const c = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        (sessionId: string) => `task-${sessionId}`,
+      );
+
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: [
+            {
+              id: "model",
+              name: "Model",
+              type: "select",
+              currentValue: "claude-3-7-sonnet",
+              options: [
+                { value: "claude-3-7-sonnet", name: "Claude 3.7 Sonnet" },
+                { value: "claude-3-5-haiku", name: "Claude 3.5 Haiku" },
+              ],
+            },
+          ],
+        },
+      } as any);
+
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/models",
+        {
+          task_id: "task-sess-1",
+          session_id: "sess-1",
+          config_id: "model",
+          current_model: "claude-3-7-sonnet",
+          models: [
+            { id: "claude-3-7-sonnet", name: "Claude 3.7 Sonnet", current: true },
+            { id: "claude-3-5-haiku", name: "Claude 3.5 Haiku", current: false },
+          ],
+        },
+      );
+    });
+
+    it("ignores config_option_update if no model options exist", async () => {
+      const c = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        (sessionId: string) => `task-${sessionId}`,
+      );
+
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: [
+            {
+              id: "theme",
+              name: "Theme",
+              type: "select",
+              currentValue: "dark",
+              options: [{ value: "dark", name: "Dark" }],
+            },
+          ],
+        },
+      } as any);
+
+      expect(mcpBridge.sendNotification).not.toHaveBeenCalledWith(
+        "notifications/claude/channel/models",
+        expect.anything(),
+      );
+    });
+
+    it("skips models notification when no task ID is found for session", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const c = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+      );
+
+      await c.sendModelsToWorkspace("sess-notask", {
+        configId: "model",
+        currentModelId: "gpt-4",
+        models: [{ id: "gpt-4", name: "GPT-4", current: true }],
+      });
+
+      expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("No task ID for session sess-notask, not sending models notification"),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("handles error when sending models notification fails", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mcpBridge.sendNotification.mockRejectedValue(new Error("network error"));
+
+      const c = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        (sessionId: string) => `task-${sessionId}`,
+      );
+
+      await c.sendModelsToWorkspace("sess-1", {
+        configId: "model",
+        currentModelId: "gpt-4",
+        models: [{ id: "gpt-4", name: "GPT-4", current: true }],
+      });
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to send models notification for session sess-1:"),
+        expect.anything(),
+      );
+      consoleSpy.mockRestore();
+    });
+  });
 });
