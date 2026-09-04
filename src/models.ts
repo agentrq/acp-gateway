@@ -94,17 +94,10 @@ export function extractModels(
   if (selectOptions.length === 0) return undefined;
 
   // Priority 1: category === "model" or exact id === "model"
-  // Priority 2: candidate matching isModelConfigOption
-  // Priority 3: any remaining select option with "model" in id/name without non-model keywords
+  // Priority 2: candidate matching isModelConfigOption (with keyword exclusions)
   const modelOption =
     selectOptions.find((opt) => opt.category === "model" || opt.id === "model") ??
-    selectOptions.find(isModelConfigOption) ??
-    selectOptions.find(
-      (opt) =>
-        opt.category !== "model_config" &&
-        opt.category !== "thought_level" &&
-        (opt.id.toLowerCase().includes("model") || opt.name.toLowerCase().includes("model")),
-    );
+    selectOptions.find(isModelConfigOption);
 
   if (!modelOption || !Array.isArray(modelOption.options) || modelOption.options.length === 0) {
     return undefined;
@@ -112,8 +105,8 @@ export function extractModels(
 
   const models: AgentModel[] = [];
   const currentModelId =
-    typeof modelOption.currentValue === "string"
-      ? modelOption.currentValue
+    modelOption.currentValue !== undefined && modelOption.currentValue !== null
+      ? String(modelOption.currentValue)
       : undefined;
 
   for (const item of modelOption.options) {
@@ -123,20 +116,22 @@ export function extractModels(
       const groupName = (item as any).name || (item as any).group;
       for (const opt of (item as any).options) {
         if (!opt || typeof opt !== "object" || !("value" in opt)) continue;
+        const valStr = String(opt.value);
         models.push({
-          id: String(opt.value),
-          name: opt.name || String(opt.value),
+          id: valStr,
+          name: opt.name || valStr,
           description: opt.description ?? undefined,
-          current: opt.value === currentModelId,
+          current: currentModelId !== undefined && valStr === currentModelId,
           group: groupName,
         });
       }
     } else if ("value" in item) {
+      const valStr = String(item.value);
       models.push({
-        id: String(item.value),
-        name: item.name || String(item.value),
+        id: valStr,
+        name: item.name || valStr,
         description: item.description ?? undefined,
-        current: item.value === currentModelId,
+        current: currentModelId !== undefined && valStr === currentModelId,
       });
     }
   }

@@ -216,6 +216,59 @@ describe("models", () => {
       expect(result?.models[0].id).toBe("claude-3-7-sonnet");
     });
 
+    it("should reject category-less reasoning/effort/thinking options when alone", () => {
+      const configOptions: acp.SessionConfigOption[] = [
+        {
+          id: "model_reasoning_effort",
+          name: "Reasoning Effort",
+          type: "select",
+          currentValue: "medium",
+          options: [{ value: "low" }, { value: "medium" }, { value: "high" }],
+        } as any,
+      ];
+      expect(extractModels(configOptions)).toBeUndefined();
+    });
+
+    it("should handle options with missing or undefined name safely", () => {
+      const configOptions: acp.SessionConfigOption[] = [
+        {
+          id: "model",
+          type: "select",
+          currentValue: "m1",
+          options: [{ value: "m1" }, { value: "m2", name: undefined }],
+        } as any,
+      ];
+
+      const result = extractModels(configOptions);
+      expect(result).toBeDefined();
+      expect(result?.models).toEqual([
+        { id: "m1", name: "m1", description: undefined, current: true },
+        { id: "m2", name: "m2", description: undefined, current: false },
+      ]);
+    });
+
+    it("should properly match current model with coerced non-string values", () => {
+      const configOptions: acp.SessionConfigOption[] = [
+        {
+          id: "model",
+          name: "Model",
+          type: "select",
+          currentValue: 123 as any,
+          options: [{ value: 123 as any }, { value: 456 as any }],
+        } as any,
+      ];
+
+      const result = extractModels(configOptions);
+      expect(result).toBeDefined();
+      expect(result?.currentModelId).toBe("123");
+      expect(result?.models[0]).toEqual({
+        id: "123",
+        name: "123",
+        description: undefined,
+        current: true,
+      });
+      expect(result?.models[1].current).toBe(false);
+    });
     it("should handle malformed or empty options safely", () => {
       const configOptions: acp.SessionConfigOption[] = [
         {

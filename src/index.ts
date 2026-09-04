@@ -1090,28 +1090,33 @@ export async function runAgentCommand(
         },
       );
 
-      const modelsResult = extractModels(sessionResult.configOptions);
-      if (modelsResult && modelsResult.models.length > 0) {
-        console.log(formatModelsText(modelsResult, acpCmdArgs.join(" ")));
-      } else if (
-        agentCapabilities?.providers &&
-        typeof (agent.connection as any).unstable_listProviders === "function"
-      ) {
-        try {
-          const providersRes = await (agent.connection as any).unstable_listProviders({});
-          const providers = providersRes?.providers ?? [];
-          if (providers.length > 0) {
-            console.log(`Configurable providers for "${acpCmdArgs.join(" ")}":\n`);
-            for (const p of providers) {
-              console.log(`  * ${p.providerId} (${p.supported.join(", ")})`);
+      try {
+        const modelsResult = extractModels(sessionResult.configOptions);
+        if (modelsResult && modelsResult.models.length > 0) {
+          console.log(formatModelsText(modelsResult, acpCmdArgs.join(" ")));
+        } else if (
+          agentCapabilities?.providers &&
+          typeof (agent.connection as any).unstable_listProviders === "function"
+        ) {
+          try {
+            const providersRes = await (agent.connection as any).unstable_listProviders({});
+            const providers = providersRes?.providers ?? [];
+            if (providers.length > 0) {
+              console.log(`Configurable providers for "${acpCmdArgs.join(" ")}":\n`);
+              for (const p of providers) {
+                console.log(`  * ${p.providerId} (${p.supported.join(", ")})`);
+              }
+            } else {
+              console.log(`No configurable models advertised by "${acpCmdArgs.join(" ")}".`);
             }
-          } else {
+          } catch {
             console.log(`No configurable models advertised by "${acpCmdArgs.join(" ")}".`);
           }
-        } catch {
+        } else {
           console.log(`No configurable models advertised by "${acpCmdArgs.join(" ")}".`);
         }
-      } else {
+      } catch (err) {
+        console.error(`[acp] Failed to extract models:`, err);
         console.log(`No configurable models advertised by "${acpCmdArgs.join(" ")}".`);
       }
 
