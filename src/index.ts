@@ -106,6 +106,12 @@ import {
   extractTaskIdFromMeta,
   extractTaskIdFromText,
 } from "./taskIdentity.js";
+import {
+  extractModels,
+  formatModelsText,
+  setSessionModel,
+  type AgentModelsResult,
+} from "./models.js";
 
 const lastTaskContent = new Map<string, string>();
 
@@ -270,6 +276,9 @@ export function setupSignalHandlers(
 /** Login preferences taken from the CLI, consulted whenever an agent demands auth. */
 export const authConfig: { methodId?: string } = {};
 
+/** Model preference taken from the CLI, applied when a session starts. */
+export const modelConfig: { modelId?: string } = {};
+
 /** How long tool calls wait for a human, taken from the CLI at startup. */
 export const permissionConfig: { timeoutMs?: number } = {};
 
@@ -380,6 +389,11 @@ export async function openAgentConnection({
         url: {},
       },
       plan: {},
+      session: {
+        configOptions: {
+          boolean: {},
+        },
+      },
       // Only claim terminal logins when we can actually hand the agent a
       // terminal; otherwise the agent may offer a method we cannot run.
       auth: {
@@ -457,6 +471,44 @@ export async function getOrCreateSession(
     interactive: isInteractiveTerminal(),
   });
   console.error(`[acp] Created session ${sessionResult.sessionId} for task ${key}`);
+
+  const modelsResult = extractModels(sessionResult.configOptions);
+  if (modelsResult) {
+    if (modelConfig.modelId && modelConfig.modelId !== modelsResult.currentModelId) {
+      const targetModel = modelsResult.models.find(
+        (m) => m.id === modelConfig.modelId || m.name === modelConfig.modelId,
+      );
+      if (targetModel) {
+        try {
+          const updateRes = await setSessionModel(
+            connection,
+            sessionResult.sessionId,
+            modelsResult.configId,
+            targetModel.id,
+          );
+          const updatedModels = extractModels(updateRes.configOptions) ?? {
+            ...modelsResult,
+            currentModelId: targetModel.id,
+            models: modelsResult.models.map((m) => ({
+              ...m,
+              current: m.id === targetModel.id,
+            })),
+          };
+          void acpClient.sendModelsToWorkspace(sessionResult.sessionId, updatedModels);
+        } catch (err) {
+          console.error(`[acp] Failed to set requested model "${modelConfig.modelId}":`, err);
+          void acpClient.sendModelsToWorkspace(sessionResult.sessionId, modelsResult);
+        }
+      } else {
+        console.error(
+          `[acp] Requested model "${modelConfig.modelId}" not found in available models: ${modelsResult.models.map((m) => m.id).join(", ")}`,
+        );
+        void acpClient.sendModelsToWorkspace(sessionResult.sessionId, modelsResult);
+      }
+    } else {
+      void acpClient.sendModelsToWorkspace(sessionResult.sessionId, modelsResult);
+    }
+  }
 
   await enforceHumanApprovalMode(connection, sessionResult);
   // The mode is pinned once here, but agents may move themselves back out of
@@ -774,6 +826,7 @@ export type GatewayCommand =
   | "logout"
   | "list-auth-methods"
   | "list-agents"
+  | "list-models"
   | "agent-info"
   | "help";
 
@@ -782,6 +835,7 @@ export interface GatewayOptions {
   /** How long a tool call waits for a human verdict. 0 waits indefinitely. */
   permissionTimeoutMs: number;
   authMethodId?: string;
+  modelId?: string;
   command: GatewayCommand;
   /** Registry id of the agent to run, instead of a command given after `--`. */
   agentId?: string;
@@ -836,6 +890,12 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
           i++;
         }
         break;
+      case "--model":
+        if (value) {
+          options.modelId = value;
+          i++;
+        }
+        break;
       case "--login":
         options.command = "login";
         if (value) {
@@ -857,6 +917,9 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
         break;
       case "--list-agents":
         options.command = "list-agents";
+        break;
+      case "--list-models":
+        options.command = "list-models";
         break;
       case "--agent-info":
         options.command = "agent-info";
@@ -1010,6 +1073,57 @@ export async function runAgentCommand(
       return;
     }
 
+    if (command === "list-models") {
+      const newSessionParams: AcpNewSessionParams = {
+        cwd: process.cwd(),
+        mcpServers: mapMcpServers([], agentCapabilities),
+      };
+      const sessionResult = await createSessionWithAuth(
+        agent.connection,
+        newSessionParams,
+        {
+          methods: authMethods,
+          launch: { command: cmd, args: cmdArgs, env: agentrqConfig.env },
+          preferredId: authMethodId,
+          interactive: isInteractiveTerminal(),
+        },
+      );
+
+      const modelsResult = extractModels(sessionResult.configOptions);
+      if (modelsResult && modelsResult.models.length > 0) {
+        console.log(formatModelsText(modelsResult, acpCmdArgs.join(" ")));
+      } else if (
+        agentCapabilities?.providers &&
+        typeof (agent.connection as any).unstable_listProviders === "function"
+      ) {
+        try {
+          const providersRes = await (agent.connection as any).unstable_listProviders({});
+          const providers = providersRes?.providers ?? [];
+          if (providers.length > 0) {
+            console.log(`Configurable providers for "${acpCmdArgs.join(" ")}":\n`);
+            for (const p of providers) {
+              console.log(`  * ${p.providerId} (${p.supported.join(", ")})`);
+            }
+          } else {
+            console.log(`No configurable models advertised by "${acpCmdArgs.join(" ")}".`);
+          }
+        } catch {
+          console.log(`No configurable models advertised by "${acpCmdArgs.join(" ")}".`);
+        }
+      } else {
+        console.log(`No configurable models advertised by "${acpCmdArgs.join(" ")}".`);
+      }
+
+      await closeSession({
+        connection: agent.connection,
+        sessionId: sessionResult.sessionId,
+        process: agent.process,
+        acpClient: agent.acpClient,
+        initResult: agent.initResult,
+      });
+      return;
+    }
+
     if (command === "logout") {
       await logout(connection, agentCapabilities);
       return;
@@ -1049,6 +1163,8 @@ AGENT
                               if needed, instead of a command you supply.
   --list-agents               List every agent in the registry, and how each one
                               can run on this machine. Exits.
+  --list-models               List models supported by the agent. Exits.
+  --model <model-id>          Select a specific model for the session.
   --agent-info                What the agent says it supports — session
                               lifecycle, prompt content, MCP transports and
                               logins. Only a live handshake can tell you. Exits.
@@ -1081,6 +1197,8 @@ EXAMPLES
   acp-gateway --agent gemini                     Run Gemini from the registry
   acp-gateway -- gemini --acp                    Run an agent you installed
   acp-gateway --list-agents                      See what the registry offers
+  acp-gateway --list-models --agent gemini       See models supported by Gemini
+  acp-gateway --model gemini-2.5-pro -- gemini --acp
   acp-gateway --agent-info --agent gemini        See what that agent supports
   acp-gateway --login -- gemini --acp            Log in before running anything
   acp-gateway --max-concurrency 4 -- gemini --acp
@@ -1156,6 +1274,7 @@ async function main() {
   }
 
   authConfig.methodId = authMethodId;
+  modelConfig.modelId = options.modelId;
   permissionConfig.timeoutMs = options.permissionTimeoutMs;
 
   const taskQueue = new TaskQueue(maxConcurrency);

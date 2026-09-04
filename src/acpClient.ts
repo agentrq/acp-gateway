@@ -18,6 +18,7 @@ import {
   type TelemetryKind,
   type TelemetryPayload,
 } from "./telemetry.js";
+import { extractModels, type AgentModelsResult } from "./models.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -625,6 +626,9 @@ export class AgentRQACPClient implements acp.Client {
         console.error(`[acp] Agent switched session mode to "${update.currentModeId}"`);
         await this.onModeChanged?.(params.sessionId, update.currentModeId);
         break;
+      case "config_option_update":
+        this.handleConfigOptionUpdate(params.sessionId, update.configOptions);
+        break;
       case "tool_call_update":
         this.rememberToolCall(update);
         break;
@@ -650,6 +654,43 @@ export class AgentRQACPClient implements acp.Client {
       }
       default:
         break;
+    }
+  }
+
+  handleConfigOptionUpdate(
+    sessionId: string,
+    configOptions: acp.SessionConfigOption[],
+  ): void {
+    const modelsResult = extractModels(configOptions);
+    if (!modelsResult) return;
+    void this.sendModelsToWorkspace(sessionId, modelsResult);
+  }
+
+  async sendModelsToWorkspace(
+    sessionId: string,
+    modelsResult: AgentModelsResult,
+  ): Promise<void> {
+    const taskId = this.getTaskIdForSession(sessionId);
+    const payload = {
+      task_id: taskId,
+      session_id: sessionId,
+      config_id: modelsResult.configId,
+      current_model: modelsResult.currentModelId,
+      models: modelsResult.models,
+    };
+    try {
+      await this.mcpBridge.sendNotification(
+        "notifications/claude/channel/models",
+        payload,
+      );
+      console.error(
+        `[acp] Shared ${modelsResult.models.length} supported model(s) with workspace (current: ${modelsResult.currentModelId ?? "none"})`,
+      );
+    } catch (err) {
+      console.error(
+        `[acp] Failed to send models notification for session ${sessionId}:`,
+        err,
+      );
     }
   }
 
