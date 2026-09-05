@@ -65,7 +65,7 @@ acp-gateway -- your-acp-agent --flag1 --flag2
 
 You can specify gateway options before the `--` separator:
 
-- `--max-concurrency` / `--maxConcurrency` `<number>`: Sets the maximum number of concurrent tasks allowed to prompt the ACP agent at once. Defaults to `2`.
+- `--max-concurrency` / `--maxConcurrency` `<number>`: Sets the maximum number of concurrent tasks allowed to prompt the ACP agent at once. Defaults to `1`.
 - `--agent <registry-id>`: Runs an agent from the ACP registry instead of a command you supply yourself.
 - `--list-agents`: Prints every agent in the registry and how each one can run on this machine, then exits.
 - `--list-models`: Prints the models supported by the agent, then exits.
