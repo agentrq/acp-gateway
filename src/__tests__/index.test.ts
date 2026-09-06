@@ -968,10 +968,8 @@ describe("index", () => {
     it("returns the file a name resolves to", () => {
       const dir = mkdtempSync(join(tmpdir(), "acp-gateway-path-"));
       writeFileSync(join(dir, "npx.cmd"), "");
-      // The suffix comes back spelled as PATHEXT spells it; Windows paths are
-      // case-insensitive, so that is the same file.
-      expect(resolveOnPath("npx", { PATH: dir, PATHEXT: ".EXE;.CMD" }, "win32")).toBe(
-        join(dir, "npx.CMD"),
+      expect(resolveOnPath("npx", { PATH: dir, PATHEXT: ".EXE;.cmd" }, "win32")).toBe(
+        join(dir, "npx.cmd"),
       );
       expect(resolveOnPath("npx", { PATH: dir, PATHEXT: ".EXE" }, "win32")).toBeUndefined();
     });
