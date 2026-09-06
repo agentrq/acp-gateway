@@ -325,8 +325,8 @@ export async function resolveAgentLaunch({
     );
   }
 
-  if (kinds.includes("npx")) return packageLaunchSpec("npx", agent.distribution.npx!, platform);
-  if (kinds.includes("uvx")) return packageLaunchSpec("uvx", agent.distribution.uvx!, platform);
+  if (kinds.includes("npx")) return packageLaunchSpec("npx", agent.distribution.npx!);
+  if (kinds.includes("uvx")) return packageLaunchSpec("uvx", agent.distribution.uvx!);
 
   return installBinaryAgent({
     agent,

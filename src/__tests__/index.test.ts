@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Writable, Readable } from "node:stream";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import * as acp from "@agentclientprotocol/sdk";
 import {
@@ -18,6 +21,13 @@ import {
   assertAgentRunnable,
   helpText,
   isRunnable,
+  resolveOnPath,
+  spawnTarget,
+  needsShell,
+  escapeCmdCommand,
+  quoteForCmd,
+  spawnArgsFor,
+  terminateAgentProcess,
   printHelp,
   resolveAgentCommand,
   runListAgents,
@@ -703,6 +713,49 @@ describe("index", () => {
       );
     });
 
+    it("spawns an ordinary agent command directly", async () => {
+      const { spawn } = await import("node:child_process");
+      await openAgentConnection({
+        acpCmdArgs: ["node", "agent.js"],
+        mcpBridge: fakeBridge(),
+        label: "spawn-plain",
+      });
+
+      expect(vi.mocked(spawn)).toHaveBeenLastCalledWith(
+        "node",
+        ["agent.js"],
+        expect.objectContaining({ shell: false }),
+      );
+    });
+
+    it("resolves npx on Windows and spawns the batch file through a shell", async () => {
+      // The whole reported failure in one test: the registry says "npx", the
+      // machine has it as npx.cmd, and a batch file needs a shell to start.
+      const { spawn } = await import("node:child_process");
+      const dir = mkdtempSync(join(tmpdir(), "acp-gateway-path-"));
+      writeFileSync(join(dir, "npx.cmd"), "");
+      const platform = process.platform;
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+      vi.stubEnv("PATH", dir);
+      vi.stubEnv("PATHEXT", ".EXE;.cmd");
+      try {
+        await openAgentConnection({
+          acpCmdArgs: ["npx", "-y", "@zed-industries/codex-acp"],
+          mcpBridge: fakeBridge(),
+          label: "spawn-windows",
+        });
+      } finally {
+        Object.defineProperty(process, "platform", { value: platform, configurable: true });
+        vi.unstubAllEnvs();
+      }
+
+      expect(vi.mocked(spawn)).toHaveBeenLastCalledWith(
+        join(dir, "npx.cmd"),
+        ['^"-y^"', '^"@zed-industries/codex-acp^"'],
+        expect.objectContaining({ shell: true }),
+      );
+    });
+
     it("should report the agent's login methods and survive process failures", async () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
@@ -888,6 +941,208 @@ describe("index", () => {
       // nothing while "npx.cmd" would.
       expect(isRunnable("npx", { PATH: "C:\\tools", PATHEXT: ".EXE" }, "win32")).toBe(false);
       expect(isRunnable("C:\\nope\\agent.exe", {}, "win32")).toBe(false);
+    });
+
+    it("finds a Windows command that already carries its suffix", () => {
+      // The registry launches npm agents as "npx.cmd"; appending PATHEXT to
+      // that would only ever look for "npx.cmd.EXE" and friends.
+      const dir = mkdtempSync(join(tmpdir(), "acp-gateway-path-"));
+      writeFileSync(join(dir, "npx.cmd"), "");
+      expect(isRunnable("npx.cmd", { PATH: dir, PATHEXT: ".COM;.EXE;.BAT;.CMD" }, "win32")).toBe(
+        true,
+      );
+      expect(isRunnable("npx.cmd", { PATH: dir }, "win32")).toBe(true);
+      // A suffix PATHEXT does not list is still a bare name to complete.
+      expect(isRunnable("npx.cmd", { PATH: dir, PATHEXT: ".EXE" }, "win32")).toBe(false);
+    });
+
+    it("still completes a bare Windows name from PATHEXT", () => {
+      const dir = mkdtempSync(join(tmpdir(), "acp-gateway-path-"));
+      writeFileSync(join(dir, "agent.CMD"), "");
+      expect(isRunnable("agent", { PATH: dir, PATHEXT: ".EXE;.CMD" }, "win32")).toBe(true);
+      expect(isRunnable("agent", { PATH: dir, PATHEXT: ".EXE" }, "win32")).toBe(false);
+    });
+  });
+
+  describe("resolveOnPath", () => {
+    it("returns the file a name resolves to", () => {
+      const dir = mkdtempSync(join(tmpdir(), "acp-gateway-path-"));
+      writeFileSync(join(dir, "npx.cmd"), "");
+      // The suffix comes back spelled as PATHEXT spells it; Windows paths are
+      // case-insensitive, so that is the same file.
+      expect(resolveOnPath("npx", { PATH: dir, PATHEXT: ".EXE;.CMD" }, "win32")).toBe(
+        join(dir, "npx.CMD"),
+      );
+      expect(resolveOnPath("npx", { PATH: dir, PATHEXT: ".EXE" }, "win32")).toBeUndefined();
+    });
+
+    it("takes the first directory on PATH that has it", () => {
+      const first = mkdtempSync(join(tmpdir(), "acp-gateway-path-"));
+      const second = mkdtempSync(join(tmpdir(), "acp-gateway-path-"));
+      writeFileSync(join(first, "agent.exe"), "");
+      writeFileSync(join(second, "agent.exe"), "");
+      expect(
+        resolveOnPath("agent", { PATH: `${first};${second}`, PATHEXT: ".exe" }, "win32"),
+      ).toBe(join(first, "agent.exe"));
+    });
+  });
+
+  describe("spawnTarget", () => {
+    it("leaves a command alone off Windows", () => {
+      expect(spawnTarget("npx", { PATH: "/usr/bin" }, "darwin")).toBe("npx");
+    });
+
+    it("resolves the suffix a Windows runner is actually installed under", () => {
+      // A stock npm install ships npx.cmd, a Volta install ships npx.exe, and
+      // only one of those needs a shell to start.
+      const batch = mkdtempSync(join(tmpdir(), "acp-gateway-path-"));
+      writeFileSync(join(batch, "npx.cmd"), "");
+      expect(spawnTarget("npx", { PATH: batch, PATHEXT: ".exe;.cmd" }, "win32")).toBe(
+        join(batch, "npx.cmd"),
+      );
+
+      const shimmed = mkdtempSync(join(tmpdir(), "acp-gateway-path-"));
+      writeFileSync(join(shimmed, "npx.exe"), "");
+      const resolved = spawnTarget("npx", { PATH: shimmed, PATHEXT: ".exe;.cmd" }, "win32");
+      expect(resolved).toBe(join(shimmed, "npx.exe"));
+      expect(needsShell(resolved, "win32")).toBe(false);
+    });
+
+    it("falls back to the name when nothing on PATH matches", () => {
+      expect(spawnTarget("npx", { PATH: "C:\\nowhere", PATHEXT: ".EXE" }, "win32")).toBe("npx");
+      expect(spawnTarget("C:\\tools\\agent.cmd", { PATH: "" }, "win32")).toBe(
+        "C:\\tools\\agent.cmd",
+      );
+    });
+  });
+
+  describe("needsShell", () => {
+    it("asks for a shell only for Windows batch files", () => {
+      expect(needsShell("npx.cmd", "win32")).toBe(true);
+      expect(needsShell("C:\\tools\\Agent.BAT", "win32")).toBe(true);
+      expect(needsShell("node.exe", "win32")).toBe(false);
+      expect(needsShell("npx", "win32")).toBe(false);
+    });
+
+    it("never asks for one off Windows", () => {
+      expect(needsShell("npx.cmd", "darwin")).toBe(false);
+      expect(needsShell("npx", "linux")).toBe(false);
+    });
+  });
+
+  describe("escapeCmdCommand", () => {
+    it("leaves a plain program name alone", () => {
+      expect(escapeCmdCommand("npx.cmd")).toBe("npx.cmd");
+    });
+
+    it("escapes what cmd.exe would otherwise act on", () => {
+      // The space is escaped rather than quoted, so cmd.exe reads the whole
+      // path as the program name.
+      expect(escapeCmdCommand("C:\\Program Files\\nodejs\\npx.cmd")).toBe(
+        "C:\\Program^ Files\\nodejs\\npx.cmd",
+      );
+      expect(escapeCmdCommand("a&b.cmd")).toBe("a^&b.cmd");
+    });
+  });
+
+  describe("quoteForCmd", () => {
+    it("quotes every argument for both parsers", () => {
+      // Quoted for the agent's own argument parser, then escaped so cmd.exe
+      // passes those quotes along instead of eating them.
+      expect(quoteForCmd("-y")).toBe('^"-y^"');
+      expect(quoteForCmd("@zed-industries/codex-acp")).toBe('^"@zed-industries/codex-acp^"');
+      expect(quoteForCmd("")).toBe('^"^"');
+    });
+
+    it("neutralises whitespace and shell syntax", () => {
+      expect(quoteForCmd("two words")).toBe('^"two^ words^"');
+      expect(quoteForCmd("a&b|c")).toBe('^"a^&b^|c^"');
+      expect(quoteForCmd("%PATH%")).toBe('^"^%PATH^%^"');
+    });
+
+    it("escapes twice for a wrapper that re-enters cmd.exe", () => {
+      expect(quoteForCmd("a&b", true)).toBe('^^^"a^^^&b^^^"');
+    });
+
+    it("doubles the backslashes a quote would otherwise escape", () => {
+      expect(quoteForCmd('say "hi"')).toBe('^"say^ \\^"hi\\^"^"');
+      expect(quoteForCmd("C:\\dir\\")).toBe('^"C:\\dir\\\\^"');
+      // A run of backslashes before a quote is doubled whole, then the quote
+      // gets its own: two backslashes and a quote need five and a quote.
+      expect(quoteForCmd('a\\\\"b')).toBe('^"a\\\\\\\\\\^"b^"');
+    });
+  });
+
+  describe("spawnArgsFor", () => {
+    it("passes the command through when no shell is involved", () => {
+      expect(spawnArgsFor("npx", ["-y", "some pkg"], "darwin")).toEqual([
+        "npx",
+        ["-y", "some pkg"],
+      ]);
+      expect(spawnArgsFor("npx.cmd", ["-y", "codex-acp"], "linux")).toEqual([
+        "npx.cmd",
+        ["-y", "codex-acp"],
+      ]);
+    });
+
+    it("escapes twice for an npm bin shim, which re-enters cmd.exe", () => {
+      expect(
+        spawnArgsFor("C:\\proj\\node_modules\\.bin\\my-agent.cmd", ["--flag"], "win32"),
+      ).toEqual(["C:\\proj\\node_modules\\.bin\\my-agent.cmd", ['^^^"--flag^^^"']]);
+    });
+
+    it("escapes the command line a Windows shell would re-parse", () => {
+      expect(
+        spawnArgsFor("C:\\Program Files\\nodejs\\npx.cmd", ["-y", "codex-acp"], "win32"),
+      ).toEqual([
+        "C:\\Program^ Files\\nodejs\\npx.cmd",
+        ['^"-y^"', '^"codex-acp^"'],
+      ]);
+    });
+  });
+
+  describe("terminateAgentProcess", () => {
+    it("just kills the process off Windows", () => {
+      const child = { pid: 42, kill: vi.fn() };
+      const spawnImpl = vi.fn();
+      terminateAgentProcess(child, "darwin", spawnImpl as any);
+      expect(child.kill).toHaveBeenCalled();
+      expect(spawnImpl).not.toHaveBeenCalled();
+    });
+
+    it("kills the whole tree on Windows", () => {
+      const killer: any = new EventEmitter();
+      killer.unref = vi.fn();
+      const spawnImpl = vi.fn(() => killer);
+      const child = { pid: 4242, kill: vi.fn() };
+
+      terminateAgentProcess(child, "win32", spawnImpl as any);
+
+      expect(spawnImpl).toHaveBeenCalledWith(
+        "taskkill",
+        ["/pid", "4242", "/T", "/F"],
+        { stdio: "ignore" },
+      );
+      expect(killer.unref).toHaveBeenCalled();
+      expect(child.kill).not.toHaveBeenCalled();
+
+      // taskkill itself failing must not leave the agent running.
+      killer.emit("error", new Error("not found"));
+      expect(child.kill).toHaveBeenCalled();
+    });
+
+    it("falls back to a plain kill when the process has no pid", () => {
+      const child = { kill: vi.fn() };
+      const spawnImpl = vi.fn();
+      terminateAgentProcess(child, "win32", spawnImpl as any);
+      expect(child.kill).toHaveBeenCalled();
+      expect(spawnImpl).not.toHaveBeenCalled();
+    });
+
+    it("does nothing when there is no process to end", () => {
+      const spawnImpl = vi.fn();
+      expect(() => terminateAgentProcess(undefined, "win32", spawnImpl as any)).not.toThrow();
+      expect(spawnImpl).not.toHaveBeenCalled();
     });
   });
 

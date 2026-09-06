@@ -185,19 +185,20 @@ export function selectBinaryTarget(
 /**
  * Turns an npm or PyPI distribution into the command that runs it.
  *
- * On Windows npm installs `npx` as `npx.cmd`; spawning a bare "npx" there
- * looks only for `npx.exe` and fails, so the runner is named explicitly.
+ * The runner is named plainly. What it is called on disk — `npx.cmd` from a
+ * stock npm install, `npx.exe` from a version manager such as Volta — differs
+ * between Windows machines, so the gateway resolves it along PATH when the
+ * time comes to spawn it rather than guessing a suffix here.
  */
 export function packageLaunchSpec(
   kind: "npx" | "uvx",
   distribution: PackageDistribution,
-  platform: string = process.platform,
 ): LaunchSpec {
   // `npx -y` skips the install prompt, which would otherwise block a gateway
   // that nobody is watching.
   const args = kind === "npx" ? ["-y", distribution.package] : [distribution.package];
   return {
-    command: kind === "npx" && platform === "win32" ? "npx.cmd" : kind,
+    command: kind,
     args: [...args, ...(distribution.args ?? [])],
     env: distribution.env,
     kind,
