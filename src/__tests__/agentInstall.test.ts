@@ -370,7 +370,9 @@ describe("agentInstall", () => {
       expect(fetchImpl).not.toHaveBeenCalled();
     });
 
-    it("names npx explicitly on Windows, where a bare npx cannot be spawned", async () => {
+    it("names the runner plainly on Windows, leaving the suffix to be resolved", async () => {
+      // What npx is called on disk varies by how node was installed, so the
+      // gateway looks it up along PATH when it spawns rather than here.
       const spec = await resolveAgentLaunch({
         id: "gemini",
         registry,
@@ -378,7 +380,7 @@ describe("agentInstall", () => {
         platform: "win32",
       });
 
-      expect(spec.command).toBe("npx.cmd");
+      expect(spec.command).toBe("npx");
     });
 
     it("runs PyPI-distributed agents through uvx", async () => {

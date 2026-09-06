@@ -231,7 +231,7 @@ export async function closeSession(
   }
 
   try {
-    session.process?.kill?.();
+    terminateAgentProcess(session.process);
   } catch (err) {
     // Process might already be dead or exited
   }
@@ -312,6 +312,162 @@ export interface OpenAgentConnectionOptions {
 }
 
 /**
+ * Ends an agent process, and on Windows everything it started.
+ *
+ * `kill()` on Windows terminates only the process it is handed. A batch-file
+ * agent runs under a cmd.exe wrapper, and npm runners start the real agent as
+ * a child of their own, so killing what we spawned would leave the agent
+ * itself running with nobody left to talk to it.
+ */
+export function terminateAgentProcess(
+  child: { pid?: number; kill: () => unknown } | undefined,
+  platform: string = process.platform,
+  spawnImpl: typeof spawn = spawn,
+): void {
+  if (!child) return;
+  if (platform !== "win32" || child.pid === undefined) {
+    child.kill();
+    return;
+  }
+  const killer = spawnImpl("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+    stdio: "ignore",
+  });
+  // taskkill is part of Windows, but if it cannot be run the agent should
+  // still go away — even if its own children outlive it.
+  killer.on("error", () => child.kill());
+  killer.unref();
+}
+
+/**
+ * The suffixes a bare Windows command may be found under.
+ *
+ * PATHEXT lists what the shell will append to a name that has no suffix. A
+ * name that already carries one of those suffixes — `npx.cmd`, say — is on
+ * disk under that exact name, so appending to it would only ever miss.
+ */
+function windowsCandidateSuffixes(command: string, env: NodeJS.ProcessEnv): string[] {
+  const pathext = (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
+  const lower = command.toLowerCase();
+  if (pathext.some((ext) => lower.endsWith(ext.toLowerCase()))) return [""];
+  return pathext;
+}
+
+/**
+ * The file a bare command name resolves to along PATH, if any.
+ *
+ * PATHEXT is honoured on Windows, where an executable is rarely named without
+ * a suffix — unless the name already carries one, in which case it is looked
+ * for as written.
+ */
+export function resolveOnPath(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: string = process.platform,
+): string | undefined {
+  const extensions = platform === "win32" ? windowsCandidateSuffixes(command, env) : [""];
+  const separator = platform === "win32" ? ";" : ":";
+  for (const dir of (env.PATH ?? "").split(separator).filter(Boolean)) {
+    for (const ext of extensions) {
+      const candidate = path.join(dir, command + ext);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+/** Whether a command is written as a path rather than a name to look up. */
+function isPathLike(command: string, platform: string): boolean {
+  return command.includes("/") || (platform === "win32" && command.includes("\\"));
+}
+
+/**
+ * The file to actually spawn for a command.
+ *
+ * On Windows the suffix decides whether a shell is needed at all, so a bare
+ * name is resolved along PATH first rather than assumed: a stock npm install
+ * ships `npx` as a batch file, while a version manager such as Volta shims it
+ * as an .exe that can be spawned directly. Elsewhere the name is left alone —
+ * spawn resolves it, and no suffix changes how it starts.
+ */
+export function spawnTarget(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: string = process.platform,
+): string {
+  if (platform !== "win32" || isPathLike(command, platform)) return command;
+  return resolveOnPath(command, env, platform) ?? command;
+}
+
+/**
+ * Whether a command can only be started through a shell.
+ *
+ * A Windows batch file is not an executable, and since the fix for
+ * CVE-2024-27980 (Node 18.20.2 / 20.12.2) `spawn` refuses one outright unless
+ * a shell is asked for. A stock npm install ships its runners as `.cmd`, so
+ * this is where most npm-distributed agents end up.
+ */
+export function needsShell(command: string, platform: string = process.platform): boolean {
+  if (platform !== "win32") return false;
+  const lower = command.toLowerCase();
+  return lower.endsWith(".cmd") || lower.endsWith(".bat");
+}
+
+/**
+ * Characters cmd.exe acts on rather than passes along.
+ *
+ * A caret in front of one makes cmd.exe treat it as text — including a space,
+ * which is how a program name with a space in it survives without quotes.
+ */
+const CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
+
+/**
+ * Escapes the program name for cmd.exe.
+ */
+export function escapeCmdCommand(command: string): string {
+  return command.replace(CMD_META_CHARS, "^$1");
+}
+
+/**
+ * The npm-generated wrappers that re-enter cmd.exe with the arguments they
+ * were given, so that anything escaped for cmd.exe is read a second time.
+ */
+const CMD_SHIM = /node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/i;
+
+/**
+ * Escapes one argument for a command line cmd.exe hands to a batch file.
+ *
+ * The line is parsed twice: cmd.exe reads it, then the program's own argument
+ * parser reads what cmd.exe passed on. So each argument is quoted for the
+ * program (backslash runs before a quote are doubled, per the Windows
+ * command-line rules at https://qntm.org/cmd) and the result is then escaped
+ * for cmd.exe — twice over for a shim that will hand the line to cmd.exe
+ * again. This is the algorithm `cross-spawn` uses, reproduced here rather
+ * than taken as a dependency.
+ */
+export function quoteForCmd(arg: string, doubleEscape = false): string {
+  const quoted = `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
+  const escaped = quoted.replace(CMD_META_CHARS, "^$1");
+  return doubleEscape ? escaped.replace(CMD_META_CHARS, "^$1") : escaped;
+}
+
+/**
+ * The command and arguments to hand `spawn`.
+ *
+ * Everywhere but a Windows shell spawn these are passed through untouched:
+ * `spawn` gives each argument to the child as its own, with no shell in
+ * between to re-split them.
+ */
+export function spawnArgsFor(
+  command: string,
+  args: string[],
+  platform: string = process.platform,
+): [string, string[]] {
+  if (!needsShell(command, platform)) return [command, args];
+  const doubleEscape = CMD_SHIM.test(command);
+  return [escapeCmdCommand(command), args.map((arg) => quoteForCmd(arg, doubleEscape))];
+}
+
+/**
  * Spawns an ACP agent, wires the JSON-RPC streams to it and completes the
  * `initialize` handshake, returning the connection plus what the agent said
  * about itself — including the login methods it advertises.
@@ -327,9 +483,12 @@ export async function openAgentConnection({
   const [cmd, ...cmdArgs] = acpCmdArgs;
   console.error(`[acp] Spawning agent for ${label}: ${cmd} ${cmdArgs.join(" ")}`);
 
-  const agentProcess = spawn(cmd, cmdArgs, {
+  const target = spawnTarget(cmd);
+  if (target !== cmd) console.error(`[acp] Resolved "${cmd}" to ${target}`);
+  const agentProcess = spawn(...spawnArgsFor(target, cmdArgs), {
     stdio: ["pipe", "pipe", "inherit"],
     env: { ...process.env, ...env },
+    shell: needsShell(target),
   });
 
   const acpClient = new AgentRQACPClient(mcpBridge, () => taskId, {
@@ -996,24 +1155,15 @@ export async function resolveAgentCommand(
 /**
  * Whether a command can actually be run.
  *
- * A path is checked directly; a bare name is looked for along PATH, honouring
- * PATHEXT on Windows where an executable is rarely named without a suffix.
+ * A path is checked directly; a bare name is looked for along PATH.
  */
 export function isRunnable(
   command: string,
   env: NodeJS.ProcessEnv = process.env,
   platform: string = process.platform,
 ): boolean {
-  if (command.includes("/") || (platform === "win32" && command.includes("\\"))) {
-    return existsSync(command);
-  }
-  const extensions =
-    platform === "win32" ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";") : [""];
-  const separator = platform === "win32" ? ";" : ":";
-  return (env.PATH ?? "")
-    .split(separator)
-    .filter(Boolean)
-    .some((dir) => extensions.some((ext) => existsSync(path.join(dir, command + ext))));
+  if (isPathLike(command, platform)) return existsSync(command);
+  return resolveOnPath(command, env, platform) !== undefined;
 }
 
 /**
@@ -1143,7 +1293,7 @@ export async function runAgentCommand(
       interactive: isInteractiveTerminal(),
     });
   } finally {
-    agent.process.kill();
+    terminateAgentProcess(agent.process);
   }
 }
 
