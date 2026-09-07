@@ -17,6 +17,7 @@ import {
   createSessionWithAuth,
   isInteractiveTerminal,
   openAgentConnection,
+  DEFAULT_MAX_CONCURRENCY,
   parseGatewayArgs,
   assertAgentRunnable,
   helpText,
@@ -818,9 +819,9 @@ describe("index", () => {
   });
 
   describe("parseGatewayArgs", () => {
-    it("should default to bridging tasks with a concurrency of 2", () => {
+    it("should default to bridging tasks with a concurrency of 1", () => {
       expect(parseGatewayArgs([])).toEqual({
-        maxConcurrency: 2,
+        maxConcurrency: 1,
         permissionTimeoutMs: 30 * 60_000,
         command: "run",
         allowUnverifiedAgent: false,
@@ -850,17 +851,17 @@ describe("index", () => {
     });
 
     it("should keep the default when the concurrency value is missing or not a number", () => {
-      expect(parseGatewayArgs(["--max-concurrency"]).maxConcurrency).toBe(2);
-      expect(parseGatewayArgs(["--max-concurrency", "many"]).maxConcurrency).toBe(2);
+      expect(parseGatewayArgs(["--max-concurrency"]).maxConcurrency).toBe(1);
+      expect(parseGatewayArgs(["--max-concurrency", "many"]).maxConcurrency).toBe(1);
       expect(parseGatewayArgs(["--max-concurrency", "--logout"])).toMatchObject({
-        maxConcurrency: 2,
+        maxConcurrency: 1,
         command: "logout",
       });
     });
 
     it("should read the preferred auth method", () => {
       expect(parseGatewayArgs(["--auth-method", "oauth"])).toMatchObject({
-        maxConcurrency: 2,
+        maxConcurrency: 1,
         command: "run",
         authMethodId: "oauth",
       });
@@ -868,9 +869,9 @@ describe("index", () => {
     });
 
     it("should recognise the auth commands", () => {
-      expect(parseGatewayArgs(["--login"])).toMatchObject({ maxConcurrency: 2, command: "login" });
+      expect(parseGatewayArgs(["--login"])).toMatchObject({ maxConcurrency: 1, command: "login" });
       expect(parseGatewayArgs(["--login", "oauth"])).toMatchObject({
-        maxConcurrency: 2,
+        maxConcurrency: 1,
         command: "login",
         authMethodId: "oauth",
       });
@@ -1202,7 +1203,7 @@ describe("index", () => {
 
   describe("resolveAgentCommand", () => {
     const options = (overrides: Record<string, any> = {}) => ({
-      maxConcurrency: 2,
+      maxConcurrency: 1,
       permissionTimeoutMs: 30 * 60_000,
       command: "run" as const,
       allowUnverifiedAgent: false,
@@ -1464,6 +1465,10 @@ describe("index", () => {
 
     it("should say why an unverified agent is not installed by default", () => {
       expect(helpText()).toMatch(/no way to tell what was downloaded/);
+    });
+
+    it("should document the default concurrency of 1", () => {
+      expect(helpText()).toContain("Defaults to 1.");
     });
   });
 

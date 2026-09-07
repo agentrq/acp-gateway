@@ -988,6 +988,9 @@ export type GatewayCommand =
   | "agent-info"
   | "help";
 
+/** Default maximum number of concurrent tasks allowed to prompt the ACP agent at once. */
+export const DEFAULT_MAX_CONCURRENCY = 1;
+
 export interface GatewayOptions {
   maxConcurrency: number;
   /** How long a tool call waits for a human verdict. 0 waits indefinitely. */
@@ -1011,7 +1014,7 @@ export interface GatewayOptions {
  */
 export function parseGatewayArgs(args: string[]): GatewayOptions {
   const options: GatewayOptions = {
-    maxConcurrency: 2,
+    maxConcurrency: DEFAULT_MAX_CONCURRENCY,
     permissionTimeoutMs: DEFAULT_PERMISSION_TIMEOUT_MS,
     command: "run",
     allowUnverifiedAgent: false,
@@ -1340,7 +1343,7 @@ AUTHENTICATION
 
 BRIDGE
   --max-concurrency <number>  How many tasks may prompt the agent at once.
-                              Defaults to 2.
+                              Defaults to ${DEFAULT_MAX_CONCURRENCY}.
   --permission-timeout <min>  How long a tool call waits for someone to approve
                               it before the turn is cancelled. Defaults to 30.
                               0 waits indefinitely, which is what a wedged
