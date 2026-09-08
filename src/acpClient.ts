@@ -24,36 +24,65 @@ import * as path from "node:path";
 
 /**
  * Identifies a tool call routed through an agentrq MCP server named after a
- * bare workspace id, which is how the workspace hands out its config.
+ * bare workspace id.
  *
- * Kept as a fallback for the shape this recognised before the server's
- * configured name was consulted; `workspaceToolTitlePattern` is what covers
- * the general case.
+ * Matched anywhere in a title, which is looser than the checks below — but it
+ * is the rule every existing deployment already relies on, so it stays exactly
+ * as generous as it was.
  */
 const AGENTRQ_TOOL_PATTERN = /agentrq-[a-zA-Z0-9]{11}/;
 
 /**
- * The `mcp` token an agent puts in the title of an MCP tool call, whichever
- * shape it uses: `mcp__server__tool`, `mcp.server.tool`, or
- * `tool (server MCP Server)`.
+ * An MCP server belonging to agentrq: a bare workspace id today, a slug
+ * tomorrow, so anything starting `agentrq` counts.
  *
- * Required alongside the server name so that merely mentioning the server —
- * a file path under a directory of that name, say — is not mistaken for a
- * call to it.
+ * Being generous about the name is safe because the name alone never grants
+ * auto-approval — the tool it is calling has to be one the workspace itself
+ * advertises.
  */
-const MCP_TOOL_TITLE = /(?:^|[^A-Za-z0-9])mcp(?:[^A-Za-z0-9]|$)/i;
+const AGENTRQ_SERVER = /^agentrq(?:[.\-_][A-Za-z0-9.\-_]*)?$/i;
 
 /**
- * Recognises `server` named as a whole word in a tool-call title.
+ * The tools agentrq's workspace server is known to advertise, used only when
+ * the server has not managed to say for itself.
  *
- * Matching the server this gateway is actually bridged to — rather than
- * guessing at the shape of a workspace id — is what keeps every tool the
- * workspace advertises auto-allowed, including ones added to it after this
- * code was written.
+ * Not the mechanism — `MCPBridge.getAdvertisedTools` is — just a floor, so a
+ * `tools/list` that failed does not turn every workspace call into a question
+ * for the human.
  */
-function workspaceToolTitlePattern(server: string): RegExp {
-  const escaped = server.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?:^|[^A-Za-z0-9])${escaped}(?![A-Za-z0-9])`, "i");
+const KNOWN_WORKSPACE_TOOLS: ReadonlySet<string> = new Set([
+  "reply",
+  "createTask",
+  "getTask",
+  "updateTaskStatus",
+  "getWorkspace",
+  "publishEvent",
+  "downloadAttachment",
+  "elicit",
+  "loadMemory",
+  "saveMemory",
+  "deleteMemory",
+]);
+
+/**
+ * The server and tool an MCP tool-call title names, if it names one.
+ *
+ * Agents each spell this their own way — `mcp__server__tool`,
+ * `mcp.server.tool`, `tool (server MCP Server)` — but all of them put the two
+ * names in fixed positions. Reading the positions, rather than searching the
+ * whole title, is what stops a path under a directory of the same name (or an
+ * argument echoed into the title) from reading as a call to that server.
+ */
+function mcpCallFromTitle(title: string): { server: string; tool: string } | undefined {
+  // `saveMemory (agentrq-workspace MCP Server)`
+  const attributed = /^\s*([A-Za-z0-9_]+)\s*\(\s*([^()\s]+)\s+MCP\b/i.exec(title);
+  if (attributed) return { server: attributed[2], tool: attributed[1] };
+
+  // `mcp__agentrq-workspace__saveMemory`, `mcp.agentrq-workspace.saveMemory`
+  const qualified = /^\s*mcp(__|[.\-])(.+?)\1([A-Za-z0-9_]+)\s*$/i.exec(title);
+  if (qualified) return { server: qualified[2], tool: qualified[3] };
+
+  return undefined;
 }
 
 /** How long to wait for `session/cancel` before settling permissions regardless. */
@@ -167,19 +196,16 @@ export class AgentRQACPClient implements acp.Client {
   private permissionTimeoutMs: number;
   private cancelSession?: (sessionId: string) => unknown;
   private onModeChanged?: (sessionId: string, modeId: string) => unknown;
-  // Recognises the workspace MCP server by the name it is configured under,
-  // built once because the name cannot change for the life of the bridge.
-  private readonly workspaceTitle?: RegExp;
+  // The name the workspace server is configured under. Fixed for the life of
+  // the bridge, so it is read once.
+  private readonly workspaceServer?: string;
 
   constructor(
     private mcpBridge: MCPBridge,
     private getTaskIdForSession: (sessionId: string) => string | undefined = () => undefined,
     options: { permissionTimeoutMs?: number } = {},
   ) {
-    const serverName = this.mcpBridge.getServerName?.();
-    this.workspaceTitle = serverName
-      ? workspaceToolTitlePattern(serverName)
-      : undefined;
+    this.workspaceServer = this.mcpBridge.getServerName?.();
     this.permissionTimeoutMs = options.permissionTimeoutMs ?? DEFAULT_PERMISSION_TIMEOUT_MS;
     this.mcpBridge.on("verdict", this.onVerdict);
     this.mcpBridge.on("reconnected", this.onWorkspaceReconnected);
@@ -644,8 +670,23 @@ export class AgentRQACPClient implements acp.Client {
    */
   private isWorkspaceToolCall(title: string): boolean {
     if (AGENTRQ_TOOL_PATTERN.test(title)) return true;
-    if (!this.workspaceTitle) return false;
-    return MCP_TOOL_TITLE.test(title) && this.workspaceTitle.test(title);
+
+    const call = mcpCallFromTitle(title);
+    if (!call) return false;
+
+    // The server has to be agentrq's — either the one this gateway is bridged
+    // to, or any other agentrq-named one, since the workspace is free to
+    // rename what it hands out.
+    const isOurs =
+      call.server.toLowerCase() === this.workspaceServer?.toLowerCase() ||
+      AGENTRQ_SERVER.test(call.server);
+    if (!isOurs) return false;
+
+    // And the tool has to be one the workspace actually offers. Without this a
+    // server named to look like agentrq's would have its whole surface
+    // approved on the human's behalf.
+    const advertised = this.mcpBridge.getAdvertisedTools?.() ?? KNOWN_WORKSPACE_TOOLS;
+    return advertised.has(call.tool);
   }
 
   /**

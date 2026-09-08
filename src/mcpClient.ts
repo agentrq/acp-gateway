@@ -21,6 +21,8 @@ export class MCPBridge extends EventEmitter {
   // Whether this bridge has ever been connected. A second connection is a
   // reconnection, which matters to anything already waiting on the workspace.
   private hasConnected = false;
+  // What the server said it has, last time it was asked.
+  private advertisedTools?: ReadonlySet<string>;
 
   public getSessionId(): string | undefined {
     return (this.transport as any)?._sessionId;
@@ -35,6 +37,40 @@ export class MCPBridge extends EventEmitter {
    */
   public getServerName(): string {
     return this.config.name;
+  }
+
+  /**
+   * The tools the workspace server says it has, or undefined if it has not
+   * been asked yet.
+   *
+   * Read rather than guessed so that a tool added to the workspace needs no
+   * release here, while a tool name the workspace never advertised is still
+   * refused the auto-approval its own tools get.
+   */
+  public getAdvertisedTools(): ReadonlySet<string> | undefined {
+    return this.advertisedTools;
+  }
+
+  /**
+   * Asks the workspace what it advertises. Called on every connection, since
+   * a reconnect may land on a server that has since gained or lost tools.
+   *
+   * A failure is not fatal: the caller falls back to the tools the workspace
+   * is known to have, so an unanswered `tools/list` costs recognition of a
+   * newly added tool, not of the workspace itself.
+   */
+  private async refreshAdvertisedTools(): Promise<void> {
+    try {
+      const { tools } = await this.client!.listTools();
+      this.advertisedTools = new Set(tools.map((t) => t.name));
+      console.error(
+        `[mcp] ${this.config.name} advertises ${this.advertisedTools.size} tool(s)`,
+      );
+    } catch (err: any) {
+      console.error(
+        `[mcp] Could not list tools on ${this.config.name}: ${err?.message ?? err}`,
+      );
+    }
   }
 
   constructor(private config: McpServerConfig) {
@@ -198,6 +234,8 @@ export class MCPBridge extends EventEmitter {
         this.emit("cancel", { taskId, reason: params.reason });
       },
     );
+
+    await this.refreshAdvertisedTools();
   }
 
   private async ensureConnected() {

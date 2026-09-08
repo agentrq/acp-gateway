@@ -139,6 +139,8 @@ describe("AgentRQACPClient", () => {
         const bridge = Object.assign(new EventEmitter(), {
           getSessionId: vi.fn().mockReturnValue("test-session"),
           getServerName: vi.fn().mockReturnValue(name),
+          // Unasked by default, so the built-in floor is what applies.
+          getAdvertisedTools: vi.fn().mockReturnValue(undefined),
           sendNotification: vi.fn().mockResolvedValue(undefined),
           callTool: vi.fn(),
         });
@@ -218,19 +220,65 @@ describe("AgentRQACPClient", () => {
         );
       });
 
-      it("does not treat a longer server name as the one it is bridged to", async () => {
+      // The workspace is free to rename what it hands out — a slug instead of
+      // a bare id, say — without waiting on a release of the gateway.
+      it.each([
+        "mcp__agentrq-my-team-slug__saveMemory",
+        "mcp__agentrq__loadMemory",
+        "deleteMemory (agentrq-workspace-0an2BXTfpGj MCP Server)",
+      ])("auto-allows an agentrq server named some other way: %s", async (title) => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+
+        const response = await c.requestPermission(ask(title));
+
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((response.outcome as any).optionId).toBe("opt-1");
+      });
+
+      // Being generous about the name is only safe because the name alone
+      // never grants approval: an agentrq-looking server cannot have its whole
+      // surface waved through.
+      it("still asks the human about a tool the workspace does not advertise", async () => {
         const { bridge, client: c } = clientFor("agentrq-workspace");
         setTimeout(() => {
           const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
           bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
         }, 10);
 
-        await c.requestPermission(ask("mcp__agentrq-workspaces__saveMemory"));
+        await c.requestPermission(ask("mcp__agentrq-workspace__deleteRepository"));
 
+        expect(bridge.sendNotification).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({
+            tool_name: "mcp__agentrq-workspace__deleteRepository",
+          }),
+        );
+      });
+
+      // What the server says it has beats any built-in list, so a tool added
+      // to the workspace needs no change here.
+      it("trusts the tools the server says it advertises", async () => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+        bridge.getAdvertisedTools.mockReturnValue(
+          new Set(["reply", "summariseWorkspace"]),
+        );
+
+        const added = await c.requestPermission(
+          ask("mcp__agentrq-workspace__summariseWorkspace"),
+        );
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((added.outcome as any).optionId).toBe("opt-1");
+
+        // And a tool it no longer lists goes back to the human.
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+        await c.requestPermission(ask("mcp__agentrq-workspace__saveMemory"));
         expect(bridge.sendNotification).toHaveBeenCalled();
       });
 
-      it("matches a server name containing regex characters literally", async () => {
+      it("compares a server name with punctuation in it literally", async () => {
         const { bridge, client: c } = clientFor("agentrq.workspace");
 
         const allowed = await c.requestPermission(
@@ -239,12 +287,32 @@ describe("AgentRQACPClient", () => {
         expect(bridge.sendNotification).not.toHaveBeenCalled();
         expect((allowed.outcome as any).optionId).toBe("opt-1");
 
+        // `agentrqXworkspace` is neither the configured name nor an
+        // agentrq-prefixed one, so it is somebody else's server.
         setTimeout(() => {
           const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
           bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
         }, 10);
         await c.requestPermission(ask("mcp__agentrqXworkspace__saveMemory"));
         expect(bridge.sendNotification).toHaveBeenCalled();
+      });
+
+      // A title that echoes its arguments can carry an agentrq-looking path
+      // without being a call to agentrq at all.
+      it("still asks the human when the server name only appears in an argument", async () => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+        const title = "mcp__filesystem__read_file (/home/me/agentrq-notes/x.md)";
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+
+        await c.requestPermission(ask(title));
+
+        expect(bridge.sendNotification).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({ tool_name: title }),
+        );
       });
 
       it("falls back to the bare-workspace-id pattern when the name is unavailable", async () => {
