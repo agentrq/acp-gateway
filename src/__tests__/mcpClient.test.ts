@@ -64,6 +64,15 @@ describe("MCPBridge", () => {
     expect(Client).not.toHaveBeenCalled();
   });
 
+  // The gateway tells the workspace's own tool calls apart by this name, so it
+  // has to be the one the server was configured under, verbatim.
+  it("should report the configured server name", () => {
+    expect(new MCPBridge(config).getServerName()).toBe("agentrq");
+    expect(
+      new MCPBridge({ ...config, name: "agentrq-workspace" }).getServerName(),
+    ).toBe("agentrq-workspace");
+  });
+
   it("should throw error if config has no URL", () => {
     expect(() => new MCPBridge({ name: "fail", type: "http" } as any)).toThrow(
       "has no URL",

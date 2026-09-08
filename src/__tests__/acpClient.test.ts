@@ -133,6 +133,170 @@ describe("AgentRQACPClient", () => {
       expect((response.outcome as any).optionId).toBe("opt-1");
     });
 
+    describe("tools served by the configured workspace server", () => {
+      /** A client bridged to a workspace MCP server configured under `name`. */
+      const clientFor = (name: string) => {
+        const bridge = Object.assign(new EventEmitter(), {
+          getSessionId: vi.fn().mockReturnValue("test-session"),
+          getServerName: vi.fn().mockReturnValue(name),
+          sendNotification: vi.fn().mockResolvedValue(undefined),
+          callTool: vi.fn(),
+        });
+        return {
+          bridge,
+          client: new AgentRQACPClient(bridge as unknown as MCPBridge),
+        };
+      };
+
+      const ask = (title: string) =>
+        ({
+          toolCall: { toolCallId: "req-1", title },
+          options: [
+            { optionId: "opt-1", kind: "allow_once", name: "Allow" },
+            { optionId: "opt-2", kind: "reject_once", name: "Reject" },
+          ],
+        }) as any;
+
+      // The server this repo is configured with: "agentrq-" plus a word, which
+      // the bare-workspace-id pattern never matched, so every workspace tool
+      // was going to the human for approval.
+      it.each([
+        "saveMemory (agentrq-workspace MCP Server)",
+        "mcp__agentrq-workspace__loadMemory",
+        "mcp.agentrq-workspace.deleteMemory",
+        "reply (agentrq-workspace MCP Server)",
+      ])("auto-allows %s", async (title) => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+
+        const response = await c.requestPermission(ask(title));
+
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((response.outcome as any).optionId).toBe("opt-1");
+      });
+
+      it("auto-allows the memory tools on a server named after a bare workspace id", async () => {
+        const { bridge, client: c } = clientFor("agentrq-0an2BXTfpGj");
+
+        const response = await c.requestPermission(
+          ask("mcp__agentrq-0an2BXTfpGj__saveMemory"),
+        );
+
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((response.outcome as any).optionId).toBe("opt-1");
+      });
+
+      it("still asks the human about another server's tools", async () => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+
+        await c.requestPermission(ask("mcp__github__create_issue"));
+
+        expect(bridge.sendNotification).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({ tool_name: "mcp__github__create_issue" }),
+        );
+      });
+
+      // A path that happens to sit under a directory of the same name is not a
+      // call to the workspace, and must not be approved on the human's behalf.
+      it("still asks the human about a tool that merely mentions the server name", async () => {
+        const { bridge, client: c } = clientFor("agentrq");
+        const title = "Read (/src/github.com/agentrq/acp-gateway/src/index.ts)";
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+
+        await c.requestPermission(ask(title));
+
+        expect(bridge.sendNotification).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({ tool_name: title }),
+        );
+      });
+
+      it("does not treat a longer server name as the one it is bridged to", async () => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+
+        await c.requestPermission(ask("mcp__agentrq-workspaces__saveMemory"));
+
+        expect(bridge.sendNotification).toHaveBeenCalled();
+      });
+
+      it("matches a server name containing regex characters literally", async () => {
+        const { bridge, client: c } = clientFor("agentrq.workspace");
+
+        const allowed = await c.requestPermission(
+          ask("mcp__agentrq.workspace__saveMemory"),
+        );
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((allowed.outcome as any).optionId).toBe("opt-1");
+
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+        await c.requestPermission(ask("mcp__agentrqXworkspace__saveMemory"));
+        expect(bridge.sendNotification).toHaveBeenCalled();
+      });
+
+      it("falls back to the bare-workspace-id pattern when the name is unavailable", async () => {
+        const bridge = Object.assign(new EventEmitter(), {
+          getSessionId: vi.fn().mockReturnValue("test-session"),
+          sendNotification: vi.fn().mockResolvedValue(undefined),
+          callTool: vi.fn(),
+        });
+        const c = new AgentRQACPClient(bridge as unknown as MCPBridge);
+
+        const response = await c.requestPermission(
+          ask("saveMemory (agentrq-0an2BXTfpGj MCP Server)"),
+        );
+
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((response.outcome as any).optionId).toBe("opt-1");
+      });
+
+      it("skips a duplicate reply the agent sent through the configured server", async () => {
+        const { bridge } = clientFor("agentrq-workspace");
+        bridge.callTool.mockResolvedValue({ isError: false, content: [] });
+        const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+        const withTask = new AgentRQACPClient(
+          bridge as unknown as MCPBridge,
+          () => "task-123",
+        );
+
+        await withTask.sessionUpdate({
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Hello world" },
+          },
+        } as any);
+        await withTask.sessionUpdate({
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "tool_call",
+            title: "reply (agentrq-workspace MCP Server)",
+            status: "completed",
+            toolCallId: "tc-1",
+            rawInput: { chatId: "task-123", text: "Hello world" },
+          },
+        } as any);
+        await withTask.flushReply("sess-1");
+
+        expect(bridge.callTool).not.toHaveBeenCalledWith("reply", expect.anything());
+        consoleSpy.mockRestore();
+      });
+    });
+
     it("should handle missing tool title", async () => {
       const consoleSpy = vi
         .spyOn(console, "error")

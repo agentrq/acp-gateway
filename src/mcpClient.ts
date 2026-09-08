@@ -26,6 +26,17 @@ export class MCPBridge extends EventEmitter {
     return (this.transport as any)?._sessionId;
   }
 
+  /**
+   * The configured name of the workspace MCP server.
+   *
+   * Agents name an MCP tool call after the server it belongs to, so this is
+   * what lets the gateway tell the workspace's own tool calls apart from
+   * everything else the agent does.
+   */
+  public getServerName(): string {
+    return this.config.name;
+  }
+
   constructor(private config: McpServerConfig) {
     super();
     if (!config.url) {
