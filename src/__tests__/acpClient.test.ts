@@ -1349,6 +1349,73 @@ describe("AgentRQACPClient", () => {
       expect(response.content).toBe("file content");
     });
 
+    describe("line and limit windows", () => {
+      const file = "one\ntwo\nthree\nfour\n";
+
+      beforeEach(() => {
+        vi.mocked(path.resolve).mockReturnValue("/mock/path/file.txt");
+        vi.mocked(fs.readFile).mockResolvedValue(file);
+      });
+
+      const read = (line?: number | null, limit?: number | null) =>
+        client
+          .readTextFile({ path: "file.txt", sessionId: "test-session", line, limit })
+          .then((r) => r.content);
+
+      it("returns the whole file when neither bound is given", async () => {
+        await expect(read()).resolves.toBe(file);
+        await expect(read(null, null)).resolves.toBe(file);
+      });
+
+      it("starts at the 1-based line the agent asked for", async () => {
+        await expect(read(1)).resolves.toBe(file);
+        await expect(read(3)).resolves.toBe("three\nfour\n");
+      });
+
+      it("stops after `limit` lines", async () => {
+        await expect(read(null, 2)).resolves.toBe("one\ntwo\n");
+      });
+
+      it("honours both bounds together", async () => {
+        await expect(read(2, 2)).resolves.toBe("two\nthree\n");
+      });
+
+      it("keeps the last line intact when the file has no trailing newline", async () => {
+        vi.mocked(fs.readFile).mockResolvedValue("one\ntwo\nthree");
+        await expect(read(3, 1)).resolves.toBe("three");
+        await expect(read(2, 5)).resolves.toBe("two\nthree");
+      });
+
+      it("returns nothing when the window starts past the end of the file", async () => {
+        await expect(read(99)).resolves.toBe("");
+        await expect(read(99, 10)).resolves.toBe("");
+      });
+
+      it("returns nothing for a limit of zero or less", async () => {
+        await expect(read(1, 0)).resolves.toBe("");
+        await expect(read(1, -5)).resolves.toBe("");
+      });
+
+      it("clamps a start line below one back to the first line", async () => {
+        await expect(read(0)).resolves.toBe(file);
+        await expect(read(-3, 1)).resolves.toBe("one\n");
+      });
+
+      it("truncates fractional bounds instead of misaligning the window", async () => {
+        await expect(read(2.9, 1.9)).resolves.toBe("two\n");
+      });
+
+      it("ignores bounds that are not usable numbers", async () => {
+        await expect(read(Number.NaN, Number.NaN)).resolves.toBe(file);
+        await expect(read(Number.POSITIVE_INFINITY, 2)).resolves.toBe("one\ntwo\n");
+      });
+
+      it("reads an empty file without complaint", async () => {
+        vi.mocked(fs.readFile).mockResolvedValue("");
+        await expect(read(1, 10)).resolves.toBe("");
+      });
+    });
+
     it("should throw error when reading file fails", async () => {
       vi.mocked(fs.readFile).mockRejectedValue(new Error("read failed"));
       await expect(

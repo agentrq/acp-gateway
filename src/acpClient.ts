@@ -61,6 +61,52 @@ const STOP_REASON_NOTES: Record<string, string> = {
   cancelled: "⚠️ The turn was cancelled before the agent finished.",
 };
 
+/** A line/limit bound the caller left out, or sent as something unusable. */
+function lineBound(value: number | null | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.trunc(value)
+    : undefined;
+}
+
+/**
+ * The window of `content` an ACP `fs/read_text_file` request asked for.
+ *
+ * `line` is a 1-based start line and `limit` a maximum line count; either may
+ * be absent, in which case the window runs from the start of the file, or to
+ * its end. Lines keep the newline they had in the file, so the result is
+ * always an exact substring — reading a whole file returns it byte for byte.
+ *
+ * A `line` past the end of the file yields an empty window rather than an
+ * error: the agent asked what is there, and the answer is nothing.
+ */
+function sliceLines(
+  content: string,
+  line: number | null | undefined,
+  limit: number | null | undefined
+): string {
+  const startLine = lineBound(line);
+  const maxLines = lineBound(limit);
+  if (startLine === undefined && maxLines === undefined) return content;
+
+  let start = 0;
+  for (let i = 1; i < (startLine ?? 1); i++) {
+    const lineEnd = content.indexOf("\n", start);
+    if (lineEnd === -1) return "";
+    start = lineEnd + 1;
+  }
+
+  if (maxLines === undefined) return content.slice(start);
+  if (maxLines <= 0) return "";
+
+  let end = start;
+  for (let i = 0; i < maxLines; i++) {
+    const lineEnd = content.indexOf("\n", end);
+    if (lineEnd === -1) return content.slice(start);
+    end = lineEnd + 1;
+  }
+  return content.slice(start, end);
+}
+
 export class AgentRQACPClient implements acp.Client {
   private replyBuffers = new Map<string, string>();
   // sessionId → reasoning accumulated since the last boundary. Thought tokens
@@ -835,11 +881,15 @@ export class AgentRQACPClient implements acp.Client {
     params: acp.ReadTextFileRequest
   ): Promise<acp.ReadTextFileResponse> {
     const filePath = path.resolve(process.cwd(), params.path);
-    console.error(`[acp] Reading file: ${params.path}`);
-    
+    const window =
+      params.line != null || params.limit != null
+        ? ` (from line ${params.line ?? 1}${params.limit != null ? `, ${params.limit} lines` : ""})`
+        : "";
+    console.error(`[acp] Reading file: ${params.path}${window}`);
+
     try {
       const content = await fs.readFile(filePath, "utf8");
-      return { content };
+      return { content: sliceLines(content, params.line, params.limit) };
     } catch (err: any) {
       console.error(`[acp] Error reading file ${params.path}:`, err.message);
       throw err;

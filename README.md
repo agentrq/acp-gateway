@@ -268,7 +268,7 @@ acp-gateway/
 - **Streaming telemetry**: Reasoning, execution plans and token/cost counters are forwarded on `notifications/claude/channel/telemetry`. Reasoning is batched into one block per boundary (the agent starts answering, calls a tool, or revises its plan) rather than one message per token; plans go out as they change; only the last usage snapshot of a turn is reported. Sends are queued off the ACP stream, so a workspace that is slow or unreachable never stalls the agent.
 - **Registry agents**: `--agent <id>` resolves through the registry index; package distributions are preferred over binaries, and a binary without a published `sha256` is refused unless explicitly allowed.
 - **Authentication**: Login methods come from the `initialize` handshake; an `auth_required` refusal triggers a login and one retry of `newSession`.
-- **File I/O**: `readTextFile` / `writeTextFile` are proxied directly to the filesystem; paths are resolved relative to `process.cwd()`.
+- **File I/O**: `readTextFile` / `writeTextFile` are proxied directly to the filesystem; paths are resolved relative to `process.cwd()`. Reads honour the optional 1-based `line` and `limit` bounds, returning only the requested window of the file.
 
 ## Contributing
 
