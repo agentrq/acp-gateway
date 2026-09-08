@@ -9,6 +9,9 @@ const createMockClient = () => ({
   callTool: vi.fn().mockResolvedValue({ result: "ok" }),
   notification: vi.fn().mockResolvedValue(undefined),
   setNotificationHandler: vi.fn(),
+  listTools: vi
+    .fn()
+    .mockResolvedValue({ tools: [{ name: "reply" }, { name: "saveMemory" }] }),
 });
 
 const createMockTransport = () => ({
@@ -62,6 +65,87 @@ describe("MCPBridge", () => {
     expect(bridge).toBeDefined();
     expect(StreamableHTTPClientTransport).not.toHaveBeenCalled();
     expect(Client).not.toHaveBeenCalled();
+  });
+
+  // The gateway tells the workspace's own tool calls apart by this name, so it
+  // has to be the one the server was configured under, verbatim.
+  it("should report the configured server name", () => {
+    expect(new MCPBridge(config).getServerName()).toBe("agentrq");
+    expect(
+      new MCPBridge({ ...config, name: "agentrq-workspace" }).getServerName(),
+    ).toBe("agentrq-workspace");
+  });
+
+  describe("advertised tools", () => {
+    it("should not claim to know the tool list before connecting", () => {
+      expect(new MCPBridge(config).getAdvertisedTools()).toBeUndefined();
+    });
+
+    it("should read the tool list from the server on connect", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      expect(lastMockClient.listTools).toHaveBeenCalled();
+      expect([...bridge.getAdvertisedTools()!]).toEqual(["reply", "saveMemory"]);
+    });
+
+    // A reconnect can land on a server that has since gained or lost tools.
+    it("should read the list again on a later connection", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      // The workspace has gained a tool by the time the gateway comes back.
+      (Client as any).mockImplementationOnce(function () {
+        lastMockClient = createMockClient();
+        lastMockClient.listTools.mockResolvedValue({
+          tools: [{ name: "reply" }, { name: "loadMemory" }, { name: "saveMemory" }],
+        });
+        return lastMockClient;
+      });
+      (bridge as any).isConnected = false;
+      await bridge.connect();
+
+      expect([...bridge.getAdvertisedTools()!]).toContain("loadMemory");
+    });
+
+    // Losing the list costs recognition of a newly added tool, not the
+    // connection — so it must not throw out of connect().
+    it("should survive a server that will not list its tools", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      (Client as any).mockImplementationOnce(function () {
+        lastMockClient = createMockClient();
+        lastMockClient.listTools.mockRejectedValue(new Error("no tools for you"));
+        return lastMockClient;
+      });
+
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      expect((bridge as any).isConnected).toBe(true);
+      expect(bridge.getAdvertisedTools()).toBeUndefined();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Could not list tools"),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("should report a refusal that is not an Error", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      (Client as any).mockImplementationOnce(function () {
+        lastMockClient = createMockClient();
+        lastMockClient.listTools.mockRejectedValue("tools/list not supported");
+        return lastMockClient;
+      });
+
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      expect(bridge.getAdvertisedTools()).toBeUndefined();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("tools/list not supported"),
+      );
+      consoleSpy.mockRestore();
+    });
   });
 
   it("should throw error if config has no URL", () => {

@@ -133,6 +133,238 @@ describe("AgentRQACPClient", () => {
       expect((response.outcome as any).optionId).toBe("opt-1");
     });
 
+    describe("tools served by the configured workspace server", () => {
+      /** A client bridged to a workspace MCP server configured under `name`. */
+      const clientFor = (name: string) => {
+        const bridge = Object.assign(new EventEmitter(), {
+          getSessionId: vi.fn().mockReturnValue("test-session"),
+          getServerName: vi.fn().mockReturnValue(name),
+          // Unasked by default, so the built-in floor is what applies.
+          getAdvertisedTools: vi.fn().mockReturnValue(undefined),
+          sendNotification: vi.fn().mockResolvedValue(undefined),
+          callTool: vi.fn(),
+        });
+        return {
+          bridge,
+          client: new AgentRQACPClient(bridge as unknown as MCPBridge),
+        };
+      };
+
+      const ask = (title: string) =>
+        ({
+          toolCall: { toolCallId: "req-1", title },
+          options: [
+            { optionId: "opt-1", kind: "allow_once", name: "Allow" },
+            { optionId: "opt-2", kind: "reject_once", name: "Reject" },
+          ],
+        }) as any;
+
+      // The server this repo is configured with: "agentrq-" plus a word, which
+      // the bare-workspace-id pattern never matched, so every workspace tool
+      // was going to the human for approval.
+      it.each([
+        "saveMemory (agentrq-workspace MCP Server)",
+        "mcp__agentrq-workspace__loadMemory",
+        "mcp.agentrq-workspace.deleteMemory",
+        "reply (agentrq-workspace MCP Server)",
+      ])("auto-allows %s", async (title) => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+
+        const response = await c.requestPermission(ask(title));
+
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((response.outcome as any).optionId).toBe("opt-1");
+      });
+
+      it("auto-allows the memory tools on a server named after a bare workspace id", async () => {
+        const { bridge, client: c } = clientFor("agentrq-0an2BXTfpGj");
+
+        const response = await c.requestPermission(
+          ask("mcp__agentrq-0an2BXTfpGj__saveMemory"),
+        );
+
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((response.outcome as any).optionId).toBe("opt-1");
+      });
+
+      it("still asks the human about another server's tools", async () => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+
+        await c.requestPermission(ask("mcp__github__create_issue"));
+
+        expect(bridge.sendNotification).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({ tool_name: "mcp__github__create_issue" }),
+        );
+      });
+
+      // A path that happens to sit under a directory of the same name is not a
+      // call to the workspace, and must not be approved on the human's behalf.
+      it("still asks the human about a tool that merely mentions the server name", async () => {
+        const { bridge, client: c } = clientFor("agentrq");
+        const title = "Read (/src/github.com/agentrq/acp-gateway/src/index.ts)";
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+
+        await c.requestPermission(ask(title));
+
+        expect(bridge.sendNotification).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({ tool_name: title }),
+        );
+      });
+
+      // The workspace is free to rename what it hands out — a slug instead of
+      // a bare id, say — without waiting on a release of the gateway.
+      it.each([
+        "mcp__agentrq-my-team-slug__saveMemory",
+        "mcp__agentrq__loadMemory",
+        "deleteMemory (agentrq-workspace-0an2BXTfpGj MCP Server)",
+      ])("auto-allows an agentrq server named some other way: %s", async (title) => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+
+        const response = await c.requestPermission(ask(title));
+
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((response.outcome as any).optionId).toBe("opt-1");
+      });
+
+      // Being generous about the name is only safe because the name alone
+      // never grants approval: an agentrq-looking server cannot have its whole
+      // surface waved through.
+      it("still asks the human about a tool the workspace does not advertise", async () => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+
+        await c.requestPermission(ask("mcp__agentrq-workspace__deleteRepository"));
+
+        expect(bridge.sendNotification).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({
+            tool_name: "mcp__agentrq-workspace__deleteRepository",
+          }),
+        );
+      });
+
+      // What the server says it has beats any built-in list, so a tool added
+      // to the workspace needs no change here.
+      it("trusts the tools the server says it advertises", async () => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+        bridge.getAdvertisedTools.mockReturnValue(
+          new Set(["reply", "summariseWorkspace"]),
+        );
+
+        const added = await c.requestPermission(
+          ask("mcp__agentrq-workspace__summariseWorkspace"),
+        );
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((added.outcome as any).optionId).toBe("opt-1");
+
+        // And a tool it no longer lists goes back to the human.
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+        await c.requestPermission(ask("mcp__agentrq-workspace__saveMemory"));
+        expect(bridge.sendNotification).toHaveBeenCalled();
+      });
+
+      it("compares a server name with punctuation in it literally", async () => {
+        const { bridge, client: c } = clientFor("agentrq.workspace");
+
+        const allowed = await c.requestPermission(
+          ask("mcp__agentrq.workspace__saveMemory"),
+        );
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((allowed.outcome as any).optionId).toBe("opt-1");
+
+        // `agentrqXworkspace` is neither the configured name nor an
+        // agentrq-prefixed one, so it is somebody else's server.
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+        await c.requestPermission(ask("mcp__agentrqXworkspace__saveMemory"));
+        expect(bridge.sendNotification).toHaveBeenCalled();
+      });
+
+      // A title that echoes its arguments can carry an agentrq-looking path
+      // without being a call to agentrq at all.
+      it("still asks the human when the server name only appears in an argument", async () => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+        const title = "mcp__filesystem__read_file (/home/me/agentrq-notes/x.md)";
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+
+        await c.requestPermission(ask(title));
+
+        expect(bridge.sendNotification).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({ tool_name: title }),
+        );
+      });
+
+      it("falls back to the bare-workspace-id pattern when the name is unavailable", async () => {
+        const bridge = Object.assign(new EventEmitter(), {
+          getSessionId: vi.fn().mockReturnValue("test-session"),
+          sendNotification: vi.fn().mockResolvedValue(undefined),
+          callTool: vi.fn(),
+        });
+        const c = new AgentRQACPClient(bridge as unknown as MCPBridge);
+
+        const response = await c.requestPermission(
+          ask("saveMemory (agentrq-0an2BXTfpGj MCP Server)"),
+        );
+
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((response.outcome as any).optionId).toBe("opt-1");
+      });
+
+      it("skips a duplicate reply the agent sent through the configured server", async () => {
+        const { bridge } = clientFor("agentrq-workspace");
+        bridge.callTool.mockResolvedValue({ isError: false, content: [] });
+        const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+        const withTask = new AgentRQACPClient(
+          bridge as unknown as MCPBridge,
+          () => "task-123",
+        );
+
+        await withTask.sessionUpdate({
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Hello world" },
+          },
+        } as any);
+        await withTask.sessionUpdate({
+          sessionId: "sess-1",
+          update: {
+            sessionUpdate: "tool_call",
+            title: "reply (agentrq-workspace MCP Server)",
+            status: "completed",
+            toolCallId: "tc-1",
+            rawInput: { chatId: "task-123", text: "Hello world" },
+          },
+        } as any);
+        await withTask.flushReply("sess-1");
+
+        expect(bridge.callTool).not.toHaveBeenCalledWith("reply", expect.anything());
+        consoleSpy.mockRestore();
+      });
+    });
+
     it("should handle missing tool title", async () => {
       const consoleSpy = vi
         .spyOn(console, "error")

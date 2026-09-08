@@ -22,8 +22,68 @@ import { extractModels, type AgentModelsResult } from "./models.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-/** Identifies a tool call routed through an agentrq MCP server. */
+/**
+ * Identifies a tool call routed through an agentrq MCP server named after a
+ * bare workspace id.
+ *
+ * Matched anywhere in a title, which is looser than the checks below — but it
+ * is the rule every existing deployment already relies on, so it stays exactly
+ * as generous as it was.
+ */
 const AGENTRQ_TOOL_PATTERN = /agentrq-[a-zA-Z0-9]{11}/;
+
+/**
+ * An MCP server belonging to agentrq: a bare workspace id today, a slug
+ * tomorrow, so anything starting `agentrq` counts.
+ *
+ * Being generous about the name is safe because the name alone never grants
+ * auto-approval — the tool it is calling has to be one the workspace itself
+ * advertises.
+ */
+const AGENTRQ_SERVER = /^agentrq(?:[.\-_][A-Za-z0-9.\-_]*)?$/i;
+
+/**
+ * The tools agentrq's workspace server is known to advertise, used only when
+ * the server has not managed to say for itself.
+ *
+ * Not the mechanism — `MCPBridge.getAdvertisedTools` is — just a floor, so a
+ * `tools/list` that failed does not turn every workspace call into a question
+ * for the human.
+ */
+const KNOWN_WORKSPACE_TOOLS: ReadonlySet<string> = new Set([
+  "reply",
+  "createTask",
+  "getTask",
+  "updateTaskStatus",
+  "getWorkspace",
+  "publishEvent",
+  "downloadAttachment",
+  "elicit",
+  "loadMemory",
+  "saveMemory",
+  "deleteMemory",
+]);
+
+/**
+ * The server and tool an MCP tool-call title names, if it names one.
+ *
+ * Agents each spell this their own way — `mcp__server__tool`,
+ * `mcp.server.tool`, `tool (server MCP Server)` — but all of them put the two
+ * names in fixed positions. Reading the positions, rather than searching the
+ * whole title, is what stops a path under a directory of the same name (or an
+ * argument echoed into the title) from reading as a call to that server.
+ */
+function mcpCallFromTitle(title: string): { server: string; tool: string } | undefined {
+  // `saveMemory (agentrq-workspace MCP Server)`
+  const attributed = /^\s*([A-Za-z0-9_]+)\s*\(\s*([^()\s]+)\s+MCP\b/i.exec(title);
+  if (attributed) return { server: attributed[2], tool: attributed[1] };
+
+  // `mcp__agentrq-workspace__saveMemory`, `mcp.agentrq-workspace.saveMemory`
+  const qualified = /^\s*mcp(__|[.\-])(.+?)\1([A-Za-z0-9_]+)\s*$/i.exec(title);
+  if (qualified) return { server: qualified[2], tool: qualified[3] };
+
+  return undefined;
+}
 
 /** How long to wait for `session/cancel` before settling permissions regardless. */
 const CANCEL_SESSION_TIMEOUT_MS = 5000;
@@ -136,12 +196,16 @@ export class AgentRQACPClient implements acp.Client {
   private permissionTimeoutMs: number;
   private cancelSession?: (sessionId: string) => unknown;
   private onModeChanged?: (sessionId: string, modeId: string) => unknown;
+  // The name the workspace server is configured under. Fixed for the life of
+  // the bridge, so it is read once.
+  private readonly workspaceServer?: string;
 
   constructor(
     private mcpBridge: MCPBridge,
     private getTaskIdForSession: (sessionId: string) => string | undefined = () => undefined,
     options: { permissionTimeoutMs?: number } = {},
   ) {
+    this.workspaceServer = this.mcpBridge.getServerName?.();
     this.permissionTimeoutMs = options.permissionTimeoutMs ?? DEFAULT_PERMISSION_TIMEOUT_MS;
     this.mcpBridge.on("verdict", this.onVerdict);
     this.mcpBridge.on("reconnected", this.onWorkspaceReconnected);
@@ -450,8 +514,8 @@ export class AgentRQACPClient implements acp.Client {
     const toolTitle = params.toolCall.title ?? remembered?.title ?? "Unknown Tool";
     const rawInput = params.toolCall.rawInput ?? remembered?.rawInput;
 
-    // Auto-allow tool calls that contain the pattern: agentrq-<11 chars a-zA-Z0-9>
-    if (AGENTRQ_TOOL_PATTERN.test(toolTitle)) {
+    // Auto-allow the tool calls the workspace itself is serving.
+    if (this.isWorkspaceToolCall(toolTitle)) {
       console.error(`\n🔓 ACP Auto-allowing tool call: ${toolTitle} (ID: ${toolCallId})`);
       const option = params.options.find(o =>
         o.kind.startsWith("allow") ||
@@ -596,6 +660,36 @@ export class AgentRQACPClient implements acp.Client {
   }
 
   /**
+   * Whether a tool call is one the workspace itself is serving.
+   *
+   * These need no human approval — the workspace is where the approval would
+   * be asked, and a call it is serving is already the human's own bookkeeping
+   * (reporting a reply, moving a task on, reading or writing the workspace's
+   * memory). Forwarding them would ask the human to approve the very act of
+   * being asked.
+   */
+  private isWorkspaceToolCall(title: string): boolean {
+    if (AGENTRQ_TOOL_PATTERN.test(title)) return true;
+
+    const call = mcpCallFromTitle(title);
+    if (!call) return false;
+
+    // The server has to be agentrq's — either the one this gateway is bridged
+    // to, or any other agentrq-named one, since the workspace is free to
+    // rename what it hands out.
+    const isOurs =
+      call.server.toLowerCase() === this.workspaceServer?.toLowerCase() ||
+      AGENTRQ_SERVER.test(call.server);
+    if (!isOurs) return false;
+
+    // And the tool has to be one the workspace actually offers. Without this a
+    // server named to look like agentrq's would have its whole surface
+    // approved on the human's behalf.
+    const advertised = this.mcpBridge.getAdvertisedTools?.() ?? KNOWN_WORKSPACE_TOOLS;
+    return advertised.has(call.tool);
+  }
+
+  /**
    * Records what a tool call is, keyed by its id, so that a permission request
    * arriving without a title or input can still be identified. ACP requires a
    * title on the `tool_call` session update but leaves it optional on the
@@ -682,7 +776,7 @@ export class AgentRQACPClient implements acp.Client {
         // Reasoning that explains a tool call belongs in front of it.
         this.queueThoughtFlush(params.sessionId);
         this.rememberToolCall(update);
-        if (update.title && AGENTRQ_TOOL_PATTERN.test(update.title)) {
+        if (update.title && this.isWorkspaceToolCall(update.title)) {
           // Track completed reply calls so flushReply can skip exact duplicates
           if (
             update.status === "completed" &&
