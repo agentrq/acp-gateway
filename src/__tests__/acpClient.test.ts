@@ -2340,15 +2340,19 @@ describe("AgentRQACPClient", () => {
       consoleSpy.mockRestore();
     });
 
-    it("skips the send when the session has no task to attach to", async () => {
+    it("sends even when the session has no task to attach to", async () => {
+      // Unlike the models and commands beside it, this notification is not
+      // about a task: the workspace keys it to the connection and ignores the
+      // task id. Requiring one would keep the workspace ignorant of its agent
+      // for exactly as long as nobody had given it work.
       const consoleSpy = quiet();
       const client = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => undefined);
 
       await client.sendAgentToWorkspace("sess-1", { name: "codex" });
 
-      expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("No task ID for session sess-1"),
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/agent",
+        expect.objectContaining({ task_id: "", session_id: "sess-1", name: "codex" }),
       );
       consoleSpy.mockRestore();
     });
@@ -2363,7 +2367,7 @@ describe("AgentRQACPClient", () => {
       ).resolves.toBeUndefined();
 
       expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to send agent notification for session sess-1:"),
+        expect.stringContaining("Failed to send agent notification:"),
         expect.anything(),
       );
       consoleSpy.mockRestore();

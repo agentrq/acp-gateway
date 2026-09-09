@@ -1270,6 +1270,44 @@ describe("index", () => {
       expect(resolved.env).toEqual({ K: "v" });
     });
 
+    it("reports who the registry says the agent is, before it has been started", async () => {
+      // This is the only name available while the gateway is idle: the agent
+      // itself does not speak until a task starts it, and until then a
+      // workspace can only see the gateway.
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          version: "1.0.0",
+          agents: [
+            {
+              id: "antigravity-acp",
+              name: "Google Antigravity",
+              version: "1.1.1",
+              description: "…",
+              distribution: { npx: { package: "antigravity-acp@1.1.1", args: [] } },
+            },
+          ],
+        }),
+      });
+
+      const resolved = await resolveAgentCommand(
+        options({ agentId: "antigravity-acp" }),
+        [],
+        fetchImpl as any,
+      );
+      errorSpy.mockRestore();
+
+      expect(resolved.identity).toEqual({ name: "Google Antigravity", version: "1.1.1" });
+    });
+
+    it("has no identity to report for a command given after --", async () => {
+      // Nothing named it, so there is nothing to say until the agent does.
+      const resolved = await resolveAgentCommand(options(), ["gemini", "--acp"], vi.fn() as any);
+
+      expect(resolved.identity).toBeUndefined();
+    });
+
     it("should surface a registry id that does not exist", async () => {
       const fetchImpl = vi.fn().mockResolvedValue({
         ok: true,

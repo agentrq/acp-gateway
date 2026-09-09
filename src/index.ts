@@ -96,10 +96,16 @@ import {
   type LoginOptions,
 } from "./auth.js";
 import { resolveAgentLaunch } from "./agentInstall.js";
-import { agentIdentity, describeAgentInfo } from "./agentInfo.js";
+import {
+  agentIdentity,
+  describeAgentInfo,
+  sendAgentIdentity,
+  type AgentIdentity,
+} from "./agentInfo.js";
 import {
   describeAgents,
   fetchRegistry,
+  findAgent,
   hostPlatformTarget,
 } from "./registry.js";
 import {
@@ -1145,7 +1151,7 @@ export async function resolveAgentCommand(
   options: GatewayOptions,
   explicitCommand: string[],
   fetchImpl: typeof fetch = fetch,
-): Promise<{ command: string[]; env?: Record<string, string> }> {
+): Promise<{ command: string[]; env?: Record<string, string>; identity?: AgentIdentity }> {
   if (!options.agentId) return { command: explicitCommand };
 
   const registry = await fetchRegistry(options.registryUrl, fetchImpl);
@@ -1159,7 +1165,16 @@ export async function resolveAgentCommand(
   console.error(
     `[registry] Running "${options.agentId}" via ${spec.kind}: ${spec.command} ${spec.args.join(" ")}`,
   );
-  return { command: [spec.command, ...spec.args], env: spec.env };
+
+  // What the registry says this agent is. Known now, before it has been
+  // started, which is the only reason a workspace can name it while the
+  // gateway is idle — the agent itself does not speak until a task arrives.
+  const entry = findAgent(registry, options.agentId);
+  const identity: AgentIdentity | undefined = entry
+    ? { name: entry.name || entry.id, version: entry.version }
+    : undefined;
+
+  return { command: [spec.command, ...spec.args], env: spec.env, identity };
 }
 
 /**
@@ -1462,6 +1477,15 @@ async function main() {
   }
 
   await mcpBridge.connect();
+
+  // Name the agent as soon as there is somewhere to say it. The agent itself
+  // will not speak until the first task starts it, and until then a workspace
+  // can only see this gateway — so it showed the bridge's name where a human
+  // wanted the agent's. What the registry said is the best answer available
+  // now, and the agent's own word replaces it the moment it has one.
+  if (resolved.identity) {
+    void sendAgentIdentity(mcpBridge, resolved.identity);
+  }
 
   let cleanupPromise: Promise<void> | null = null;
   const cleanup = async (signal?: string) => {
