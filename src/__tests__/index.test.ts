@@ -11,7 +11,11 @@ import {
   mapMcpServers,
   TaskQueue,
   getOrCreateSession,
+  isLoginRefusal,
+  openIdleSession,
+  resetIdleSession,
   activeSessions,
+  IDLE_SESSION_KEY,
   authConfig,
   modelConfig,
   createSessionWithAuth,
@@ -82,6 +86,11 @@ vi.mock("node:child_process", async () => {
   };
 });
 
+/** Lets a test make the next `session/new` fail, e.g. with auth_required. */
+const { newSessionError } = vi.hoisted(() => ({
+  newSessionError: { value: null as unknown },
+}));
+
 vi.mock("@agentclientprotocol/sdk", async () => {
   const actual = await vi.importActual<typeof import("@agentclientprotocol/sdk")>("@agentclientprotocol/sdk");
   return {
@@ -89,7 +98,10 @@ vi.mock("@agentclientprotocol/sdk", async () => {
     ClientSideConnection: vi.fn().mockImplementation(function() {
       return {
         initialize: vi.fn().mockResolvedValue({ protocolVersion: "0.1.0" }),
-        newSession: vi.fn().mockResolvedValue({ sessionId: "test-sess-123" }),
+        newSession: vi.fn().mockImplementation(async () => {
+          if (newSessionError.value) throw newSessionError.value;
+          return { sessionId: "test-sess-123" };
+        }),
         prompt: vi.fn().mockResolvedValue({ stopReason: "complete" }),
       };
     }),
@@ -515,6 +527,8 @@ describe("index", () => {
   describe("getOrCreateSession", () => {
     beforeEach(() => {
       activeSessions.clear();
+      resetIdleSession();
+      newSessionError.value = null;
     });
 
     it("should spawn a new session when not cached", async () => {
@@ -527,6 +541,196 @@ describe("index", () => {
       expect(session).toBeDefined();
       expect(session.sessionId).toBe("test-sess-123");
       expect(activeSessions.has("T-New")).toBe(true);
+    });
+
+    it("files a session opened with no task under the idle key", async () => {
+      // This is the session the gateway opens at startup so a workspace can say
+      // what its agent offers before any work arrives.
+      const mockBridge: any = fakeBridge();
+
+      const session = await getOrCreateSession(undefined, ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(session).toBeDefined();
+      expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(true);
+    });
+
+    it("hands the startup session to the first task rather than opening a second", async () => {
+      // Sessions are keyed by task, so without this the first real task would
+      // spawn a second agent alongside the one already running.
+      const mockBridge: any = fakeBridge();
+
+      const idle = await getOrCreateSession(undefined, ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      const forTask = await getOrCreateSession("T-First", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(forTask).toBe(idle);
+      expect(activeSessions.has("T-First")).toBe(true);
+      expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(false);
+      expect(activeSessions.size).toBe(1);
+    });
+
+    it("attributes what an adopted session reports to the task that took it", async () => {
+      // Everything the session says afterwards — models, commands, replies —
+      // belongs to that task, so the task id has to follow the adoption.
+      const mockBridge: any = fakeBridge();
+
+      const idle = await getOrCreateSession(undefined, ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      mockBridge.sendNotification.mockClear();
+      await getOrCreateSession("T-Owner", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      await idle.acpClient.sendCommandsToWorkspace(idle.sessionId, [{ name: "init", description: "d" }]);
+
+      expect(mockBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/commands",
+        expect.objectContaining({ task_id: "T-Owner" }),
+      );
+    });
+
+    it("gives a second task its own session, having only one to hand over", async () => {
+      const mockBridge: any = fakeBridge();
+
+      await getOrCreateSession(undefined, ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      const first = await getOrCreateSession("T-A", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      const second = await getOrCreateSession("T-B", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(second).not.toBe(first);
+      expect(activeSessions.has("T-A")).toBe(true);
+      expect(activeSessions.has("T-B")).toBe(true);
+    });
+
+    it("opens the idle session at startup", async () => {
+      const mockBridge: any = fakeBridge();
+
+      await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(true);
+    });
+
+    it("never fails when the agent cannot be started", async () => {
+      // The safety property of the whole change: a broken agent used to fail
+      // when the first task arrived, and it still must. Failing at startup
+      // would turn it into a gateway that will not run at all.
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const mockBridge: any = fakeBridge();
+      newSessionError.value = new Error("agent will not start");
+
+      await expect(
+        openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge),
+      ).resolves.toBeUndefined();
+
+      expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(false);
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("the first task will start one"),
+        expect.anything(),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("shuts the gateway down when the agent cannot be authenticated", async () => {
+      // Carrying on would leave the workspace showing a live agent that fails
+      // every task it is given, which is worse than not running at all.
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const mockBridge: any = fakeBridge();
+      const onUnauthenticated = vi.fn();
+      newSessionError.value = { code: -32000, data: { authRequired: true }, message: "auth_required" };
+
+      await openIdleSession(
+        ["node", "agent.js"],
+        [],
+        { env: {} } as any,
+        mockBridge,
+        onUnauthenticated,
+      );
+
+      expect(onUnauthenticated).toHaveBeenCalledOnce();
+      expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(false);
+      // Nothing was claimed about an agent that never started.
+      expect(mockBridge.sendNotification).not.toHaveBeenCalledWith(
+        "notifications/claude/channel/models",
+        expect.anything(),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("says what to do about it, and stops the process", async () => {
+      // The default behaviour, with nothing injected: this is what a human
+      // actually sees when their agent is not logged in.
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const exitSpy = vi
+        .spyOn(process, "exit")
+        .mockImplementation((() => undefined) as never);
+      const mockBridge: any = fakeBridge();
+      newSessionError.value = { code: -32000, data: { authRequired: true }, message: "auth_required" };
+
+      await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(exitSpy).toHaveBeenCalledWith(1);
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("needs you to log in"),
+      );
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Nothing was started"));
+      exitSpy.mockRestore();
+      consoleSpy.mockRestore();
+    });
+
+    it("shuts down when a headless run has no way to log in", async () => {
+      // What `login` throws when there is nobody to ask. Same conclusion: an
+      // agent that cannot authenticate cannot work.
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const mockBridge: any = fakeBridge();
+      const onUnauthenticated = vi.fn();
+      newSessionError.value = new Error(
+        "No usable authentication method. Available:\n  oauth\nTerminal logins need an interactive terminal;",
+      );
+
+      await openIdleSession(
+        ["node", "agent.js"],
+        [],
+        { env: {} } as any,
+        mockBridge,
+        onUnauthenticated,
+      );
+
+      expect(onUnauthenticated).toHaveBeenCalledOnce();
+      consoleSpy.mockRestore();
+    });
+
+    it("keeps running when the agent merely failed to start", async () => {
+      // Not the same thing at all: that may have been a race, it used to fail
+      // when the first task arrived, and it still should.
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const mockBridge: any = fakeBridge();
+      const onUnauthenticated = vi.fn();
+      newSessionError.value = new Error("spawn ENOENT");
+
+      await openIdleSession(
+        ["node", "agent.js"],
+        [],
+        { env: {} } as any,
+        mockBridge,
+        onUnauthenticated,
+      );
+
+      expect(onUnauthenticated).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("the first task will start one"),
+        expect.anything(),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("makes a task wait for a startup session still coming up, rather than starting a second agent", async () => {
+      // Opening one can take a long time when an agent wants a human to log in,
+      // and a task arriving in that window used to find nothing cached.
+      const mockBridge: any = fakeBridge();
+
+      const startup = openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      const forTask = getOrCreateSession("T-Racer", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      await startup;
+      const session = await forTask;
+
+      expect(activeSessions.size).toBe(1);
+      expect(activeSessions.get("T-Racer")).toBe(session);
     });
 
     it("should return cached session when already created", async () => {
@@ -1087,6 +1291,23 @@ describe("index", () => {
       // A run of backslashes before a quote is doubled whole, then the quote
       // gets its own: two backslashes and a quote need five and a quote.
       expect(quoteForCmd('a\\\\"b')).toBe('^"a\\\\\\\\\\^"b^"');
+    });
+
+    it("stays fast on a long run of backslashes", () => {
+      // The two regexes this replaced asked for a run of backslashes followed
+      // by a quote, so a long run with no quote after it was re-tried from
+      // every position in the run. 50k backslashes took long enough to matter;
+      // counting the run once does not care.
+      const run = "\\".repeat(50_000);
+
+      const started = Date.now();
+      const quoted = quoteForCmd(run);
+      const elapsed = Date.now() - started;
+
+      // Untouched, because nothing follows them but the closing quote — which
+      // is exactly the case that doubles them.
+      expect(quoted).toBe(`^"${"\\".repeat(100_000)}^"`);
+      expect(elapsed).toBeLessThan(1_000);
     });
   });
 
@@ -2229,5 +2450,21 @@ describe("index", () => {
         cleanup();
       });
     });
+  });
+});
+
+describe("isLoginRefusal", () => {
+  it("recognises login giving up, which nobody can act on from the gateway", () => {
+    expect(isLoginRefusal(new Error("No usable authentication method. Available:\n  oauth"))).toBe(true);
+    expect(isLoginRefusal(new Error('Unknown authentication method "nope". Available:'))).toBe(true);
+  });
+
+  it("does not mistake an agent falling over for a login problem", () => {
+    // These are survivable; treating them as auth would shut the gateway down
+    // over a transient failure.
+    expect(isLoginRefusal(new Error("spawn ENOENT"))).toBe(false);
+    expect(isLoginRefusal(new Error("socket hang up"))).toBe(false);
+    expect(isLoginRefusal("not an error at all")).toBe(false);
+    expect(isLoginRefusal(undefined)).toBe(false);
   });
 });
