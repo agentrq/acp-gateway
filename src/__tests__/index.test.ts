@@ -55,6 +55,7 @@ import {
   closeAllSessions,
   setupSignalHandlers,
 } from "../index.js";
+import { lastModelsForSession, sendModelsNotification } from "../acpClient.js";
 import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
 
@@ -2228,13 +2229,61 @@ describe("index", () => {
       ).resolves.toBeUndefined();
     });
 
-    it("ignores a notification naming no model", async () => {
-      const { session, setSessionConfigOption } = sessionThatSwitches();
+    it("answers for a session that has already ended", async () => {
+      // The agent exited, taking its client with it, so there is nothing left to
+      // set. The picker is still holding a pending model, so what was last true
+      // for that session goes out over the bridge to release it.
+      const sendNotification = vi.fn().mockResolvedValue(undefined);
+      await sendModelsNotification(
+        { sendNotification } as any,
+        "sess-ended",
+        known,
+      );
+      sendNotification.mockClear();
+
+      await handleSetModel(
+        { sessionId: "sess-ended", configId: "model", modelId: "b" },
+        { sendNotification } as any,
+      );
+
+      expect(sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/models",
+        expect.objectContaining({ session_id: "sess-ended", current_model: "a" }),
+      );
+    });
+
+    it("stays quiet about a set that names no session and matches none", async () => {
+      // With no id and nothing running there is nothing to identify, let alone
+      // report on.
+      const sendNotification = vi.fn().mockResolvedValue(undefined);
+
+      await handleSetModel({ configId: "model", modelId: "b" }, { sendNotification } as any);
+
+      expect(sendNotification).not.toHaveBeenCalled();
+    });
+
+    it("stays quiet about a session it has never heard of", async () => {
+      // Nothing was ever reported for it, so there is no truth to put back and
+      // inventing one would be worse than the silence.
+      const sendNotification = vi.fn().mockResolvedValue(undefined);
+
+      await handleSetModel(
+        { sessionId: "sess-never-seen", configId: "model", modelId: "b" },
+        { sendNotification } as any,
+      );
+
+      expect(sendNotification).not.toHaveBeenCalled();
+    });
+
+    it("answers a notification naming no model instead of ignoring it", async () => {
+      const { session, sendModelsToWorkspace, setSessionConfigOption } = sessionThatSwitches();
       activeSessions.set("task-1", session);
 
       await handleSetModel({ sessionId: "sess-1", configId: "model" });
 
       expect(setSessionConfigOption).not.toHaveBeenCalled();
+      // A malformed notification is still a pending picker on the other end.
+      expect(sendModelsToWorkspace).toHaveBeenCalledWith("sess-1", known);
     });
 
     it("refuses a model the session never advertised, and says what it has", async () => {
@@ -2299,6 +2348,49 @@ describe("index", () => {
           ],
         }),
       );
+    });
+
+    it("puts back the newest report, not the snapshot taken before the set", async () => {
+      // The agent moved to "c" on its own while the set was in flight, and then
+      // refused the set. Reverting to the pre-set snapshot would claim the
+      // session is on "a" — a model it has already left — and, since every
+      // report is recorded, would write that stale list back over the newer one.
+      const fresher = {
+        configId: "model",
+        currentModelId: "c",
+        models: [{ id: "c", name: "Model C", current: true }],
+      };
+      const sendModelsToWorkspace = vi.fn();
+
+      await applyModelSelection({
+        connection: {
+          setSessionConfigOption: vi.fn().mockRejectedValue(new Error("nope")),
+        } as any,
+        acpClient: { sendModelsToWorkspace, lastModelsFor: () => fresher } as any,
+        sessionId: "sess-1",
+        known,
+        requested: "b",
+      });
+
+      expect(sendModelsToWorkspace).toHaveBeenCalledWith("sess-1", fresher);
+    });
+
+    it("falls back to the caller's snapshot when nothing has been reported yet", async () => {
+      // The startup path: --model runs against a session that has not sent a
+      // models notification, so the list from session/new is all there is.
+      const sendModelsToWorkspace = vi.fn();
+
+      await applyModelSelection({
+        connection: {
+          setSessionConfigOption: vi.fn().mockRejectedValue(new Error("nope")),
+        } as any,
+        acpClient: { sendModelsToWorkspace, lastModelsFor: () => undefined } as any,
+        sessionId: "sess-1",
+        known,
+        requested: "b",
+      });
+
+      expect(sendModelsToWorkspace).toHaveBeenCalledWith("sess-1", known);
     });
 
     it("says so rather than guessing when there is no config option to write to", async () => {

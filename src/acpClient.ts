@@ -110,6 +110,81 @@ const CANCEL_SESSION_TIMEOUT_MS = 5000;
  */
 export const DEFAULT_PERMISSION_TIMEOUT_MS = 30 * 60 * 1000;
 
+/**
+ * The last model list reported for each session.
+ *
+ * Kept so a runtime selection that fails can put back what was true. The
+ * workspace marks a chosen model pending and waits for a models notification to
+ * confirm it, so a set that throws would otherwise leave the picker showing a
+ * model the agent never adopted, with nothing ever arriving to correct it.
+ *
+ * Deliberately module-level rather than a field. A set can arrive for a session
+ * whose agent has already exited, and the client instance that served it went
+ * with the process — an instance field would take the only record of what that
+ * session was on with it, leaving the one case that most needs answering unable
+ * to be answered. Session ids are unique, so nothing collides here.
+ *
+ * Written in sendModelsToWorkspace because that is the single point every report
+ * leaves through, which is what keeps this current without a second place to
+ * remember to update.
+ */
+const lastModels = new Map<string, AgentModelsResult>();
+
+/** What was last reported for a session, from anywhere, including after it ends. */
+export function lastModelsForSession(sessionId: string): AgentModelsResult | undefined {
+  return lastModels.get(sessionId);
+}
+
+/**
+ * Sends a session's model list to the workspace.
+ *
+ * Standalone, like sendAgentIdentity, because the caller that needs it most has
+ * no client left to call a method on: a set_model for a session that has ended
+ * still has to be answered, and only the bridge survives that.
+ *
+ * Never throws: this is an interface update, and a workspace that cannot take it
+ * right now must not cost the agent anything.
+ */
+export async function sendModelsNotification(
+  bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
+  sessionId: string,
+  modelsResult: AgentModelsResult,
+  taskId?: string,
+): Promise<void> {
+  lastModels.set(sessionId, modelsResult);
+  const payload = {
+    // No task required. The workspace keys this to the MCP connection it
+    // arrived on and ignores the task id, so refusing to send without one only
+    // kept a workspace ignorant of its agent until somebody gave it work —
+    // which is exactly when a human is looking at it.
+    task_id: taskId ?? "",
+    session_id: sessionId,
+    config_id: modelsResult.configId,
+    current_model: modelsResult.currentModelId,
+    models: modelsResult.models,
+    // This gateway acts on a set_model notification, and says so.
+    //
+    // The workspace cannot infer it: every gateway ever published reports its
+    // models, and the ones before this release ignore being told to change
+    // one. Nor can it be read off the client name, which is "acp-gateway"
+    // either way — the question is about the version, not the identity. So
+    // the capability is declared here, absence means no, and older gateways
+    // stay read-only without knowing this field exists.
+    can_set: true,
+  };
+  try {
+    await bridge.sendNotification("notifications/claude/channel/models", payload);
+    console.error(
+      `[acp] Shared ${modelsResult.models.length} supported model(s) with workspace (current: ${modelsResult.currentModelId ?? "none"})`,
+    );
+  } catch (err) {
+    console.error(
+      `[acp] Failed to send models notification for session ${sessionId}:`,
+      err,
+    );
+  }
+}
+
 /** A permission request that has been sent to agentrq and has no verdict yet. */
 interface PendingPermission {
   /** Exactly what was sent, kept so it can be re-sent if the session changes. */
@@ -201,19 +276,6 @@ export class AgentRQACPClient implements acp.Client {
   // verdict, so every unanswered request leaked one for the life of the process.
   private pendingPermissions = new Map<string, PendingPermission>();
 
-  /**
-   * The last model list reported for each session.
-   *
-   * Kept so a runtime selection that fails can put back what was true. The
-   * workspace marks a chosen model pending and waits for this notification to
-   * confirm it, so a set that throws would otherwise leave the picker showing a
-   * model the agent never adopted, with nothing ever arriving to correct it.
-   *
-   * Written in sendModelsToWorkspace because that is the single point every
-   * report leaves through, which is what keeps this current without a second
-   * place to remember to update.
-   */
-  private lastModels = new Map<string, AgentModelsResult>();
   private permissionTimeoutMs: number;
   private cancelSession?: (sessionId: string) => unknown;
   private onModeChanged?: (sessionId: string, modeId: string) => unknown;
@@ -826,7 +888,7 @@ export class AgentRQACPClient implements acp.Client {
 
   /** What was last reported for a session, for putting back after a failed set. */
   lastModelsFor(sessionId: string): AgentModelsResult | undefined {
-    return this.lastModels.get(sessionId);
+    return lastModelsForSession(sessionId);
   }
 
   handleConfigOptionUpdate(
@@ -849,41 +911,12 @@ export class AgentRQACPClient implements acp.Client {
     sessionId: string,
     modelsResult: AgentModelsResult,
   ): Promise<void> {
-    // No task required. The workspace keys this to the MCP connection it
-    // arrived on and ignores the task id, so refusing to send without one only
-    // kept a workspace ignorant of its agent until somebody gave it work —
-    // which is exactly when a human is looking at it.
-    this.lastModels.set(sessionId, modelsResult);
-    const payload = {
-      task_id: this.getTaskIdForSession(sessionId) ?? "",
-      session_id: sessionId,
-      config_id: modelsResult.configId,
-      current_model: modelsResult.currentModelId,
-      models: modelsResult.models,
-      // This gateway acts on a set_model notification, and says so.
-      //
-      // The workspace cannot infer it: every gateway ever published reports its
-      // models, and the ones before this release ignore being told to change
-      // one. Nor can it be read off the client name, which is "acp-gateway"
-      // either way — the question is about the version, not the identity. So
-      // the capability is declared here, absence means no, and older gateways
-      // stay read-only without knowing this field exists.
-      can_set: true,
-    };
-    try {
-      await this.mcpBridge.sendNotification(
-        "notifications/claude/channel/models",
-        payload,
-      );
-      console.error(
-        `[acp] Shared ${modelsResult.models.length} supported model(s) with workspace (current: ${modelsResult.currentModelId ?? "none"})`,
-      );
-    } catch (err) {
-      console.error(
-        `[acp] Failed to send models notification for session ${sessionId}:`,
-        err,
-      );
-    }
+    await sendModelsNotification(
+      this.mcpBridge,
+      sessionId,
+      modelsResult,
+      this.getTaskIdForSession(sessionId),
+    );
   }
 
   /**
