@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { describeAgentInfo } from "../agentInfo.js";
+import {
+  AGENT_NOTIFICATION_METHOD,
+  agentIdentity,
+  describeAgentInfo,
+} from "../agentInfo.js";
 
 /** A minimal initialize response, with only what a test cares about set. */
 function initResult(overrides: Record<string, unknown> = {}): any {
@@ -119,3 +123,39 @@ describe("describeAgentInfo", () => {
     expect(text).toContain("http  no");
   });
 });
+
+describe('agentIdentity', () => {
+  it("takes the agent's own name for itself", () => {
+    expect(
+      agentIdentity({ agentInfo: { name: 'codex', title: 'Codex CLI', version: '1.10.0' } } as any, 'npx codex-acp')
+    ).toEqual({ name: 'codex', title: 'Codex CLI', version: '1.10.0' })
+  })
+
+  it('drops a title that merely repeats the name', () => {
+    // So a caller rendering both does not print the same word twice.
+    expect(agentIdentity({ agentInfo: { name: 'codex', title: 'codex' } } as any, 'x')).toEqual({
+      name: 'codex',
+    })
+  })
+
+  it('falls back to how the agent was launched when it says nothing', () => {
+    // ACP leaves agentInfo optional. The launch command is the only name
+    // available, and it is better than none.
+    expect(agentIdentity({} as any, 'npx some-acp-agent')).toEqual({ name: 'npx some-acp-agent' })
+    expect(agentIdentity({ agentInfo: {} } as any, 'launched-as')).toEqual({ name: 'launched-as' })
+    expect(agentIdentity({ agentInfo: { name: '   ' } } as any, 'launched-as')).toEqual({
+      name: 'launched-as',
+    })
+  })
+
+  it('leaves out the parts the agent did not give', () => {
+    expect(agentIdentity({ agentInfo: { name: 'gemini' } } as any, 'x')).toEqual({ name: 'gemini' })
+    expect(
+      agentIdentity({ agentInfo: { name: 'gemini', title: '  ', version: '  ' } } as any, 'x')
+    ).toEqual({ name: 'gemini' })
+  })
+
+  it('publishes the channel the workspace listens on', () => {
+    expect(AGENT_NOTIFICATION_METHOD).toBe('notifications/claude/channel/agent')
+  })
+})

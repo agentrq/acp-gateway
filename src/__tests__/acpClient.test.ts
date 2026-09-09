@@ -2299,4 +2299,74 @@ describe("AgentRQACPClient", () => {
       consoleSpy.mockRestore();
     });
   });
+  describe("sendAgentToWorkspace", () => {
+    function quiet() {
+      return vi.spyOn(console, "error").mockImplementation(() => {});
+    }
+
+    it("tells the workspace which agent is behind the gateway", async () => {
+      const consoleSpy = quiet();
+      const client = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+
+      await client.sendAgentToWorkspace("sess-1", {
+        name: "codex",
+        title: "Codex CLI",
+        version: "1.10.0",
+      });
+
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/agent",
+        {
+          task_id: "task-123",
+          session_id: "sess-1",
+          name: "codex",
+          title: "Codex CLI",
+          version: "1.10.0",
+        },
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("sends the name alone when that is all the agent gave", async () => {
+      const consoleSpy = quiet();
+      const client = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+
+      await client.sendAgentToWorkspace("sess-1", { name: "gemini" });
+
+      const payload = mcpBridge.sendNotification.mock.calls.at(-1)?.[1];
+      expect(payload).toMatchObject({ name: "gemini" });
+      expect(payload.title).toBeUndefined();
+      expect(payload.version).toBeUndefined();
+      consoleSpy.mockRestore();
+    });
+
+    it("skips the send when the session has no task to attach to", async () => {
+      const consoleSpy = quiet();
+      const client = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => undefined);
+
+      await client.sendAgentToWorkspace("sess-1", { name: "codex" });
+
+      expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("No task ID for session sess-1"),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("does not let a failed send stall the agent's turn", async () => {
+      const consoleSpy = quiet();
+      mcpBridge.sendNotification.mockRejectedValueOnce(new Error("workspace unreachable"));
+      const client = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+
+      await expect(
+        client.sendAgentToWorkspace("sess-1", { name: "codex" }),
+      ).resolves.toBeUndefined();
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to send agent notification for session sess-1:"),
+        expect.anything(),
+      );
+      consoleSpy.mockRestore();
+    });
+  });
 });

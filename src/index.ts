@@ -96,7 +96,7 @@ import {
   type LoginOptions,
 } from "./auth.js";
 import { resolveAgentLaunch } from "./agentInstall.js";
-import { describeAgentInfo } from "./agentInfo.js";
+import { agentIdentity, describeAgentInfo } from "./agentInfo.js";
 import {
   describeAgents,
   fetchRegistry,
@@ -625,6 +625,13 @@ export async function getOrCreateSession(
     interactive: isInteractiveTerminal(),
   });
   console.error(`[acp] Created session ${sessionResult.sessionId} for task ${key}`);
+
+  // Tell the workspace which agent this actually is. Its MCP client is this
+  // gateway, so without this the workspace can only ever name the bridge.
+  void acpClient.sendAgentToWorkspace(
+    sessionResult.sessionId,
+    agentIdentity(initResult, acpCmdArgs.join(" ")),
+  );
 
   try {
     const modelsResult = extractModels(sessionResult.configOptions);
