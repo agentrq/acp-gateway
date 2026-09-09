@@ -489,9 +489,42 @@ const CMD_SHIM = /node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/i;
  * than taken as a dependency.
  */
 export function quoteForCmd(arg: string, doubleEscape = false): string {
-  const quoted = `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
+  const quoted = `"${escapeBackslashesAndQuotes(arg)}"`;
   const escaped = quoted.replace(CMD_META_CHARS, "^$1");
   return doubleEscape ? escaped.replace(CMD_META_CHARS, "^$1") : escaped;
+}
+
+/**
+ * Applies the Windows argument rule: a run of backslashes is doubled when a
+ * quote (or the closing quote) follows it, and left alone otherwise, and a
+ * literal quote is escaped.
+ *
+ * Written as a single pass rather than the two regexes this used to use.
+ * `/(\\*)"/g` asks the engine to match a run of backslashes and then a quote,
+ * so a long run with no quote after it is re-tried from every position in the
+ * run — quadratic in the length of the run, which is the sort of thing an
+ * argument can carry. Counting the run once cannot do that, and says the rule
+ * more plainly than the regex did.
+ */
+function escapeBackslashesAndQuotes(arg: string): string {
+  let out = "";
+  let slashes = 0;
+  for (const ch of arg) {
+    if (ch === "\\") {
+      slashes++;
+      continue;
+    }
+    if (ch === '"') {
+      // The run escapes the quote we are about to add rather than the one in
+      // the argument, so it has to survive as literal backslashes: double it.
+      out += "\\".repeat(slashes * 2) + '\\"';
+    } else {
+      out += "\\".repeat(slashes) + ch;
+    }
+    slashes = 0;
+  }
+  // Whatever is left runs into the closing quote, so it is doubled too.
+  return out + "\\".repeat(slashes * 2);
 }
 
 /**

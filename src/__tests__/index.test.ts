@@ -1292,6 +1292,23 @@ describe("index", () => {
       // gets its own: two backslashes and a quote need five and a quote.
       expect(quoteForCmd('a\\\\"b')).toBe('^"a\\\\\\\\\\^"b^"');
     });
+
+    it("stays fast on a long run of backslashes", () => {
+      // The two regexes this replaced asked for a run of backslashes followed
+      // by a quote, so a long run with no quote after it was re-tried from
+      // every position in the run. 50k backslashes took long enough to matter;
+      // counting the run once does not care.
+      const run = "\\".repeat(50_000);
+
+      const started = Date.now();
+      const quoted = quoteForCmd(run);
+      const elapsed = Date.now() - started;
+
+      // Untouched, because nothing follows them but the closing quote — which
+      // is exactly the case that doubles them.
+      expect(quoted).toBe(`^"${"\\".repeat(100_000)}^"`);
+      expect(elapsed).toBeLessThan(1_000);
+    });
   });
 
   describe("spawnArgsFor", () => {
