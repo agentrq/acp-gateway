@@ -742,6 +742,10 @@ export async function getOrCreateSession(
     if (idle) {
       idle.adopt(taskId);
       console.error(`[acp] Task ${taskId} took over the session opened at startup`);
+      const lastModels = idle.acpClient.lastModelsFor(idle.sessionId);
+      if (lastModels) {
+        void idle.acpClient.sendModelsToWorkspace(idle.sessionId, lastModels);
+      }
       return idle;
     }
   }

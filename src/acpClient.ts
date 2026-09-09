@@ -152,16 +152,41 @@ export async function sendModelsNotification(
   taskId?: string,
 ): Promise<void> {
   lastModels.set(sessionId, modelsResult);
+  const serializedModels = modelsResult.models.map((m) => {
+    const isCurrent = m.current ?? false;
+    return {
+      ...m,
+      id: m.id,
+      model_id: m.model_id ?? m.id,
+      modelId: m.modelId ?? m.id,
+      value: m.value ?? m.id,
+      name: m.name,
+      label: m.label ?? m.name,
+      title: m.title ?? m.name,
+      description: m.description,
+      current: isCurrent,
+      is_current: m.is_current ?? isCurrent,
+      isCurrent: m.isCurrent ?? isCurrent,
+    };
+  });
   const payload = {
     // No task required. The workspace keys this to the MCP connection it
     // arrived on and ignores the task id, so refusing to send without one only
     // kept a workspace ignorant of its agent until somebody gave it work —
     // which is exactly when a human is looking at it.
     task_id: taskId ?? "",
+    taskId: taskId ?? "",
     session_id: sessionId,
+    sessionId: sessionId,
     config_id: modelsResult.configId,
+    configId: modelsResult.configId,
     current_model: modelsResult.currentModelId,
-    models: modelsResult.models,
+    currentModel: modelsResult.currentModelId,
+    current_model_id: modelsResult.currentModelId,
+    currentModelId: modelsResult.currentModelId,
+    models: serializedModels,
+    available_models: serializedModels,
+    availableModels: serializedModels,
     // This gateway acts on a set_model notification, and says so.
     //
     // The workspace cannot infer it: every gateway ever published reports its
@@ -171,6 +196,7 @@ export async function sendModelsNotification(
     // the capability is declared here, absence means no, and older gateways
     // stay read-only without knowing this field exists.
     can_set: true,
+    canSet: true,
   };
   try {
     await bridge.sendNotification("notifications/claude/channel/models", payload);

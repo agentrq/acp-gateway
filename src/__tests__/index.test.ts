@@ -593,6 +593,29 @@ describe("index", () => {
       );
     });
 
+    it("re-advertises known models with the adopted task id when taken over", async () => {
+      const mockBridge: any = fakeBridge();
+
+      const idle = await getOrCreateSession(undefined, ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      await idle.acpClient.sendModelsToWorkspace(idle.sessionId, {
+        configId: "model",
+        currentModelId: "m1",
+        models: [{ id: "m1", name: "Model 1", current: true }],
+      });
+      mockBridge.sendNotification.mockClear();
+
+      await getOrCreateSession("T-Adopt", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(mockBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/models",
+        expect.objectContaining({
+          task_id: "T-Adopt",
+          session_id: idle.sessionId,
+          current_model: "m1",
+        }),
+      );
+    });
+
     it("gives a second task its own session, having only one to hand over", async () => {
       const mockBridge: any = fakeBridge();
 

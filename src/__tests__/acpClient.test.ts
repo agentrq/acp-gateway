@@ -2127,19 +2127,84 @@ describe("AgentRQACPClient", () => {
 
       expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
         "notifications/claude/channel/models",
-        {
+        expect.objectContaining({
           task_id: "task-sess-1",
           session_id: "sess-1",
           config_id: "model",
           current_model: "claude-3-7-sonnet",
           models: [
-            { id: "claude-3-7-sonnet", name: "Claude 3.7 Sonnet", current: true },
-            { id: "claude-3-5-haiku", name: "Claude 3.5 Haiku", current: false },
+            expect.objectContaining({
+              id: "claude-3-7-sonnet",
+              model_id: "claude-3-7-sonnet",
+              name: "Claude 3.7 Sonnet",
+              current: true,
+            }),
+            expect.objectContaining({
+              id: "claude-3-5-haiku",
+              model_id: "claude-3-5-haiku",
+              name: "Claude 3.5 Haiku",
+              current: false,
+            }),
           ],
-          // Declared on every report: the workspace offers a picker only where
-          // it sees this, and cannot infer it from the models being present.
+          available_models: expect.any(Array),
           can_set: true,
-        },
+        }),
+      );
+    });
+
+    it("includes wire format aliases (model_id, modelId, value, available_models) in models payload", async () => {
+      const c = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        (sessionId: string) => `task-${sessionId}`,
+      );
+
+      await c.sendModelsToWorkspace("sess-test", {
+        configId: "model",
+        currentModelId: "gpt-4",
+        models: [
+          { id: "gpt-4", name: "GPT-4", current: true, description: "Smart" },
+          { id: "gpt-3.5", name: "GPT-3.5", current: false },
+        ],
+      });
+
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/models",
+        expect.objectContaining({
+          task_id: "task-sess-test",
+          session_id: "sess-test",
+          config_id: "model",
+          current_model: "gpt-4",
+          current_model_id: "gpt-4",
+          can_set: true,
+          models: [
+            expect.objectContaining({
+              id: "gpt-4",
+              model_id: "gpt-4",
+              modelId: "gpt-4",
+              value: "gpt-4",
+              name: "GPT-4",
+              label: "GPT-4",
+              title: "GPT-4",
+              current: true,
+              is_current: true,
+              isCurrent: true,
+            }),
+            expect.objectContaining({
+              id: "gpt-3.5",
+              model_id: "gpt-3.5",
+              modelId: "gpt-3.5",
+              value: "gpt-3.5",
+              name: "GPT-3.5",
+              label: "GPT-3.5",
+              title: "GPT-3.5",
+              current: false,
+              is_current: false,
+              isCurrent: false,
+            }),
+          ],
+          available_models: expect.any(Array),
+          availableModels: expect.any(Array),
+        }),
       );
     });
 
