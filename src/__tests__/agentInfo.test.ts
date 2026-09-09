@@ -1,8 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   AGENT_NOTIFICATION_METHOD,
   agentIdentity,
   describeAgentInfo,
+  sendAgentIdentity,
 } from "../agentInfo.js";
 
 /** A minimal initialize response, with only what a test cares about set. */
@@ -158,4 +159,40 @@ describe('agentIdentity', () => {
   it('publishes the channel the workspace listens on', () => {
     expect(AGENT_NOTIFICATION_METHOD).toBe('notifications/claude/channel/agent')
   })
+})
+
+describe('sendAgentIdentity', () => {
+  const bridge = () => ({ sendNotification: vi.fn().mockResolvedValue(undefined) });
+
+  it('names the agent with no task and no session, which is how startup sends it', async () => {
+    // The workspace keys this to the connection it arrived on, so neither id is
+    // needed — and requiring one is what would keep a workspace ignorant of its
+    // agent until somebody gave it work.
+    const b = bridge();
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await sendAgentIdentity(b as any, { name: 'Google Antigravity', version: '1.1.1' });
+
+    expect(b.sendNotification).toHaveBeenCalledWith('notifications/claude/channel/agent', {
+      task_id: '',
+      session_id: '',
+      name: 'Google Antigravity',
+      title: undefined,
+      version: '1.1.1',
+    });
+    quiet.mockRestore();
+  });
+
+  it('never throws, so a workspace that cannot take it costs the agent nothing', async () => {
+    const b = { sendNotification: vi.fn().mockRejectedValue(new Error('unreachable')) };
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(sendAgentIdentity(b as any, { name: 'codex' })).resolves.toBeUndefined();
+
+    expect(quiet).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to send agent notification:'),
+      expect.anything(),
+    );
+    quiet.mockRestore();
+  });
 })
