@@ -16,6 +16,7 @@ import {
   activeSessions,
   AuthenticationFailed,
   IDLE_SESSION_KEY,
+  loginCommandFor,
   authConfig,
   modelConfig,
   createSessionWithAuth,
@@ -665,7 +666,9 @@ describe("index", () => {
       const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
 
       expect(outcome).toBe("unauthenticated");
-      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Log in and run acp-gateway again"));
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("npx @agentrq/acp-gateway@latest --login"),
+      );
       consoleSpy.mockRestore();
     });
 
@@ -684,7 +687,7 @@ describe("index", () => {
         expect.stringContaining("expecting a credential of its own"),
       );
       expect(consoleSpy).not.toHaveBeenCalledWith(
-        expect.stringContaining("Log in and run acp-gateway again."),
+        expect.stringContaining("--login"),
       );
       consoleSpy.mockRestore();
     });
@@ -702,6 +705,7 @@ describe("index", () => {
         [],
         { env: {} } as any,
         mockBridge,
+        loginCommandFor("some-agent"),
         20,
       );
 
@@ -2462,5 +2466,23 @@ describe("index", () => {
         cleanup();
       });
     });
+  });
+});
+
+describe("loginCommandFor", () => {
+  it("names the agent, so nobody has to work the command out", () => {
+    expect(loginCommandFor("antigravity-acp")).toBe(
+      "npx @agentrq/acp-gateway@latest --login --agent antigravity-acp",
+    );
+  });
+
+  it("repeats the command after -- when no registry id named the agent", () => {
+    expect(loginCommandFor(undefined, ["node", "my-agent.js"])).toBe(
+      "npx @agentrq/acp-gateway@latest --login -- node my-agent.js",
+    );
+  });
+
+  it("falls back to the bare command when nothing identifies the agent", () => {
+    expect(loginCommandFor()).toBe("npx @agentrq/acp-gateway@latest --login");
   });
 });

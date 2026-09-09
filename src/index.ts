@@ -895,9 +895,13 @@ export async function openIdleSession(
   configs: McpServerConfig[],
   agentrqConfig: McpServerConfig,
   mcpBridge: MCPBridge,
+  loginCommand: string = loginCommandFor(),
   timeoutMs: number = IDLE_SESSION_TIMEOUT_MS,
 ): Promise<IdleSessionOutcome> {
   try {
+    // Cleared when the session itself settles rather than when this returns:
+    // after a timeout the session is still coming, and a task that arrives
+    // meanwhile should still wait for it instead of starting a second agent.
     idleSessionInFlight = getOrCreateSession(
       undefined,
       acpCmdArgs,
@@ -905,6 +909,10 @@ export async function openIdleSession(
       agentrqConfig,
       mcpBridge,
     );
+    const settled = idleSessionInFlight;
+    void settled.catch(() => {}).finally(() => {
+      if (idleSessionInFlight === settled) idleSessionInFlight = null;
+    });
     // Bounded: nothing reaches the workspace until this settles, so an agent
     // that spawns and then never answers its handshake would otherwise take the
     // whole gateway down with it — a worse failure than the one being fixed,
@@ -934,13 +942,14 @@ export async function openIdleSession(
         err instanceof AuthenticationFailed && !err.hasLogin
           ? `It offers no way to log in through acp-gateway, so it is expecting a credential ` +
             `of its own — an API key in the environment, or whatever its own documentation ` +
-            `asks for. Set that and run acp-gateway again.`
-          : `Log in and run acp-gateway again.`;
+            `asks for. Set that and start acp-gateway again.`
+          : `Log in with:\n\n    ${loginCommand}\n\nthen start acp-gateway again.`;
       console.error(
         `\n[acp-gateway] The agent will not start a session until it is authenticated: ` +
           `${err instanceof Error ? err.message : String(err)}\n` +
-          `Nothing was started. ${remedy} Carrying on would leave the workspace showing a ` +
-          `live agent that fails every task it is given.`,
+          `Nothing was started. ${remedy}\n` +
+          `Carrying on would leave the workspace showing a live agent that fails every task ` +
+          `it is given.`,
       );
       return "unauthenticated";
     }
@@ -950,9 +959,25 @@ export async function openIdleSession(
       err instanceof Error ? err.message : String(err),
     );
     return "unknown";
-  } finally {
-    idleSessionInFlight = null;
   }
+}
+
+/**
+ * The command that logs this agent in, so the message can name it rather than
+ * leave someone to work it out.
+ *
+ * Built from how the gateway itself was started: the registry id when there was
+ * one, and otherwise the command after `--`, since that is the only handle on
+ * an agent nobody named.
+ */
+export function loginCommandFor(
+  agentId?: string,
+  agentCommand: string[] = [],
+): string {
+  const base = "npx @agentrq/acp-gateway@latest --login";
+  if (agentId) return `${base} --agent ${agentId}`;
+  if (agentCommand.length) return `${base} -- ${agentCommand.join(" ")}`;
+  return base;
 }
 
 /**
@@ -964,8 +989,21 @@ export async function openIdleSession(
  */
 export type IdleSessionOutcome = "ready" | "unknown" | "unauthenticated";
 
-/** How long to wait for an agent to open its first session. */
-export const IDLE_SESSION_TIMEOUT_MS = 60_000;
+/**
+ * How long to wait for an agent to open its first session.
+ *
+ * Generous because the wait includes starting the agent, and an `npx`
+ * distribution downloads its package the first time it is spawned — a cold
+ * install of a large one on a slow line is minutes, not seconds. (A registry
+ * *binary* is already on disk by now: that download happens while the launch
+ * command is being resolved, before any of this.)
+ *
+ * Erring long costs little. A session that arrives after the deadline is still
+ * recorded, still reports what the agent offers, and is still adopted by the
+ * first task — the timeout only decides how long the gateway waits before
+ * connecting to the workspace without knowing those things yet.
+ */
+export const IDLE_SESSION_TIMEOUT_MS = 5 * 60_000;
 
 
 
@@ -1855,7 +1893,13 @@ async function main() {
     // sends notifications, and sending one opens the connection. A task pushed
     // between the connection opening and something listening for it is a task
     // dropped on the floor.
-    const idle = await openIdleSession(acpCmdArgs, configs, agentrqConfig, mcpBridge);
+    const idle = await openIdleSession(
+      acpCmdArgs,
+      configs,
+      agentrqConfig,
+      mcpBridge,
+      loginCommandFor(options.agentId, explicitCommand),
+    );
     if (idle === "unauthenticated") {
       // Nothing to unwind: the agent was terminated where it was spawned, and
       // the workspace connection below has not been opened yet.
