@@ -25,6 +25,11 @@ import {
   type AgentCommand,
   type CommandsPayload,
 } from "./commands.js";
+import {
+  AGENT_NOTIFICATION_METHOD,
+  type AgentIdentity,
+  type AgentPayload,
+} from "./agentInfo.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -897,6 +902,47 @@ export class AgentRQACPClient implements acp.Client {
     } catch (err) {
       console.error(
         `[acp] Failed to send commands notification for session ${sessionId}:`,
+        err,
+      );
+    }
+  }
+
+  /**
+   * Tells the workspace which agent is behind this gateway.
+   *
+   * Without it the workspace can only name its MCP client, which for anything
+   * reached through here is "acp-gateway" — the bridge rather than the agent.
+   * The agent said who it was during its own handshake; this passes that on.
+   *
+   * Sent once per session, since an agent cannot become a different agent
+   * mid-session. Never throws, for the same reason the models beside it do
+   * not: this is a label for a human, and a workspace that cannot take it
+   * right now must not cost the agent its turn.
+   */
+  async sendAgentToWorkspace(
+    sessionId: string,
+    identity: AgentIdentity,
+  ): Promise<void> {
+    const taskId = this.getTaskIdForSession(sessionId);
+    if (!taskId) {
+      console.error(
+        `[acp] No task ID for session ${sessionId}, not sending agent notification`,
+      );
+      return;
+    }
+    const payload: AgentPayload = {
+      task_id: taskId,
+      session_id: sessionId,
+      name: identity.name,
+      title: identity.title,
+      version: identity.version,
+    };
+    try {
+      await this.mcpBridge.sendNotification(AGENT_NOTIFICATION_METHOD, payload);
+      console.error(`[acp] Told the workspace it is talking to "${identity.name}"`);
+    } catch (err) {
+      console.error(
+        `[acp] Failed to send agent notification for session ${sessionId}:`,
         err,
       );
     }

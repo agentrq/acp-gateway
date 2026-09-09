@@ -26,18 +26,67 @@ function section(title: string, rows: Array<[string, string]>): string {
   return [title, ...body].join("\n");
 }
 
+/** The notification agentrq listens on for which agent is behind the gateway. */
+export const AGENT_NOTIFICATION_METHOD = "notifications/claude/channel/agent";
+
+/**
+ * The wire shape agentrq receives. snake_case to match the telemetry, models
+ * and commands notifications on the same channel; the REST surface that
+ * eventually renders this is camelCase, and the mapping happens there.
+ */
+export interface AgentPayload {
+  task_id: string;
+  session_id: string;
+  name: string;
+  title?: string;
+  version?: string;
+}
+
+/** Who an agent says it is. */
+export interface AgentIdentity {
+  /** The agent's own name for itself, or how it was launched if it gave none. */
+  name: string;
+  /** A longer human-readable name, when it differs from the short one. */
+  title?: string;
+  version?: string;
+}
+
+/**
+ * Who the agent is, from its `initialize` response.
+ *
+ * ACP leaves `agentInfo` optional, so an agent that says nothing about itself
+ * is named by how it was launched instead. That is the only name available and
+ * it is better than none — the workspace's "which agent is this" is otherwise
+ * unanswerable.
+ *
+ * `title` is dropped when it merely repeats the name, so a caller rendering
+ * both does not print the same word twice.
+ */
+export function agentIdentity(
+  initResult: acp.InitializeResponse,
+  launchedAs: string,
+): AgentIdentity {
+  const info = (initResult as { agentInfo?: { name?: string; title?: string; version?: string } })
+    .agentInfo;
+
+  const name = info?.name?.trim();
+  if (!name) return { name: launchedAs };
+
+  const identity: AgentIdentity = { name };
+  const title = info?.title?.trim();
+  if (title && title !== name) identity.title = title;
+  const version = info?.version?.trim();
+  if (version) identity.version = version;
+  return identity;
+}
+
 /** The agent's own name for itself, falling back to how it was launched. */
 function heading(
   initResult: acp.InitializeResponse,
   launchedAs: string,
 ): string {
-  const info = (initResult as { agentInfo?: { name?: string; title?: string; version?: string } })
-    .agentInfo;
-  if (!info?.name) return launchedAs;
-
-  const title = info.title && info.title !== info.name ? ` — ${info.title}` : "";
-  const version = info.version ? ` ${info.version}` : "";
-  return `${info.name}${title}${version}`;
+  const { name, title, version } = agentIdentity(initResult, launchedAs);
+  return `${name}${title ? ` — ${title}` : ""}${version ? ` ${version}` : ""}`;
 }
 
 /**
