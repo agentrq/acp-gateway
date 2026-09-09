@@ -85,7 +85,12 @@ export function mapMcpServers(
       };
     });
 }
-import { AgentRQACPClient, DEFAULT_PERMISSION_TIMEOUT_MS } from "./acpClient.js";
+import {
+  AgentRQACPClient,
+  DEFAULT_PERMISSION_TIMEOUT_MS,
+  lastModelsForSession,
+  sendModelsNotification,
+} from "./acpClient.js";
 import {
   describeAuthMethods,
   isAuthRequiredError,
@@ -1007,10 +1012,6 @@ export function findActiveSession(taskId?: string): AgentSession | undefined {
 }
 
 /**
- * Handles task cancellation events from the MCP server.
- * Cancels the ACP session/turn and immediately cancels any pending permissions.
- */
-/**
  * Switches a session's model and tells the workspace what it ended up as.
  *
  * The one place a model is ever set, reached from two directions: the --model
@@ -1043,8 +1044,15 @@ export async function applyModelSelection({
   /** The config option to write through, when the caller knows it. */
   configId?: string;
 }): Promise<void> {
+  // Freshest first. `known` was read before the set was attempted, and the agent
+  // may have reported a different list while that call was in flight — echoing
+  // the older snapshot would tell the workspace the session is on a model it has
+  // already left, and, because every report is recorded, would write that stale
+  // list back over the newer one. The cache is preferred over it for that reason,
+  // and `known` stays as the last resort for the startup path, where the session
+  // has not reported anything yet.
   const echo = (result?: AgentModelsResult) => {
-    const fallback = result ?? known ?? acpClient.lastModelsFor(sessionId);
+    const fallback = result ?? acpClient.lastModelsFor(sessionId) ?? known;
     if (fallback) void acpClient.sendModelsToWorkspace(sessionId, fallback);
   };
 
@@ -1107,29 +1115,53 @@ export async function applyModelSelection({
  * is searched by — findActiveSession already matches on it, and on the task id
  * a session is filed under, so either identifies the same session.
  *
- * A set for a session that has gone still answers. The interface is holding a
- * pending model and only a models notification releases it, so staying silent
- * about a vanished session would leave it pending forever; echoing what was
- * last known lets it revert to the truth.
+ * A set for a session that has gone still answers, and so does one that names no
+ * model. The interface is holding a pending model and only a models notification
+ * releases it, so staying silent about either would leave it pending forever;
+ * echoing what was last known lets it revert to the truth. That is why the last
+ * report outlives the session that produced it — by the time a set arrives for a
+ * finished session, the client that served it has exited with its agent, and the
+ * bridge is all that is left to answer through.
  */
-export async function handleSetModel({
-  sessionId,
-  configId,
-  modelId,
-}: {
-  sessionId?: string;
-  configId?: string;
-  modelId?: string;
-}): Promise<void> {
+export async function handleSetModel(
+  {
+    sessionId,
+    configId,
+    modelId,
+  }: {
+    sessionId?: string;
+    configId?: string;
+    modelId?: string;
+  },
+  /** How a session that has already gone is answered. Absent only in tests. */
+  bridge?: { sendNotification(method: string, params: unknown): Promise<unknown> },
+): Promise<void> {
+  const session = findActiveSession(sessionId);
+
+  // Nothing to switch, but the picker is still waiting on an answer, so give it
+  // the truth rather than nothing: a live session reports through its own client,
+  // and a finished one through whatever was last recorded for it.
+  const revert = async (why: string) => {
+    console.error(`[bridge] ${why}; reporting the last known models instead`);
+    if (session) {
+      const last = session.acpClient.lastModelsFor(session.sessionId);
+      if (last) await session.acpClient.sendModelsToWorkspace(session.sessionId, last);
+      return;
+    }
+    const last = sessionId ? lastModelsForSession(sessionId) : undefined;
+    if (bridge && sessionId && last) {
+      await sendModelsNotification(bridge, sessionId, last);
+    }
+  };
+
   if (!modelId) {
-    console.error("[bridge] Received a set_model notification naming no model");
+    await revert("Received a set_model notification naming no model");
     return;
   }
 
-  const session = findActiveSession(sessionId);
   if (!session) {
-    console.error(
-      `[bridge] Received set_model for session ${sessionId ?? "(unnamed)"}, but no active session matches it`,
+    await revert(
+      `Received set_model for session ${sessionId ?? "(unnamed)"}, but no active session matches it`,
     );
     return;
   }
@@ -1147,6 +1179,10 @@ export async function handleSetModel({
   });
 }
 
+/**
+ * Handles task cancellation events from the MCP server.
+ * Cancels the ACP session/turn and immediately cancels any pending permissions.
+ */
 export async function handleTaskCancellation(
   taskId?: string,
   reason?: string,
@@ -1994,7 +2030,7 @@ async function main() {
     mcpBridge.on(
       "setModel",
       (params: { sessionId?: string; configId?: string; modelId?: string }) => {
-        handleSetModel(params).catch((err) => {
+        handleSetModel(params, mcpBridge).catch((err) => {
           console.error("[bridge] Error handling model selection:", err);
         });
       },

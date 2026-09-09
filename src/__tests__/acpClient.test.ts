@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
-import { AgentRQACPClient } from "../acpClient.js";
+import { AgentRQACPClient, lastModelsForSession } from "../acpClient.js";
 import type { MCPBridge } from "../mcpClient.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -2213,6 +2213,56 @@ describe("AgentRQACPClient", () => {
         expect.stringContaining("Failed to send models notification for session sess-1:"),
         expect.anything(),
       );
+      consoleSpy.mockRestore();
+    });
+
+    it("reports a list with nothing selected yet", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const c = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+      );
+
+      await c.sendModelsToWorkspace("sess-unset", {
+        configId: "model",
+        models: [{ id: "gpt-4", name: "GPT-4", current: false }],
+      });
+
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/models",
+        expect.objectContaining({ current_model: undefined }),
+      );
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("current: none"));
+      consoleSpy.mockRestore();
+    });
+
+    it("remembers what a session was on after the client that served it is gone", async () => {
+      // A set_model can arrive for a session whose agent has already exited. The
+      // record has to survive that client, or the one case that most needs an
+      // answer — a picker left pending on a session that no longer exists — is
+      // the one case that cannot be answered.
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const models = {
+        configId: "model",
+        currentModelId: "gpt-4",
+        models: [{ id: "gpt-4", name: "GPT-4", current: true }],
+      };
+
+      let dead: AgentRQACPClient | undefined = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+      );
+      await dead.sendModelsToWorkspace("sess-outlives", models);
+      dead = undefined;
+
+      expect(lastModelsForSession("sess-outlives")).toEqual(models);
+      // And any later client sees it too, which is what lets a live session
+      // answer for one that has ended.
+      const fresh = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+      );
+      expect(fresh.lastModelsFor("sess-outlives")).toEqual(models);
       consoleSpy.mockRestore();
     });
   });
