@@ -81,7 +81,11 @@ export class MCPBridge extends EventEmitter {
   }
 
   async connect() {
-    if (this.isConnecting || this.isConnected) return;
+    if (this.isConnected) return;
+    // Already coming up — wait for that attempt rather than returning as though
+    // the connection were made. A caller that awaits this is asking to be
+    // connected, and something else having started the job first is no answer.
+    if (this.isConnecting) return this.waitUntilConnected();
     this.isConnecting = true;
     this.isClosed = false;
 
@@ -236,6 +240,20 @@ export class MCPBridge extends EventEmitter {
     );
 
     await this.refreshAdvertisedTools();
+  }
+
+  /**
+   * Waits for a connection attempt already in progress.
+   *
+   * Bounded, because the retry loop backs off indefinitely and a caller that
+   * waited forever would never reach whatever it meant to do once connected.
+   */
+  private async waitUntilConnected(timeoutMs = 10_000): Promise<void> {
+    let waited = 0;
+    while (!this.isConnected && waited < timeoutMs) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      waited += 100;
+    }
   }
 
   private async ensureConnected() {

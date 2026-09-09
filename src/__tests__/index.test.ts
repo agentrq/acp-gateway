@@ -11,11 +11,12 @@ import {
   mapMcpServers,
   TaskQueue,
   getOrCreateSession,
-  isLoginRefusal,
   openIdleSession,
   resetIdleSession,
   activeSessions,
+  AuthenticationFailed,
   IDLE_SESSION_KEY,
+  loginCommandFor,
   authConfig,
   modelConfig,
   createSessionWithAuth,
@@ -87,8 +88,10 @@ vi.mock("node:child_process", async () => {
 });
 
 /** Lets a test make the next `session/new` fail, e.g. with auth_required. */
-const { newSessionError } = vi.hoisted(() => ({
+const { newSessionError, newSessionHangs } = vi.hoisted(() => ({
   newSessionError: { value: null as unknown },
+  /** Lets a test make `session/new` never answer, like an agent gone quiet. */
+  newSessionHangs: { value: false },
 }));
 
 vi.mock("@agentclientprotocol/sdk", async () => {
@@ -99,6 +102,7 @@ vi.mock("@agentclientprotocol/sdk", async () => {
       return {
         initialize: vi.fn().mockResolvedValue({ protocolVersion: "0.1.0" }),
         newSession: vi.fn().mockImplementation(async () => {
+          if (newSessionHangs.value) return new Promise(() => {});
           if (newSessionError.value) throw newSessionError.value;
           return { sessionId: "test-sess-123" };
         }),
@@ -529,6 +533,7 @@ describe("index", () => {
       activeSessions.clear();
       resetIdleSession();
       newSessionError.value = null;
+      newSessionHangs.value = false;
     });
 
     it("should spawn a new session when not cached", async () => {
@@ -613,9 +618,10 @@ describe("index", () => {
       const mockBridge: any = fakeBridge();
       newSessionError.value = new Error("agent will not start");
 
+      // Survivable: it says the gateway can carry on, and the first task retries.
       await expect(
         openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge),
-      ).resolves.toBeUndefined();
+      ).resolves.toBe("unknown");
 
       expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(false);
       expect(consoleSpy).toHaveBeenCalledWith(
@@ -625,23 +631,17 @@ describe("index", () => {
       consoleSpy.mockRestore();
     });
 
-    it("shuts the gateway down when the agent cannot be authenticated", async () => {
+    it("reports that the gateway cannot continue when the agent is unauthenticated", async () => {
       // Carrying on would leave the workspace showing a live agent that fails
       // every task it is given, which is worse than not running at all.
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const mockBridge: any = fakeBridge();
-      const onUnauthenticated = vi.fn();
       newSessionError.value = { code: -32000, data: { authRequired: true }, message: "auth_required" };
 
-      await openIdleSession(
-        ["node", "agent.js"],
-        [],
-        { env: {} } as any,
-        mockBridge,
-        onUnauthenticated,
-      );
+      const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
 
-      expect(onUnauthenticated).toHaveBeenCalledOnce();
+      expect(outcome).toBe("unauthenticated");
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("until it is authenticated"));
       expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(false);
       // Nothing was claimed about an agent that never started.
       expect(mockBridge.sendNotification).not.toHaveBeenCalledWith(
@@ -651,46 +651,68 @@ describe("index", () => {
       consoleSpy.mockRestore();
     });
 
-    it("says what to do about it, and stops the process", async () => {
-      // The default behaviour, with nothing injected: this is what a human
-      // actually sees when their agent is not logged in.
+    it("shuts down when the login itself went wrong", async () => {
+      // A terminal login the human abandoned, a login subcommand exiting
+      // non-zero, no usable method on a headless run: all of them come back as
+      // AuthenticationFailed, so none of them has to be recognised by its
+      // message. The conclusion is the same — an agent that cannot authenticate
+      // cannot work.
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const exitSpy = vi
-        .spyOn(process, "exit")
-        .mockImplementation((() => undefined) as never);
       const mockBridge: any = fakeBridge();
-      newSessionError.value = { code: -32000, data: { authRequired: true }, message: "auth_required" };
-
-      await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(exitSpy).toHaveBeenCalledWith(1);
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("needs you to log in"),
+      newSessionError.value = new AuthenticationFailed(
+        new Error('Terminal login "oauth" failed (code=1, signal=null).'),
       );
-      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Nothing was started"));
-      exitSpy.mockRestore();
+
+      const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(outcome).toBe("unauthenticated");
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("npx @agentrq/acp-gateway@latest --login"),
+      );
       consoleSpy.mockRestore();
     });
 
-    it("shuts down when a headless run has no way to log in", async () => {
-      // What `login` throws when there is nobody to ask. Same conclusion: an
-      // agent that cannot authenticate cannot work.
+    it("tells the owner of an API-key agent to set the key, not to log in", async () => {
+      // Plenty of agents never ask anyone to log in — they read a key from the
+      // environment. When one of those refuses, sending its owner looking for a
+      // login prompt that does not exist is worse than saying nothing.
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const mockBridge: any = fakeBridge();
-      const onUnauthenticated = vi.fn();
-      newSessionError.value = new Error(
-        "No usable authentication method. Available:\n  oauth\nTerminal logins need an interactive terminal;",
-      );
+      newSessionError.value = new AuthenticationFailed(new Error("auth_required"), false);
 
-      await openIdleSession(
+      const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(outcome).toBe("unauthenticated");
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("expecting a credential of its own"),
+      );
+      expect(consoleSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("--login"),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("gives up waiting on an agent that never opens a session", async () => {
+      // Nothing reaches the workspace until this settles, so an agent that
+      // spawns and then goes quiet would otherwise take the whole gateway with
+      // it — a worse failure than the one the startup session fixes.
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const mockBridge: any = fakeBridge();
+      newSessionHangs.value = true;
+
+      const outcome = await openIdleSession(
         ["node", "agent.js"],
         [],
         { env: {} } as any,
         mockBridge,
-        onUnauthenticated,
+        loginCommandFor("some-agent"),
+        20,
       );
 
-      expect(onUnauthenticated).toHaveBeenCalledOnce();
+      expect(outcome).toBe("unknown");
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("has not opened a session"),
+      );
       consoleSpy.mockRestore();
     });
 
@@ -699,18 +721,12 @@ describe("index", () => {
       // when the first task arrived, and it still should.
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const mockBridge: any = fakeBridge();
-      const onUnauthenticated = vi.fn();
       newSessionError.value = new Error("spawn ENOENT");
 
-      await openIdleSession(
-        ["node", "agent.js"],
-        [],
-        { env: {} } as any,
-        mockBridge,
-        onUnauthenticated,
-      );
+      const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
 
-      expect(onUnauthenticated).not.toHaveBeenCalled();
+      // Survivable, so the gateway keeps running.
+      expect(outcome).toBe("unknown");
       expect(consoleSpy).toHaveBeenCalledWith(
         expect.stringContaining("the first task will start one"),
         expect.anything(),
@@ -2453,18 +2469,20 @@ describe("index", () => {
   });
 });
 
-describe("isLoginRefusal", () => {
-  it("recognises login giving up, which nobody can act on from the gateway", () => {
-    expect(isLoginRefusal(new Error("No usable authentication method. Available:\n  oauth"))).toBe(true);
-    expect(isLoginRefusal(new Error('Unknown authentication method "nope". Available:'))).toBe(true);
+describe("loginCommandFor", () => {
+  it("names the agent, so nobody has to work the command out", () => {
+    expect(loginCommandFor("antigravity-acp")).toBe(
+      "npx @agentrq/acp-gateway@latest --login --agent antigravity-acp",
+    );
   });
 
-  it("does not mistake an agent falling over for a login problem", () => {
-    // These are survivable; treating them as auth would shut the gateway down
-    // over a transient failure.
-    expect(isLoginRefusal(new Error("spawn ENOENT"))).toBe(false);
-    expect(isLoginRefusal(new Error("socket hang up"))).toBe(false);
-    expect(isLoginRefusal("not an error at all")).toBe(false);
-    expect(isLoginRefusal(undefined)).toBe(false);
+  it("repeats the command after -- when no registry id named the agent", () => {
+    expect(loginCommandFor(undefined, ["node", "my-agent.js"])).toBe(
+      "npx @agentrq/acp-gateway@latest --login -- node my-agent.js",
+    );
+  });
+
+  it("falls back to the bare command when nothing identifies the agent", () => {
+    expect(loginCommandFor()).toBe("npx @agentrq/acp-gateway@latest --login");
   });
 });

@@ -673,8 +673,36 @@ export async function createSessionWithAuth(
   } catch (err) {
     if (!isAuthRequiredError(err)) throw err;
     console.error("[auth] Agent requires authentication before a session can start.");
-    await login({ ...auth, connection: connection as unknown as AuthConnection });
-    return await connection.newSession(params);
+    // Everything from here is the login, so everything that goes wrong in it is
+    // an authentication failure — whether that is a refusal to pick a method, a
+    // terminal login the human abandoned, or the agent still saying no
+    // afterwards. Typing it here beats reading messages downstream and missing
+    // whichever one nobody thought of.
+    try {
+      await login({ ...auth, connection: connection as unknown as AuthConnection });
+      return await connection.newSession(params);
+    } catch (authErr) {
+      throw new AuthenticationFailed(authErr, Boolean(auth.methods?.length));
+    }
+  }
+}
+
+/**
+ * An agent that could not be authenticated, however the login went wrong.
+ *
+ * `hasLogin` says whether the agent offered a way in at all. An agent that
+ * advertises none is not asking to be logged in — it wants a credential it
+ * reads for itself, an API key in the environment or a file on disk — and
+ * telling its owner to log in would send them looking for a prompt that does
+ * not exist.
+ */
+export class AuthenticationFailed extends Error {
+  constructor(
+    readonly cause: unknown,
+    readonly hasLogin: boolean = true,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "AuthenticationFailed";
   }
 }
 
@@ -728,6 +756,14 @@ export async function getOrCreateSession(
     cwd: process.cwd(),
     mcpServers: mapMcpServers(configs, initResult.agentCapabilities),
   };
+
+  // From here on the agent is running but nothing is tracking it yet: it only
+  // reaches activeSessions once a session exists, and closeAllSessions can only
+  // close what is in there. So anything that goes wrong in between has to take
+  // the process with it, or it is left running with nothing attached — an agent
+  // that quits when its stdin closes gets away with it, and one with its own
+  // event loop, which is the sort that wants a login, does not.
+  try {
 
   // An agent that demands authentication stops here and waits, including at
   // startup — that is the point of starting a session then. A terminal is where
@@ -817,8 +853,12 @@ export async function getOrCreateSession(
       assignTask?.(nextTaskId);
     },
   };
-  activeSessions.set(sessionKey, sessionInfo);
-  return sessionInfo;
+    activeSessions.set(sessionKey, sessionInfo);
+    return sessionInfo;
+  } catch (err) {
+    terminateAgentProcess(agentProcess);
+    throw err;
+  }
 }
 
 /**
@@ -855,9 +895,13 @@ export async function openIdleSession(
   configs: McpServerConfig[],
   agentrqConfig: McpServerConfig,
   mcpBridge: MCPBridge,
-  onUnauthenticated: (message: string) => void = exitUnauthenticated,
-): Promise<void> {
+  loginCommand: string = loginCommandFor(),
+  timeoutMs: number = IDLE_SESSION_TIMEOUT_MS,
+): Promise<IdleSessionOutcome> {
   try {
+    // Cleared when the session itself settles rather than when this returns:
+    // after a timeout the session is still coming, and a task that arrives
+    // meanwhile should still wait for it instead of starting a second agent.
     idleSessionInFlight = getOrCreateSession(
       undefined,
       acpCmdArgs,
@@ -865,51 +909,103 @@ export async function openIdleSession(
       agentrqConfig,
       mcpBridge,
     );
-    await idleSessionInFlight;
+    const settled = idleSessionInFlight;
+    void settled.catch(() => {}).finally(() => {
+      if (idleSessionInFlight === settled) idleSessionInFlight = null;
+    });
+    // Bounded: nothing reaches the workspace until this settles, so an agent
+    // that spawns and then never answers its handshake would otherwise take the
+    // whole gateway down with it — a worse failure than the one being fixed,
+    // and a new one. On a timeout the gateway carries on; the session may still
+    // arrive, and the first task will adopt it if it does.
+    const timedOut = Symbol("timed out");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const result = await Promise.race([
+      idleSessionInFlight,
+      new Promise<typeof timedOut>((resolve) => {
+        timer = setTimeout(() => resolve(timedOut), timeoutMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+
+    if (result === timedOut) {
+      console.error(
+        `[acp] The agent has not opened a session after ${Math.round(timeoutMs / 1000)}s; ` +
+          "carrying on without knowing what it offers.",
+      );
+      return "unknown";
+    }
+    return "ready";
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (isAuthRequiredError(err) || isLoginRefusal(err)) {
-      onUnauthenticated(message);
-      return;
+    if (err instanceof AuthenticationFailed || isAuthRequiredError(err)) {
+      const remedy =
+        err instanceof AuthenticationFailed && !err.hasLogin
+          ? `It offers no way to log in through acp-gateway, so it is expecting a credential ` +
+            `of its own — an API key in the environment, or whatever its own documentation ` +
+            `asks for. Set that and start acp-gateway again.`
+          : `Log in with:\n\n    ${loginCommand}\n\nthen start acp-gateway again.`;
+      console.error(
+        `\n[acp-gateway] The agent will not start a session until it is authenticated: ` +
+          `${err instanceof Error ? err.message : String(err)}\n` +
+          `Nothing was started. ${remedy}\n` +
+          `Carrying on would leave the workspace showing a live agent that fails every task ` +
+          `it is given.`,
+      );
+      return "unauthenticated";
     }
     console.error(
       "[acp] Could not open a session to learn what the agent offers; " +
         "the first task will start one:",
-      message,
+      err instanceof Error ? err.message : String(err),
     );
-  } finally {
-    idleSessionInFlight = null;
+    return "unknown";
   }
 }
 
 /**
- * Whether a failed session was `login` giving up rather than the agent falling
- * over.
+ * The command that logs this agent in, so the message can name it rather than
+ * leave someone to work it out.
  *
- * `login` throws a plain Error for the two cases nobody can act on from here —
- * an unknown `--auth-method`, and no usable method at all, which is what a
- * headless run hits — so the message is what distinguishes them. Matching on it
- * is uncomfortable, and it is still better than treating "cannot authenticate"
- * as a transient hiccup and handing the workspace an agent that will fail
- * everything it is given.
+ * Built from how the gateway itself was started: the registry id when there was
+ * one, and otherwise the command after `--`, since that is the only handle on
+ * an agent nobody named.
  */
-export function isLoginRefusal(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : "";
-  return (
-    message.startsWith("No usable authentication method") ||
-    message.startsWith("Unknown authentication method")
-  );
+export function loginCommandFor(
+  agentId?: string,
+  agentCommand: string[] = [],
+): string {
+  const base = "npx @agentrq/acp-gateway@latest --login";
+  if (agentId) return `${base} --agent ${agentId}`;
+  if (agentCommand.length) return `${base} -- ${agentCommand.join(" ")}`;
+  return base;
 }
 
-/** Stops the gateway, saying what has to happen before it can run. */
-function exitUnauthenticated(message: string): never {
-  console.error(
-    `\n[acp-gateway] The agent needs you to log in before it can do anything: ${message}\n` +
-      `Nothing was started. Log in and run acp-gateway again — carrying on would leave ` +
-      `the workspace showing a live agent that fails every task it is given.`,
-  );
-  return process.exit(1);
-}
+/**
+ * What came of trying to open a session before any task.
+ *
+ * `ready` means the agent is up and has said what it is — including its own
+ * name, so nothing else should name it. `unknown` means the gateway is running
+ * but cannot describe its agent. `unauthenticated` means it never will.
+ */
+export type IdleSessionOutcome = "ready" | "unknown" | "unauthenticated";
+
+/**
+ * How long to wait for an agent to open its first session.
+ *
+ * Generous because the wait includes starting the agent, and an `npx`
+ * distribution downloads its package the first time it is spawned — a cold
+ * install of a large one on a slow line is minutes, not seconds. (A registry
+ * *binary* is already on disk by now: that download happens while the launch
+ * command is being resolved, before any of this.)
+ *
+ * Erring long costs little. A session that arrives after the deadline is still
+ * recorded, still reports what the agent offers, and is still adopted by the
+ * first task — the timeout only decides how long the gateway waits before
+ * connecting to the workspace without knowing those things yet.
+ */
+export const IDLE_SESSION_TIMEOUT_MS = 5 * 60_000;
+
+
 
 export function findActiveSession(taskId?: string): AgentSession | undefined {
   if (taskId) {
@@ -919,10 +1015,15 @@ export function findActiveSession(taskId?: string): AgentSession | undefined {
       if (session.sessionId === taskId) return session;
     }
     // A session opened from a notification that carried no task id is keyed
-    // "default"; when it is the only one running, an id-carrying cancel can
-    // only have meant it. Never fall back to a session keyed under a
+    // under IDLE_SESSION_KEY; when it is the only one running, an id-carrying
+    // cancel can only have meant it. Never fall back to a session keyed under a
     // *different* task id — that would abort an unrelated task.
-    const untracked = activeSessions.get("default");
+    //
+    // The session opened at startup shares that key until a task adopts it, so
+    // this can now match one that has never run anything. That stays correct
+    // either way: if it was reused for a task-less prompt it is the session the
+    // cancel meant, and if it is untouched it has no turn to cancel.
+    const untracked = activeSessions.get(IDLE_SESSION_KEY);
     if (untracked && activeSessions.size === 1) {
       return untracked;
     }
@@ -1792,14 +1893,29 @@ async function main() {
     // sends notifications, and sending one opens the connection. A task pushed
     // between the connection opening and something listening for it is a task
     // dropped on the floor.
-    await openIdleSession(acpCmdArgs, configs, agentrqConfig, mcpBridge);
+    const idle = await openIdleSession(
+      acpCmdArgs,
+      configs,
+      agentrqConfig,
+      mcpBridge,
+      loginCommandFor(options.agentId, explicitCommand),
+    );
+    if (idle === "unauthenticated") {
+      // Nothing to unwind: the agent was terminated where it was spawned, and
+      // the workspace connection below has not been opened yet.
+      removeSignalHandlers();
+      process.exit(1);
+    }
 
     await mcpBridge.connect();
 
-    // Name the agent now there is somewhere to say it. The registry's answer is
-    // the one available before the agent has spoken for itself, and the agent's
-    // own word replaces it as soon as it has one.
-    if (resolved.identity) {
+    // Only when the agent has not spoken for itself. A session that came up
+    // already reported the agent's own name, title and version from its
+    // handshake, and the registry's entry is a coarser answer to the same
+    // question — sending it after would replace what the agent said about
+    // itself with what an index says about it, dropping the title and swapping
+    // the running version for a published one.
+    if (idle !== "ready" && resolved.identity) {
       void sendAgentIdentity(mcpBridge, resolved.identity);
     }
 
