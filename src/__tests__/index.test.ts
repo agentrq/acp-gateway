@@ -43,6 +43,8 @@ import {
   runAgentCommand,
   findActiveSession,
   handleTaskCancellation,
+  handleSetModel,
+  applyModelSelection,
   cancelledTaskSeq,
   markTaskCancelled,
   isTaskCancelled,
@@ -2131,6 +2133,186 @@ describe("index", () => {
           expect.stringContaining("but 2 sessions are active (skipping to avoid aborting unrelated tasks)")
         );
       });
+    });
+  });
+
+  describe("choosing a model at runtime", () => {
+    // Everything here rests on one contract: the interface marks a chosen model
+    // pending and only a models notification releases it. So every path has to
+    // end in a report — including the ones that fail — or the picker is left
+    // claiming a model the agent never adopted, with nothing to correct it.
+    beforeEach(() => {
+      activeSessions.clear();
+    });
+
+    afterEach(() => {
+      activeSessions.clear();
+    });
+
+    const known = {
+      configId: "model",
+      currentModelId: "a",
+      models: [
+        { id: "a", name: "Model A", current: true },
+        { id: "b", name: "Model B", current: false },
+      ],
+    };
+
+    /** A session whose ACP set succeeds, reporting the new list back. */
+    const sessionThatSwitches = () => {
+      const sendModelsToWorkspace = vi.fn();
+      const setSessionConfigOption = vi.fn().mockResolvedValue({
+        configOptions: [
+          {
+            id: "model",
+            type: "select",
+            category: "model",
+            currentValue: "b",
+            options: [
+              { value: "a", name: "Model A" },
+              { value: "b", name: "Model B" },
+            ],
+          },
+        ],
+      });
+      const session: any = {
+        sessionId: "sess-1",
+        connection: { setSessionConfigOption },
+        acpClient: { sendModelsToWorkspace, lastModelsFor: () => known },
+      };
+      return { session, sendModelsToWorkspace, setSessionConfigOption };
+    };
+
+    it("switches the named session and reports what the agent ended up on", async () => {
+      const { session, sendModelsToWorkspace, setSessionConfigOption } = sessionThatSwitches();
+      activeSessions.set("task-1", session);
+
+      await handleSetModel({ sessionId: "sess-1", configId: "model", modelId: "b" });
+
+      expect(setSessionConfigOption).toHaveBeenCalledWith({
+        sessionId: "sess-1",
+        configId: "model",
+        value: "b",
+      });
+      // The agent's own answer, not the id that was asked for.
+      expect(sendModelsToWorkspace).toHaveBeenCalledWith(
+        "sess-1",
+        expect.objectContaining({ currentModelId: "b" }),
+      );
+    });
+
+    it("puts back what was true when the agent refuses the switch", async () => {
+      const sendModelsToWorkspace = vi.fn();
+      const session: any = {
+        sessionId: "sess-1",
+        connection: {
+          setSessionConfigOption: vi.fn().mockRejectedValue(new Error("nope")),
+        },
+        acpClient: { sendModelsToWorkspace, lastModelsFor: () => known },
+      };
+      activeSessions.set("task-1", session);
+
+      await handleSetModel({ sessionId: "sess-1", configId: "model", modelId: "b" });
+
+      // Still on "a": the picker reverts instead of hanging on "b" forever.
+      expect(sendModelsToWorkspace).toHaveBeenCalledWith(
+        "sess-1",
+        expect.objectContaining({ currentModelId: "a" }),
+      );
+    });
+
+    it("does not throw when no session matches", async () => {
+      // The session went away between the human clicking and this arriving.
+      await expect(
+        handleSetModel({ sessionId: "sess-gone", configId: "model", modelId: "b" }),
+      ).resolves.toBeUndefined();
+    });
+
+    it("ignores a notification naming no model", async () => {
+      const { session, setSessionConfigOption } = sessionThatSwitches();
+      activeSessions.set("task-1", session);
+
+      await handleSetModel({ sessionId: "sess-1", configId: "model" });
+
+      expect(setSessionConfigOption).not.toHaveBeenCalled();
+    });
+
+    it("refuses a model the session never advertised, and says what it has", async () => {
+      const { session, sendModelsToWorkspace, setSessionConfigOption } = sessionThatSwitches();
+      activeSessions.set("task-1", session);
+
+      await handleSetModel({ sessionId: "sess-1", configId: "model", modelId: "not-a-model" });
+
+      expect(setSessionConfigOption).not.toHaveBeenCalled();
+      expect(sendModelsToWorkspace).toHaveBeenCalledWith("sess-1", known);
+    });
+
+    it("reports without asking the agent when the model is already current", async () => {
+      const { session, sendModelsToWorkspace, setSessionConfigOption } = sessionThatSwitches();
+      activeSessions.set("task-1", session);
+
+      await handleSetModel({ sessionId: "sess-1", configId: "model", modelId: "a" });
+
+      expect(setSessionConfigOption).not.toHaveBeenCalled();
+      expect(sendModelsToWorkspace).toHaveBeenCalledWith("sess-1", known);
+    });
+
+    it("resolves a model by display name, for a --model typed by a human", async () => {
+      const { session, setSessionConfigOption } = sessionThatSwitches();
+
+      await applyModelSelection({
+        connection: session.connection,
+        acpClient: session.acpClient,
+        sessionId: "sess-1",
+        known,
+        requested: "Model B",
+      });
+
+      expect(setSessionConfigOption).toHaveBeenCalledWith({
+        sessionId: "sess-1",
+        configId: "model",
+        value: "b",
+      });
+    });
+
+    it("marks the chosen model current when the agent answers without its config", async () => {
+      // Some agents acknowledge the write without repeating their options. The
+      // interface still has to end up with something selected.
+      const sendModelsToWorkspace = vi.fn();
+      const acpClient: any = { sendModelsToWorkspace, lastModelsFor: () => known };
+
+      await applyModelSelection({
+        connection: { setSessionConfigOption: vi.fn().mockResolvedValue({}) } as any,
+        acpClient,
+        sessionId: "sess-1",
+        known,
+        requested: "b",
+      });
+
+      expect(sendModelsToWorkspace).toHaveBeenCalledWith(
+        "sess-1",
+        expect.objectContaining({
+          currentModelId: "b",
+          models: [
+            expect.objectContaining({ id: "a", current: false }),
+            expect.objectContaining({ id: "b", current: true }),
+          ],
+        }),
+      );
+    });
+
+    it("says so rather than guessing when there is no config option to write to", async () => {
+      const sendModelsToWorkspace = vi.fn();
+      const setSessionConfigOption = vi.fn();
+
+      await applyModelSelection({
+        connection: { setSessionConfigOption } as any,
+        acpClient: { sendModelsToWorkspace, lastModelsFor: () => undefined } as any,
+        sessionId: "sess-1",
+        requested: "b",
+      });
+
+      expect(setSessionConfigOption).not.toHaveBeenCalled();
     });
   });
 

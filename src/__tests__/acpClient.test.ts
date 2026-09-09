@@ -2136,6 +2136,9 @@ describe("AgentRQACPClient", () => {
             { id: "claude-3-7-sonnet", name: "Claude 3.7 Sonnet", current: true },
             { id: "claude-3-5-haiku", name: "Claude 3.5 Haiku", current: false },
           ],
+          // Declared on every report: the workspace offers a picker only where
+          // it sees this, and cannot infer it from the models being present.
+          can_set: true,
         },
       );
     });
