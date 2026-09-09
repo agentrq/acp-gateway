@@ -2210,4 +2210,93 @@ describe("AgentRQACPClient", () => {
       consoleSpy.mockRestore();
     });
   });
+  describe("available_commands_update", () => {
+    /** Silences the informational logging these paths write to stderr. */
+    function quiet() {
+      return vi.spyOn(console, "error").mockImplementation(() => {});
+    }
+
+    // No default parameter on purpose: `clientWithTask()` would take
+    // the default rather than the no-task case the test is asking for.
+    function clientWithTask(taskId?: string) {
+      return new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => taskId,
+      );
+    }
+
+    async function advertise(
+      client: AgentRQACPClient,
+      availableCommands: unknown[],
+      sessionId = "sess-1",
+    ) {
+      await client.sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: "available_commands_update", availableCommands },
+      } as any);
+    }
+
+    it("forwards the agent's commands to the workspace", async () => {
+      const consoleSpy = quiet();
+
+      await advertise(clientWithTask("task-123"), [
+        { name: "compact", description: "Shorten the context" },
+        { name: "web", description: "Search the web", input: { hint: "query" } },
+      ]);
+
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/commands",
+        {
+          task_id: "task-123",
+          session_id: "sess-1",
+          commands: [
+            { name: "compact", description: "Shorten the context" },
+            { name: "web", description: "Search the web", hint: "query" },
+          ],
+        },
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("forwards an empty list, which is how an agent withdraws its commands", async () => {
+      // Dropping this would leave the workspace offering a menu of commands
+      // the agent has stopped accepting.
+      const consoleSpy = quiet();
+
+      await advertise(clientWithTask("task-123"), []);
+
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/commands",
+        { task_id: "task-123", session_id: "sess-1", commands: [] },
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("skips the send when the session has no task to attach to", async () => {
+      const consoleSpy = quiet();
+
+      await advertise(clientWithTask(), [{ name: "init", description: "d" }]);
+
+      expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("No task ID for session sess-1"),
+      );
+      consoleSpy.mockRestore();
+    });
+
+    it("does not let a failed send stall the agent's turn", async () => {
+      const consoleSpy = quiet();
+      mcpBridge.sendNotification.mockRejectedValueOnce(new Error("workspace unreachable"));
+
+      await expect(
+        advertise(clientWithTask("task-123"), [{ name: "init", description: "d" }]),
+      ).resolves.toBeUndefined();
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to send commands notification for session sess-1:"),
+        expect.anything(),
+      );
+      consoleSpy.mockRestore();
+    });
+  });
 });

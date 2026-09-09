@@ -389,6 +389,24 @@ describe("index", () => {
       expect(mockAcpClient.flushReply).toHaveBeenCalledWith("current-session");
     });
 
+    it("forwards a slash command to the agent unmodified", async () => {
+      // ACP runs a command as ordinary prompt text and the agent matches the
+      // prefix at the *start* of it, so anything prepended here — a wrapper, a
+      // task header, a courtesy sentence — stops it being a command at all.
+      // agentrq relies on this passthrough to deliver what the human typed.
+      mockMcpBridge.callTool.mockResolvedValue({
+        isError: false,
+        content: [{ type: "text", text: "/compact keep the API discussion" }],
+      });
+
+      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
+
+      expect(mockConnection.prompt).toHaveBeenCalledWith({
+        sessionId: "current-session",
+        prompt: [{ type: "text", text: "/compact keep the API discussion" }],
+      });
+    });
+
     it("should handle exceptions during execution", async () => {
       mockMcpBridge.callTool.mockRejectedValue(new Error("network error"));
 

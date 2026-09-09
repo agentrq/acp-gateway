@@ -19,6 +19,12 @@ import {
   type TelemetryPayload,
 } from "./telemetry.js";
 import { extractModels, type AgentModelsResult } from "./models.js";
+import {
+  COMMANDS_NOTIFICATION_METHOD,
+  normalizeCommands,
+  type AgentCommand,
+  type CommandsPayload,
+} from "./commands.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -769,6 +775,12 @@ export class AgentRQACPClient implements acp.Client {
       case "config_option_update":
         this.handleConfigOptionUpdate(params.sessionId, update.configOptions);
         break;
+      case "available_commands_update":
+        await this.sendCommandsToWorkspace(
+          params.sessionId,
+          normalizeCommands(update.availableCommands),
+        );
+        break;
       case "tool_call_update":
         this.rememberToolCall(update);
         break;
@@ -842,6 +854,49 @@ export class AgentRQACPClient implements acp.Client {
     } catch (err) {
       console.error(
         `[acp] Failed to send models notification for session ${sessionId}:`,
+        err,
+      );
+    }
+  }
+
+  /**
+   * Tells the workspace which slash commands the agent is currently offering.
+   *
+   * An empty list is sent rather than skipped: it is how an agent withdraws its
+   * commands, and a workspace that only ever hears about additions would go on
+   * offering a menu of commands the agent has stopped accepting.
+   *
+   * Never throws, for the same reason telemetry does not — the commands are a
+   * convenience for the human, and a workspace that cannot take them right now
+   * must not cost the agent its turn.
+   */
+  async sendCommandsToWorkspace(
+    sessionId: string,
+    commands: AgentCommand[],
+  ): Promise<void> {
+    const taskId = this.getTaskIdForSession(sessionId);
+    if (!taskId) {
+      console.error(
+        `[acp] No task ID for session ${sessionId}, not sending commands notification`,
+      );
+      return;
+    }
+    const payload: CommandsPayload = {
+      task_id: taskId,
+      session_id: sessionId,
+      commands,
+    };
+    try {
+      await this.mcpBridge.sendNotification(
+        COMMANDS_NOTIFICATION_METHOD,
+        payload,
+      );
+      console.error(
+        `[acp] Shared ${commands.length} slash command(s) with workspace`,
+      );
+    } catch (err) {
+      console.error(
+        `[acp] Failed to send commands notification for session ${sessionId}:`,
         err,
       );
     }
