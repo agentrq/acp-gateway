@@ -682,14 +682,25 @@ export async function createSessionWithAuth(
       await login({ ...auth, connection: connection as unknown as AuthConnection });
       return await connection.newSession(params);
     } catch (authErr) {
-      throw new AuthenticationFailed(authErr);
+      throw new AuthenticationFailed(authErr, Boolean(auth.methods?.length));
     }
   }
 }
 
-/** An agent that could not be authenticated, however the login went wrong. */
+/**
+ * An agent that could not be authenticated, however the login went wrong.
+ *
+ * `hasLogin` says whether the agent offered a way in at all. An agent that
+ * advertises none is not asking to be logged in — it wants a credential it
+ * reads for itself, an API key in the environment or a file on disk — and
+ * telling its owner to log in would send them looking for a prompt that does
+ * not exist.
+ */
 export class AuthenticationFailed extends Error {
-  constructor(readonly cause: unknown) {
+  constructor(
+    readonly cause: unknown,
+    readonly hasLogin: boolean = true,
+  ) {
     super(cause instanceof Error ? cause.message : String(cause));
     this.name = "AuthenticationFailed";
   }
@@ -919,10 +930,17 @@ export async function openIdleSession(
     return "ready";
   } catch (err) {
     if (err instanceof AuthenticationFailed || isAuthRequiredError(err)) {
+      const remedy =
+        err instanceof AuthenticationFailed && !err.hasLogin
+          ? `It offers no way to log in through acp-gateway, so it is expecting a credential ` +
+            `of its own — an API key in the environment, or whatever its own documentation ` +
+            `asks for. Set that and run acp-gateway again.`
+          : `Log in and run acp-gateway again.`;
       console.error(
-        `\n[acp-gateway] The agent needs you to log in before it can do anything: ${err instanceof Error ? err.message : String(err)}\n` +
-          `Nothing was started. Log in and run acp-gateway again — carrying on would leave ` +
-          `the workspace showing a live agent that fails every task it is given.`,
+        `\n[acp-gateway] The agent will not start a session until it is authenticated: ` +
+          `${err instanceof Error ? err.message : String(err)}\n` +
+          `Nothing was started. ${remedy} Carrying on would leave the workspace showing a ` +
+          `live agent that fails every task it is given.`,
       );
       return "unauthenticated";
     }

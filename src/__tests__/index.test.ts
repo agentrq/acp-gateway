@@ -640,7 +640,7 @@ describe("index", () => {
       const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
 
       expect(outcome).toBe("unauthenticated");
-      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("needs you to log in"));
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("until it is authenticated"));
       expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(false);
       // Nothing was claimed about an agent that never started.
       expect(mockBridge.sendNotification).not.toHaveBeenCalledWith(
@@ -665,7 +665,27 @@ describe("index", () => {
       const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
 
       expect(outcome).toBe("unauthenticated");
-      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("needs you to log in"));
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("Log in and run acp-gateway again"));
+      consoleSpy.mockRestore();
+    });
+
+    it("tells the owner of an API-key agent to set the key, not to log in", async () => {
+      // Plenty of agents never ask anyone to log in — they read a key from the
+      // environment. When one of those refuses, sending its owner looking for a
+      // login prompt that does not exist is worse than saying nothing.
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const mockBridge: any = fakeBridge();
+      newSessionError.value = new AuthenticationFailed(new Error("auth_required"), false);
+
+      const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(outcome).toBe("unauthenticated");
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining("expecting a credential of its own"),
+      );
+      expect(consoleSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("Log in and run acp-gateway again."),
+      );
       consoleSpy.mockRestore();
     });
 
