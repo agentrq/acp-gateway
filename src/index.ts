@@ -167,9 +167,45 @@ export interface AgentSession {
   acpClient: AgentRQACPClient;
   sessionId: string;
   initResult: acp.InitializeResponse;
+  /** Hands this session to a task, re-keying it and re-attributing its reports. */
+  adopt(taskId: string): void;
 }
 
+/**
+ * Where the session opened before any task is filed.
+ *
+ * It exists so a connected gateway can say what its agent offers — models and
+ * slash commands only exist inside a session, and ACP has no way to ask
+ * outside one — and it is handed to the first task rather than duplicated.
+ */
+export const IDLE_SESSION_KEY = "default";
+
 export const activeSessions = new Map<string, AgentSession>();
+
+/**
+ * The startup session while it is still being opened.
+ *
+ * Opening one can take a long time — an agent that wants authentication stops
+ * and waits for a human — and a task arriving in that window would find nothing
+ * in `activeSessions` and start a second agent beside the one already coming
+ * up. Waiting for the answer costs nothing and is the difference between one
+ * agent and two.
+ */
+let idleSessionInFlight: Promise<AgentSession> | null = null;
+
+/** Forgets any in-flight startup session. For tests. */
+export function resetIdleSession(): void {
+  idleSessionInFlight = null;
+}
+
+/**
+ * What closing a session actually needs.
+ *
+ * Narrower than AgentSession on purpose: `--list-models` opens a session that
+ * belongs to no task and closes it again, and it should not have to invent the
+ * task bookkeeping it will never use.
+ */
+export type ClosableSession = Omit<AgentSession, "adopt">;
 
 /** How long to wait for `session/close` RPC before terminating the session process regardless. */
 export const CLOSE_SESSION_TIMEOUT_MS = 2000;
@@ -194,7 +230,7 @@ export function supportsCloseSession(
  * 3. Kills the agent child process.
  */
 export async function closeSession(
-  session: AgentSession,
+  session: ClosableSession,
   timeoutMs: number = CLOSE_SESSION_TIMEOUT_MS,
 ): Promise<void> {
   if (session.acpClient && typeof session.acpClient.cancelTurn === "function") {
@@ -300,6 +336,8 @@ export function isInteractiveTerminal(): boolean {
 }
 
 export interface AgentConnection {
+  /** Attributes everything this connection reports to a task. */
+  assignTask?: (taskId: string) => void;
   process: any;
   connection: acp.ClientSideConnection;
   acpClient: AgentRQACPClient;
@@ -497,7 +535,11 @@ export async function openAgentConnection({
     shell: needsShell(target),
   });
 
-  const acpClient = new AgentRQACPClient(mcpBridge, () => taskId, {
+  // Read through a holder rather than captured directly: a session created
+  // before any task exists is later handed to the first one, and everything it
+  // reports afterwards has to be attributed to that task.
+  let currentTaskId = taskId;
+  const acpClient = new AgentRQACPClient(mcpBridge, () => currentTaskId, {
     permissionTimeoutMs: permissionConfig.timeoutMs,
   });
 
@@ -571,7 +613,15 @@ export async function openAgentConnection({
     );
   }
 
-  return { process: agentProcess, connection, acpClient, initResult };
+  return {
+    process: agentProcess,
+    connection,
+    acpClient,
+    initResult,
+    assignTask: (id: string) => {
+      currentTaskId = id;
+    },
+  };
 }
 
 /**
@@ -602,21 +652,43 @@ export async function getOrCreateSession(
   agentrqConfig: McpServerConfig,
   mcpBridge: MCPBridge,
 ): Promise<AgentSession> {
-  const key = taskId || "default";
-  const existing = activeSessions.get(key);
+  let sessionKey = taskId || IDLE_SESSION_KEY;
+  const existing = activeSessions.get(sessionKey);
   if (existing) {
     return existing;
   }
 
+  // The session made at startup, before any task, is handed to the first task
+  // that arrives rather than left beside a second agent doing the same job. Its
+  // conversation is empty, so there is nothing for the task to inherit but the
+  // process itself.
+  if (taskId) {
+    // Still coming up — wait for it rather than racing it into a second agent.
+    if (idleSessionInFlight) {
+      try {
+        await idleSessionInFlight;
+      } catch {
+        // It failed; this task opens its own below, and reports the failure
+        // itself rather than inheriting a stale one.
+      }
+    }
+    const idle = activeSessions.get(IDLE_SESSION_KEY);
+    if (idle) {
+      idle.adopt(taskId);
+      console.error(`[acp] Task ${taskId} took over the session opened at startup`);
+      return idle;
+    }
+  }
+
   const [cmd, ...cmdArgs] = acpCmdArgs;
-  const { process: agentProcess, connection, acpClient, initResult } =
+  const { process: agentProcess, connection, acpClient, initResult, assignTask } =
     await openAgentConnection({
       acpCmdArgs,
       mcpBridge,
       env: agentrqConfig.env,
-      label: `task ${key}`,
+      label: taskId ? `task ${taskId}` : "the idle session",
       taskId,
-      onExit: () => activeSessions.delete(key),
+      onExit: () => activeSessions.delete(sessionKey),
     });
 
   const newSessionParams: AcpNewSessionParams = {
@@ -624,13 +696,24 @@ export async function getOrCreateSession(
     mcpServers: mapMcpServers(configs, initResult.agentCapabilities),
   };
 
+  // An agent that demands authentication stops here and waits, including at
+  // startup — that is the point of starting a session then. A terminal is where
+  // someone can actually answer, and finding out on the first task instead
+  // means a gateway that looked connected all along.
+  //
+  // Headless, `login` refuses rather than blocking on a prompt nobody can see:
+  // it only offers a terminal method to an interactive terminal, and throws a
+  // message naming --auth-method otherwise. openIdleSession logs that and
+  // leaves the gateway up.
   const sessionResult = await createSessionWithAuth(connection, newSessionParams, {
     methods: initResult.authMethods,
     launch: { command: cmd, args: cmdArgs, env: agentrqConfig.env },
     preferredId: authConfig.methodId,
     interactive: isInteractiveTerminal(),
   });
-  console.error(`[acp] Created session ${sessionResult.sessionId} for task ${key}`);
+  console.error(
+    `[acp] Created session ${sessionResult.sessionId} for ${taskId ? `task ${taskId}` : "the idle session"}`,
+  );
 
   // Tell the workspace which agent this actually is. Its MCP client is this
   // gateway, so without this the workspace can only ever name the bridge.
@@ -694,14 +777,107 @@ export async function getOrCreateSession(
     acpClient,
     sessionId: sessionResult.sessionId,
     initResult,
+    adopt(nextTaskId: string) {
+      activeSessions.delete(sessionKey);
+      sessionKey = nextTaskId;
+      activeSessions.set(sessionKey, sessionInfo);
+      assignTask?.(nextTaskId);
+    },
   };
-  activeSessions.set(key, sessionInfo);
+  activeSessions.set(sessionKey, sessionInfo);
   return sessionInfo;
 }
 
 /**
  * Finds the active agent session for a given task ID (or returns the single active session if none specified).
  */
+/**
+ * Opens a session before any task, so the workspace can say what this agent
+ * offers rather than only that something is attached.
+ *
+ * Models arrive as config options on `session/new` and slash commands as a
+ * session notification, so there is no way to learn either without a session —
+ * ACP has no question to ask outside one.
+ *
+ * An agent that demands authentication stops and waits here, which is much of
+ * the value of starting a session at all: the terminal someone just typed into
+ * is where they can answer.
+ *
+ * If that login does not happen — refused, or headless where there is nobody to
+ * ask — the gateway shuts down rather than carrying on. It would otherwise sit
+ * there looking connected, take every task the workspace gave it and fail all
+ * of them, which is worse than not running: the workspace would show a live
+ * agent while the work quietly went nowhere.
+ *
+ * Every other failure is survivable and is survived. An agent that could not be
+ * spawned may simply have lost a race; it used to fail when the first task
+ * arrived and it still does, and turning that into a gateway that refuses to
+ * run would be a worse trade than the one this is making.
+ *
+ * The session is handed to the first task rather than left running beside it —
+ * see getOrCreateSession.
+ */
+export async function openIdleSession(
+  acpCmdArgs: string[],
+  configs: McpServerConfig[],
+  agentrqConfig: McpServerConfig,
+  mcpBridge: MCPBridge,
+  onUnauthenticated: (message: string) => void = exitUnauthenticated,
+): Promise<void> {
+  try {
+    idleSessionInFlight = getOrCreateSession(
+      undefined,
+      acpCmdArgs,
+      configs,
+      agentrqConfig,
+      mcpBridge,
+    );
+    await idleSessionInFlight;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (isAuthRequiredError(err) || isLoginRefusal(err)) {
+      onUnauthenticated(message);
+      return;
+    }
+    console.error(
+      "[acp] Could not open a session to learn what the agent offers; " +
+        "the first task will start one:",
+      message,
+    );
+  } finally {
+    idleSessionInFlight = null;
+  }
+}
+
+/**
+ * Whether a failed session was `login` giving up rather than the agent falling
+ * over.
+ *
+ * `login` throws a plain Error for the two cases nobody can act on from here —
+ * an unknown `--auth-method`, and no usable method at all, which is what a
+ * headless run hits — so the message is what distinguishes them. Matching on it
+ * is uncomfortable, and it is still better than treating "cannot authenticate"
+ * as a transient hiccup and handing the workspace an agent that will fail
+ * everything it is given.
+ */
+export function isLoginRefusal(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : "";
+  return (
+    message.startsWith("No usable authentication method") ||
+    message.startsWith("Unknown authentication method")
+  );
+}
+
+/** Stops the gateway, saying what has to happen before it can run. */
+function exitUnauthenticated(message: string): never {
+  console.error(
+    `\n[acp-gateway] The agent needs you to log in before it can do anything: ${message}\n` +
+      `Nothing was started. Log in and run acp-gateway again — carrying on would leave ` +
+      `the workspace showing a live agent that fails every task it is given.`,
+  );
+  return process.exit(1);
+}
+
 export function findActiveSession(taskId?: string): AgentSession | undefined {
   if (taskId) {
     const direct = activeSessions.get(taskId);
@@ -1476,17 +1652,6 @@ async function main() {
     process.exit(0);
   }
 
-  await mcpBridge.connect();
-
-  // Name the agent as soon as there is somewhere to say it. The agent itself
-  // will not speak until the first task starts it, and until then a workspace
-  // can only see this gateway — so it showed the bridge's name where a human
-  // wanted the agent's. What the registry said is the best answer available
-  // now, and the agent's own word replaces it the moment it has one.
-  if (resolved.identity) {
-    void sendAgentIdentity(mcpBridge, resolved.identity);
-  }
-
   let cleanupPromise: Promise<void> | null = null;
   const cleanup = async (signal?: string) => {
     if (cleanupPromise) return cleanupPromise;
@@ -1581,6 +1746,29 @@ async function main() {
         console.error("[bridge] Error handling task cancellation:", err);
       });
     });
+
+    // Everything above is listening; nothing below can be missed.
+    //
+    // The agent comes up before the workspace is told anything, so a task can
+    // never be handed to a gateway whose agent is not ready — or, if it needs a
+    // login nobody can give it, to one that will never be ready. Awaited for
+    // that reason: whatever the workspace learns next, it learns about an agent
+    // that already exists.
+    //
+    // The handlers above are registered first because opening that session
+    // sends notifications, and sending one opens the connection. A task pushed
+    // between the connection opening and something listening for it is a task
+    // dropped on the floor.
+    await openIdleSession(acpCmdArgs, configs, agentrqConfig, mcpBridge);
+
+    await mcpBridge.connect();
+
+    // Name the agent now there is somewhere to say it. The registry's answer is
+    // the one available before the agent has spoken for itself, and the agent's
+    // own word replaces it as soon as it has one.
+    if (resolved.identity) {
+      void sendAgentIdentity(mcpBridge, resolved.identity);
+    }
 
     // Initial check for a pending task
     await checkForNextTask(

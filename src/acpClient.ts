@@ -830,15 +830,12 @@ export class AgentRQACPClient implements acp.Client {
     sessionId: string,
     modelsResult: AgentModelsResult,
   ): Promise<void> {
-    const taskId = this.getTaskIdForSession(sessionId);
-    if (!taskId) {
-      console.error(
-        `[acp] No task ID for session ${sessionId}, not sending models notification`,
-      );
-      return;
-    }
+    // No task required. The workspace keys this to the MCP connection it
+    // arrived on and ignores the task id, so refusing to send without one only
+    // kept a workspace ignorant of its agent until somebody gave it work —
+    // which is exactly when a human is looking at it.
     const payload = {
-      task_id: taskId,
+      task_id: this.getTaskIdForSession(sessionId) ?? "",
       session_id: sessionId,
       config_id: modelsResult.configId,
       current_model: modelsResult.currentModelId,
@@ -875,15 +872,9 @@ export class AgentRQACPClient implements acp.Client {
     sessionId: string,
     commands: AgentCommand[],
   ): Promise<void> {
-    const taskId = this.getTaskIdForSession(sessionId);
-    if (!taskId) {
-      console.error(
-        `[acp] No task ID for session ${sessionId}, not sending commands notification`,
-      );
-      return;
-    }
+    // No task required, for the reason sendModelsToWorkspace records.
     const payload: CommandsPayload = {
-      task_id: taskId,
+      task_id: this.getTaskIdForSession(sessionId) ?? "",
       session_id: sessionId,
       commands,
     };

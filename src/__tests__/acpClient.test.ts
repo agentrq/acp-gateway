@@ -2168,7 +2168,10 @@ describe("AgentRQACPClient", () => {
       );
     });
 
-    it("skips models notification when no task ID is found for session", async () => {
+    it("sends the models even when no task is attached to the session", async () => {
+      // The session opened at startup has no task, and it is the one that lets
+      // a workspace say what its agent offers before any work arrives. The
+      // workspace keys this to the connection and ignores the task id.
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const c = new AgentRQACPClient(
         mcpBridge as unknown as MCPBridge,
@@ -2181,9 +2184,9 @@ describe("AgentRQACPClient", () => {
         models: [{ id: "gpt-4", name: "GPT-4", current: true }],
       });
 
-      expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("No task ID for session sess-notask, not sending models notification"),
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/models",
+        expect.objectContaining({ task_id: "", session_id: "sess-notask", config_id: "model" }),
       );
       consoleSpy.mockRestore();
     });
@@ -2272,14 +2275,20 @@ describe("AgentRQACPClient", () => {
       consoleSpy.mockRestore();
     });
 
-    it("skips the send when the session has no task to attach to", async () => {
+    it("sends the commands even when the session has no task attached", async () => {
+      // Same reason as the models: the startup session has no task, and it is
+      // what lets the composer offer commands before any work has run.
       const consoleSpy = quiet();
 
       await advertise(clientWithTask(), [{ name: "init", description: "d" }]);
 
-      expect(mcpBridge.sendNotification).not.toHaveBeenCalled();
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("No task ID for session sess-1"),
+      expect(mcpBridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/commands",
+        expect.objectContaining({
+          task_id: "",
+          session_id: "sess-1",
+          commands: [{ name: "init", description: "d" }],
+        }),
       );
       consoleSpy.mockRestore();
     });
