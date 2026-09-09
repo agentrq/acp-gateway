@@ -162,7 +162,8 @@ describe("MCPBridge", () => {
       expect(Client).toHaveBeenCalled();
       expect(StreamableHTTPClientTransport).toHaveBeenCalled();
       expect(lastMockClient.connect).toHaveBeenCalled();
-      expect(lastMockClient.setNotificationHandler).toHaveBeenCalledTimes(3);
+      // permission verdict, cancel, and set_model.
+      expect(lastMockClient.setNotificationHandler).toHaveBeenCalledTimes(4);
       expect((bridge as any).isConnected).toBe(true);
     });
 
@@ -341,6 +342,77 @@ describe("MCPBridge", () => {
       expect(lastMockClient.notification).toHaveBeenCalledWith({
         method: "test-method",
         params: { foo: "bar" },
+      });
+    });
+  });
+
+  describe("model selection notifications", () => {
+    function getSetModelNotificationHandler() {
+      for (const call of lastMockClient.setNotificationHandler.mock.calls) {
+        const schema = call[0];
+        try {
+          const parsed = schema.safeParse({
+            method: "notifications/claude/channel/set_model",
+          });
+          if (parsed.success) return call[1];
+        } catch {}
+      }
+      return undefined;
+    }
+
+    it("emits setModel for the snake_case the workspace actually sends", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetModel = vi.fn();
+      bridge.on("setModel", onSetModel);
+
+      getSetModelNotificationHandler()({
+        method: "notifications/claude/channel/set_model",
+        params: { session_id: "sess-1", config_id: "model", model_id: "gpt-5-codex" },
+      });
+
+      expect(onSetModel).toHaveBeenCalledWith({
+        sessionId: "sess-1",
+        configId: "model",
+        modelId: "gpt-5-codex",
+      });
+    });
+
+    it("accepts camelCase too, so a spelling never becomes a silent no-op", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetModel = vi.fn();
+      bridge.on("setModel", onSetModel);
+
+      getSetModelNotificationHandler()({
+        method: "notifications/claude/channel/set_model",
+        params: { sessionId: "sess-2", configId: "model_id", modelId: "gemini-2.5-pro" },
+      });
+
+      expect(onSetModel).toHaveBeenCalledWith({
+        sessionId: "sess-2",
+        configId: "model_id",
+        modelId: "gemini-2.5-pro",
+      });
+    });
+
+    it("survives a notification carrying no params at all", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetModel = vi.fn();
+      bridge.on("setModel", onSetModel);
+
+      getSetModelNotificationHandler()({
+        method: "notifications/claude/channel/set_model",
+      });
+
+      expect(onSetModel).toHaveBeenCalledWith({
+        sessionId: undefined,
+        configId: undefined,
+        modelId: undefined,
       });
     });
   });

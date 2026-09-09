@@ -794,40 +794,13 @@ export async function getOrCreateSession(
   try {
     const modelsResult = extractModels(sessionResult.configOptions);
     if (modelsResult) {
-      if (modelConfig.modelId && modelConfig.modelId !== modelsResult.currentModelId) {
-        const targetModel = modelsResult.models.find(
-          (m) => m.id === modelConfig.modelId || m.name === modelConfig.modelId,
-        );
-        if (targetModel) {
-          try {
-            const updateRes = await setSessionModel(
-              connection,
-              sessionResult.sessionId,
-              modelsResult.configId,
-              targetModel.id,
-            );
-            const updatedModels = extractModels(updateRes.configOptions) ?? {
-              ...modelsResult,
-              currentModelId: targetModel.id,
-              models: modelsResult.models.map((m) => ({
-                ...m,
-                current: m.id === targetModel.id,
-              })),
-            };
-            void acpClient.sendModelsToWorkspace(sessionResult.sessionId, updatedModels);
-          } catch (err) {
-            console.error(`[acp] Failed to set requested model "${modelConfig.modelId}":`, err);
-            void acpClient.sendModelsToWorkspace(sessionResult.sessionId, modelsResult);
-          }
-        } else {
-          console.error(
-            `[acp] Requested model "${modelConfig.modelId}" not found in available models: ${modelsResult.models.map((m) => m.id).join(", ")}`,
-          );
-          void acpClient.sendModelsToWorkspace(sessionResult.sessionId, modelsResult);
-        }
-      } else {
-        void acpClient.sendModelsToWorkspace(sessionResult.sessionId, modelsResult);
-      }
+      await applyModelSelection({
+        connection,
+        acpClient,
+        sessionId: sessionResult.sessionId,
+        known: modelsResult,
+        requested: modelConfig.modelId,
+      });
     }
   } catch (err) {
     console.error(`[acp] Failed to extract or configure models for session ${sessionResult.sessionId}:`, err);
@@ -1037,6 +1010,143 @@ export function findActiveSession(taskId?: string): AgentSession | undefined {
  * Handles task cancellation events from the MCP server.
  * Cancels the ACP session/turn and immediately cancels any pending permissions.
  */
+/**
+ * Switches a session's model and tells the workspace what it ended up as.
+ *
+ * The one place a model is ever set, reached from two directions: the --model
+ * flag as a session opens, and a selection made in the interface while it is
+ * running. They were one block until the second existed; keeping two copies of
+ * resolve-set-echo would have let the startup path and the runtime path drift
+ * into disagreeing about what a failed switch looks like.
+ *
+ * Whatever happens, the workspace is told something. That is the contract the
+ * interface is built on: it marks a chosen model pending and waits for a models
+ * notification to settle it, so a switch that quietly failed would leave the
+ * picker claiming a model the agent never adopted. Every path below ends in a
+ * report — the new list on success, the old one on any failure.
+ */
+export async function applyModelSelection({
+  connection,
+  acpClient,
+  sessionId,
+  known,
+  requested,
+  configId,
+}: {
+  connection: acp.ClientSideConnection;
+  acpClient: AgentRQACPClient;
+  sessionId: string;
+  /** What the session last advertised, when that is known. */
+  known?: AgentModelsResult;
+  /** The model asked for, by id or by display name. */
+  requested?: string;
+  /** The config option to write through, when the caller knows it. */
+  configId?: string;
+}): Promise<void> {
+  const echo = (result?: AgentModelsResult) => {
+    const fallback = result ?? known ?? acpClient.lastModelsFor(sessionId);
+    if (fallback) void acpClient.sendModelsToWorkspace(sessionId, fallback);
+  };
+
+  // Nothing asked for, or already the current model: report and stop. Setting a
+  // model the session is already on would be a needless round trip to the agent
+  // for an answer nobody is waiting on.
+  if (!requested || (known && requested === known.currentModelId)) {
+    echo();
+    return;
+  }
+
+  // Resolved by display name as well as by id, because --model is typed by a
+  // human who may well have copied what the picker showed them. A selection
+  // from the interface always carries an id and matches on the first branch.
+  const target = known?.models.find((m) => m.id === requested || m.name === requested);
+  if (known && !target) {
+    console.error(
+      `[acp] Requested model "${requested}" not found in available models: ${known.models.map((m) => m.id).join(", ")}`,
+    );
+    echo();
+    return;
+  }
+
+  const option = configId ?? known?.configId;
+  if (!option) {
+    console.error(
+      `[acp] Cannot set model "${requested}" for session ${sessionId}: no config option to write it to`,
+    );
+    echo();
+    return;
+  }
+
+  const modelId = target?.id ?? requested;
+  try {
+    const updateRes = await setSessionModel(connection, sessionId, option, modelId);
+    // The agent's own answer is preferred over anything assumed here — it is
+    // what actually took effect. The constructed fallback is for agents that
+    // answer without repeating their config, and marks the chosen model current
+    // rather than leaving the interface with nothing selected.
+    const updated =
+      extractModels(updateRes.configOptions) ??
+      (known
+        ? {
+            ...known,
+            currentModelId: modelId,
+            models: known.models.map((m) => ({ ...m, current: m.id === modelId })),
+          }
+        : undefined);
+    echo(updated);
+  } catch (err) {
+    console.error(`[acp] Failed to set requested model "${requested}":`, err);
+    echo();
+  }
+}
+
+/**
+ * Switches model on a session the workspace names, at the workspace's request.
+ *
+ * The session id on the wire is the agent's own, which is what activeSessions
+ * is searched by — findActiveSession already matches on it, and on the task id
+ * a session is filed under, so either identifies the same session.
+ *
+ * A set for a session that has gone still answers. The interface is holding a
+ * pending model and only a models notification releases it, so staying silent
+ * about a vanished session would leave it pending forever; echoing what was
+ * last known lets it revert to the truth.
+ */
+export async function handleSetModel({
+  sessionId,
+  configId,
+  modelId,
+}: {
+  sessionId?: string;
+  configId?: string;
+  modelId?: string;
+}): Promise<void> {
+  if (!modelId) {
+    console.error("[bridge] Received a set_model notification naming no model");
+    return;
+  }
+
+  const session = findActiveSession(sessionId);
+  if (!session) {
+    console.error(
+      `[bridge] Received set_model for session ${sessionId ?? "(unnamed)"}, but no active session matches it`,
+    );
+    return;
+  }
+
+  console.error(
+    `[bridge] Switching session ${session.sessionId} to model "${modelId}"`,
+  );
+  await applyModelSelection({
+    connection: session.connection,
+    acpClient: session.acpClient,
+    sessionId: session.sessionId,
+    known: session.acpClient.lastModelsFor(session.sessionId),
+    requested: modelId,
+    configId,
+  });
+}
+
 export async function handleTaskCancellation(
   taskId?: string,
   reason?: string,
@@ -1880,6 +1990,15 @@ async function main() {
         console.error("[bridge] Error handling task cancellation:", err);
       });
     });
+
+    mcpBridge.on(
+      "setModel",
+      (params: { sessionId?: string; configId?: string; modelId?: string }) => {
+        handleSetModel(params).catch((err) => {
+          console.error("[bridge] Error handling model selection:", err);
+        });
+      },
+    );
 
     // Everything above is listening; nothing below can be missed.
     //

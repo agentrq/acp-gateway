@@ -238,6 +238,36 @@ export class MCPBridge extends EventEmitter {
         this.emit("cancel", { taskId, reason: params.reason });
       },
     );
+    // Set notification handler for a model chosen in the interface
+    this.client.setNotificationHandler(
+      z.object({
+        method: z.literal("notifications/claude/channel/set_model"),
+        params: z
+          .object({
+            session_id: z.string().optional(),
+            sessionId: z.string().optional(),
+            config_id: z.string().optional(),
+            configId: z.string().optional(),
+            model_id: z.string().optional(),
+            modelId: z.string().optional(),
+          })
+          .passthrough()
+          .optional(),
+      }),
+      (notification) => {
+        console.error("[mcp] Received model selection notification");
+        // Both spellings accepted, like the cancel handler above. The workspace
+        // sends snake_case — that is the wire format of this whole channel —
+        // but tolerating the other costs nothing and turns a whole class of
+        // silent no-op into something that simply works.
+        const params = notification.params ?? {};
+        this.emit("setModel", {
+          sessionId: params.session_id || params.sessionId,
+          configId: params.config_id || params.configId,
+          modelId: params.model_id || params.modelId,
+        });
+      },
+    );
 
     await this.refreshAdvertisedTools();
   }
