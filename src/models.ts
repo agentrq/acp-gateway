@@ -13,14 +13,29 @@ import type * as acp from "@agentclientprotocol/sdk";
 export interface AgentModel {
   /** Unique model identifier (e.g. "gemini-2.5-pro", "claude-3-7-sonnet"). */
   id: string;
+  /** Wire format identifier (snake_case) expected by agentrq workspace. */
+  model_id?: string;
+  /** Wire format identifier (camelCase). */
+  modelId?: string;
+  /** Wire format identifier (ACP option value). */
+  value?: string;
   /** Human-readable display name (e.g. "Gemini 2.5 Pro"). */
   name: string;
+  /** Wire format display name (label alias). */
+  label?: string;
+  /** Wire format display name (title alias). */
+  title?: string;
   /** Optional model description. */
   description?: string;
   /** Whether this is currently the active model. */
   current?: boolean;
+  /** Wire format whether active (snake_case). */
+  is_current?: boolean;
+  /** Wire format whether active (camelCase). */
+  isCurrent?: boolean;
   /** Optional grouping name (e.g. "Anthropic", "Google"). */
   group?: string;
+  category?: string;
 }
 
 export interface AgentModelsResult {
@@ -117,21 +132,23 @@ export function extractModels(
       for (const opt of (item as any).options) {
         if (!opt || typeof opt !== "object" || !("value" in opt)) continue;
         const valStr = String(opt.value);
+        const isCurrent = currentModelId !== undefined && valStr === currentModelId;
         models.push({
           id: valStr,
           name: opt.name || valStr,
           description: opt.description ?? undefined,
-          current: currentModelId !== undefined && valStr === currentModelId,
+          current: isCurrent,
           group: groupName,
         });
       }
     } else if ("value" in item) {
       const valStr = String(item.value);
+      const isCurrent = currentModelId !== undefined && valStr === currentModelId;
       models.push({
         id: valStr,
         name: item.name || valStr,
         description: item.description ?? undefined,
-        current: currentModelId !== undefined && valStr === currentModelId,
+        current: isCurrent,
       });
     }
   }
