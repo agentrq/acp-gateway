@@ -191,31 +191,35 @@ The workspace sends:
 ```json
 {
   "method": "notifications/claude/channel/set_concurrency",
-  "params": { "max_concurrency": 4 }
+  "params": { "maxConcurrency": 4 }
 }
 ```
 
-`maxConcurrency` and a bare `concurrency` are accepted too, and the value may be a string. A value of any
-other shape — `null`, a boolean, an object — is accepted at the door and refused downstream, so that it can
-still be answered; a notification dropped for being malformed would be a notification the gateway never
-replied to.
+This pair of notifications is camelCase, unlike the older snake_case messages on the same channel — it is new
+enough to have no client spelling it the other way, so it carries one spelling rather than two.
+
+The value may be a string. A value of any other shape — `null`, a boolean, an object — is accepted at the
+door and refused downstream, so that it can still be answered; a notification dropped for being malformed
+would be a notification the gateway never replied to. A payload that names no `maxConcurrency` at all reads
+as absent and is answered with the limit still in force, so a mistaken sender sees an unchanged limit come
+back rather than silence.
 
 The gateway reports the limit in force on `notifications/claude/channel/concurrency` — on connect, on every
 reconnect, and after every `set_concurrency`:
 
 ```json
 {
-  "max_concurrency": 4,
+  "maxConcurrency": 4,
   "active": 2,
   "queued": 3,
   "min": 1,
   "max": 64,
-  "can_set": true
+  "canSet": true
 }
 ```
 
 That report is unconditional, including when the requested value was refused or clamped, so the interface
-never goes on showing a limit the gateway did not adopt. `can_set` says this gateway will act on being told
+never goes on showing a limit the gateway did not adopt. `canSet` says this gateway will act on being told
 to change; versions before it report a limit and ignore the instruction, so a client should treat the flag's
 absence as no.
 
@@ -224,7 +228,7 @@ Two things worth knowing about how a change lands:
 - **Raising** takes effect at once — every waiting task the new headroom allows starts immediately, rather
   than one per completion.
 - **Lowering** never interrupts a task already in flight. Those keep the agent's attention and finish; the
-  queue simply stops handing out new ones until enough have. So `active` may exceed `max_concurrency` for a
+  queue simply stops handing out new ones until enough have. So `active` may exceed `maxConcurrency` for a
   while after a lower, which is expected rather than an error.
 
 The limit lives in memory. It survives MCP reconnects but not a gateway restart, which falls back to

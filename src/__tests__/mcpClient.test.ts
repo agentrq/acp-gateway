@@ -431,7 +431,7 @@ describe("MCPBridge", () => {
       return undefined;
     }
 
-    it("emits setConcurrency for the snake_case the workspace actually sends", async () => {
+    it("emits setConcurrency for the camelCase this notification uses", async () => {
       const bridge = new MCPBridge(config);
       await bridge.connect();
 
@@ -440,40 +440,10 @@ describe("MCPBridge", () => {
 
       getSetConcurrencyHandler()({
         method: "notifications/claude/channel/set_concurrency",
-        params: { max_concurrency: 4 },
+        params: { maxConcurrency: 4 },
       });
 
       expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: 4 });
-    });
-
-    it("accepts camelCase too, so a spelling never becomes a silent no-op", async () => {
-      const bridge = new MCPBridge(config);
-      await bridge.connect();
-
-      const onSetConcurrency = vi.fn();
-      bridge.on("setConcurrency", onSetConcurrency);
-
-      getSetConcurrencyHandler()({
-        method: "notifications/claude/channel/set_concurrency",
-        params: { maxConcurrency: 8 },
-      });
-
-      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: 8 });
-    });
-
-    it("accepts a bare concurrency key", async () => {
-      const bridge = new MCPBridge(config);
-      await bridge.connect();
-
-      const onSetConcurrency = vi.fn();
-      bridge.on("setConcurrency", onSetConcurrency);
-
-      getSetConcurrencyHandler()({
-        method: "notifications/claude/channel/set_concurrency",
-        params: { concurrency: 2 },
-      });
-
-      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: 2 });
     });
 
     it("passes a number sent as a string straight through to be read later", async () => {
@@ -485,7 +455,7 @@ describe("MCPBridge", () => {
 
       getSetConcurrencyHandler()({
         method: "notifications/claude/channel/set_concurrency",
-        params: { max_concurrency: "6" },
+        params: { maxConcurrency: "6" },
       });
 
       expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: "6" });
@@ -505,12 +475,10 @@ describe("MCPBridge", () => {
       expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: undefined });
     });
 
-    it("keeps a valid limit sent alongside a null in the other spelling", async () => {
-      // The workspace mirrors this gateway's own habit of sending both
-      // spellings. A schema that typed these would drop the whole notification
-      // over the null and lose the 4 sitting next to it — and, because the SDK
-      // discards a notification that fails its schema before the handler runs,
-      // it would do so without the gateway ever answering.
+    it("still answers a sender that spelled it the older snake_case way", async () => {
+      // Not read — this notification has one spelling. But it must still reach
+      // the handler, which reports the limit still in force, so a mistaken
+      // sender sees an unchanged limit come back rather than silence.
       const bridge = new MCPBridge(config);
       await bridge.connect();
 
@@ -519,25 +487,10 @@ describe("MCPBridge", () => {
 
       getSetConcurrencyHandler()({
         method: "notifications/claude/channel/set_concurrency",
-        params: { max_concurrency: 4, maxConcurrency: null },
+        params: { max_concurrency: 4 },
       });
 
-      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: 4 });
-    });
-
-    it("falls past a null spelling to one that carries a value", async () => {
-      const bridge = new MCPBridge(config);
-      await bridge.connect();
-
-      const onSetConcurrency = vi.fn();
-      bridge.on("setConcurrency", onSetConcurrency);
-
-      getSetConcurrencyHandler()({
-        method: "notifications/claude/channel/set_concurrency",
-        params: { max_concurrency: null, maxConcurrency: 3 },
-      });
-
-      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: 3 });
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: undefined });
     });
 
     it("passes a value of any shape on, so every request can still be answered", async () => {
@@ -548,11 +501,12 @@ describe("MCPBridge", () => {
         const onSetConcurrency = vi.fn();
         bridge.on("setConcurrency", onSetConcurrency);
 
-        // Refusing it is normalizeConcurrency's job, downstream, where the
-        // refusal can still be reported back to the interface.
+        // The SDK drops a notification that fails this schema before the
+        // handler runs, so refusing a bad value is normalizeConcurrency's job,
+        // downstream, where the refusal can still be reported.
         getSetConcurrencyHandler()({
           method: "notifications/claude/channel/set_concurrency",
-          params: { max_concurrency: value },
+          params: { maxConcurrency: value },
         });
 
         expect(onSetConcurrency).toHaveBeenCalledTimes(1);

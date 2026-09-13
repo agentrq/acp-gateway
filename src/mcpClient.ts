@@ -274,37 +274,30 @@ export class MCPBridge extends EventEmitter {
     this.client.setNotificationHandler(
       z.object({
         method: z.literal(SET_CONCURRENCY_NOTIFICATION_METHOD),
-        // Deliberately untyped values. The SDK drops a notification that fails
-        // this schema before the handler ever runs, so a type named here is a
-        // type whose arrival is silent — and this gateway's contract is that a
+        // Deliberately untyped. The SDK drops a notification that fails this
+        // schema before the handler ever runs, so a type named here is a type
+        // whose arrival is silent — and this gateway's contract is that a
         // set_concurrency is always answered with the limit in force. Refusing
         // a bad value is normalizeConcurrency's job, downstream, where the
-        // refusal can still be reported. Worse, the workspace mirrors this
-        // gateway's own habit of sending both spellings, so a payload like
-        // `{max_concurrency: 4, maxConcurrency: null}` would have been thrown
-        // away whole — a valid request lost to the spelling beside it.
+        // refusal can still be reported rather than swallowed.
         params: z
-          .object({
-            max_concurrency: z.unknown().optional(),
-            maxConcurrency: z.unknown().optional(),
-            concurrency: z.unknown().optional(),
-          })
+          .object({ maxConcurrency: z.unknown().optional() })
           .passthrough()
           .optional(),
       }),
       (notification) => {
         console.error("[mcp] Received concurrency notification");
-        // Both spellings, and the bare `concurrency`, for the reason the
-        // set_model handler above records: the workspace sends snake_case, and
-        // tolerating the alternatives turns a silent no-op into something that
-        // simply works.
+        // camelCase only, unlike the snake_case siblings above. This pair of
+        // notifications is new enough to have no client that spells it the
+        // other way, so it gets one spelling rather than the two that every
+        // older message on this channel has to carry forever.
+        //
+        // A payload that does spell it the other way is not silently ignored:
+        // the value simply reads as absent, which normalizeConcurrency refuses
+        // and the gateway answers with the limit still in force — so a mistaken
+        // sender sees an unchanged limit come back rather than nothing at all.
         const params = notification.params ?? {};
-        // `??` rather than `||`, so an explicit 0 reaches normalizeConcurrency
-        // and is answered, rather than falling through to the next spelling.
-        this.emit("setConcurrency", {
-          maxConcurrency:
-            params.max_concurrency ?? params.maxConcurrency ?? params.concurrency,
-        });
+        this.emit("setConcurrency", { maxConcurrency: params.maxConcurrency });
       },
     );
 

@@ -83,7 +83,6 @@ describe("concurrency", () => {
       expect(bridge.sendNotification).toHaveBeenCalledWith(
         CONCURRENCY_NOTIFICATION_METHOD,
         expect.objectContaining({
-          max_concurrency: 4,
           maxConcurrency: 4,
           active: 2,
           queued: 3,
@@ -91,6 +90,27 @@ describe("concurrency", () => {
           max: MAX_MAX_CONCURRENCY,
         }),
       );
+    });
+
+    it("spells every field one way, with no snake_case twin to keep in step", async () => {
+      const bridge = { sendNotification: vi.fn().mockResolvedValue(undefined) };
+
+      await sendConcurrencyNotification(bridge, {
+        maxConcurrency: 4,
+        active: 0,
+        queued: 0,
+      });
+
+      expect(Object.keys(bridge.sendNotification.mock.calls[0][1]).sort()).toEqual([
+        "active",
+        "canSet",
+        "max",
+        "maxConcurrency",
+        "min",
+        "queued",
+        "sessionId",
+        "taskId",
+      ]);
     });
 
     it("declares that it will act on being told to change, so old gateways stay read-only", async () => {
@@ -102,10 +122,7 @@ describe("concurrency", () => {
         queued: 0,
       });
 
-      expect(bridge.sendNotification.mock.calls[0][1]).toMatchObject({
-        can_set: true,
-        canSet: true,
-      });
+      expect(bridge.sendNotification.mock.calls[0][1]).toMatchObject({ canSet: true });
     });
 
     it("sends empty task and session ids, which the workspace ignores", async () => {
@@ -118,9 +135,7 @@ describe("concurrency", () => {
       });
 
       expect(bridge.sendNotification.mock.calls[0][1]).toMatchObject({
-        task_id: "",
         taskId: "",
-        session_id: "",
         sessionId: "",
       });
     });

@@ -678,7 +678,7 @@ describe("index", () => {
       expect(queue.getMaxConcurrency()).toBe(5);
       expect(bridge.sendNotification).toHaveBeenCalledWith(
         "notifications/claude/channel/concurrency",
-        expect.objectContaining({ max_concurrency: 5, active: 0, queued: 0 }),
+        expect.objectContaining({ maxConcurrency: 5, active: 0, queued: 0 }),
       );
     });
 
@@ -691,7 +691,7 @@ describe("index", () => {
       expect(queue.getMaxConcurrency()).toBe(64);
       expect(bridge.sendNotification).toHaveBeenCalledWith(
         "notifications/claude/channel/concurrency",
-        expect.objectContaining({ max_concurrency: 64 }),
+        expect.objectContaining({ maxConcurrency: 64 }),
       );
     });
 
@@ -717,7 +717,7 @@ describe("index", () => {
       // silence would leave it showing a limit this gateway never adopted.
       expect(bridge.sendNotification).toHaveBeenCalledWith(
         "notifications/claude/channel/concurrency",
-        expect.objectContaining({ max_concurrency: 3 }),
+        expect.objectContaining({ maxConcurrency: 3 }),
       );
     });
 
@@ -737,7 +737,7 @@ describe("index", () => {
 
       expect(bridge.sendNotification).toHaveBeenCalledWith(
         "notifications/claude/channel/concurrency",
-        expect.objectContaining({ max_concurrency: 2, active: 2, queued: 1 }),
+        expect.objectContaining({ maxConcurrency: 2, active: 2, queued: 1 }),
       );
 
       release!();
@@ -783,7 +783,7 @@ describe("index", () => {
       expect(queue.getMaxConcurrency()).toBe(5);
       expect(bridge.sendNotification).toHaveBeenCalledWith(
         "notifications/claude/channel/concurrency",
-        expect.objectContaining({ max_concurrency: 5 }),
+        expect.objectContaining({ maxConcurrency: 5 }),
       );
     });
 
@@ -802,7 +802,7 @@ describe("index", () => {
       // The limit in force, not the one the gateway booted with.
       expect(bridge.sendNotification).toHaveBeenCalledWith(
         "notifications/claude/channel/concurrency",
-        expect.objectContaining({ max_concurrency: 7 }),
+        expect.objectContaining({ maxConcurrency: 7 }),
       );
     });
 
@@ -842,7 +842,7 @@ describe("index", () => {
 
       expect(bridge.sendNotification).toHaveBeenCalledWith(
         "notifications/claude/channel/concurrency",
-        expect.objectContaining({ max_concurrency: 2, active: 2, queued: 1 }),
+        expect.objectContaining({ maxConcurrency: 2, active: 2, queued: 1 }),
       );
 
       release!();

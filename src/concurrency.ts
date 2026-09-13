@@ -79,15 +79,16 @@ export async function sendConcurrencyNotification(
   bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
   state: ConcurrencyState,
 ): Promise<void> {
+  // camelCase, and only camelCase. The older notifications on this channel
+  // each carry a field twice because they gained a second spelling after
+  // something was already reading the first; this pair has no such history and
+  // no reason to acquire one.
   const payload = {
     // No task or session required, for the reason sendAgentIdentity records:
     // the workspace keys this to the MCP connection it arrived on, and the
     // moment a human most wants to see the limit is before any task has run.
-    task_id: "",
     taskId: "",
-    session_id: "",
     sessionId: "",
-    max_concurrency: state.maxConcurrency,
     maxConcurrency: state.maxConcurrency,
     active: state.active,
     queued: state.queued,
@@ -98,7 +99,6 @@ export async function sendConcurrencyNotification(
     // Every gateway ever published could report a limit; the ones before this
     // release ignore being told to change it, and nothing else on the wire
     // distinguishes them.
-    can_set: true,
     canSet: true,
   };
   try {
