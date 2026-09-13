@@ -1385,26 +1385,99 @@ export async function handleSetConcurrency(
       queue.setMaxConcurrency(requested);
     }
   } finally {
-    // Often the second report of the same change, and deliberately so: raising
-    // the limit starts waiting tasks, and each of those announces itself
-    // through the queue's own callback before this runs. Both are true, the
-    // workspace renders every report rather than only changed ones, and this
-    // one is the one that is guaranteed — the queue says nothing at all when a
-    // set changes no numbers, and a set must always be answered.
+    // Often asked for while the queue's own reports are still going out —
+    // raising the limit starts waiting tasks, and each announces itself. That
+    // is why this is here anyway: the queue says nothing at all when a set
+    // moves no numbers, and a set must always be answered.
+    //
+    // Awaiting it is what makes the answer real. Reports go out one at a time,
+    // and this resolves only once no further report is wanted, so by the time
+    // it returns the workspace has been told the limit that actually took
+    // effect — after, not before, anything the raise set running.
     if (bridge) await reportConcurrency(bridge, queue);
   }
 }
 
-/** Tells the workspace what the queue's limit is and what it is doing under it. */
-export async function reportConcurrency(
+/**
+ * The report on the wire, if one is, and whether the numbers moved while it flew.
+ *
+ * Each report is its own HTTP POST, and two in flight at once may be processed
+ * in either order — so the workspace would be left showing whichever landed
+ * last rather than whichever is true. That cost little while a report followed
+ * a human moving a control. It costs a great deal now that one follows every
+ * task transition, because `execute` announces a freed slot and then `next()`
+ * immediately announces the task that took it: two reports, one tick apart,
+ * disagreeing about the same number. Landing them the wrong way round leaves
+ * the interface wrong until something else moves — which is the very failure
+ * this feature exists to end.
+ */
+let reportOnTheWire: Promise<void> | null = null;
+let numbersMovedAgain = false;
+
+/** Forgets any report in flight. For tests. */
+export function resetConcurrencyReports(): void {
+  reportOnTheWire = null;
+  numbersMovedAgain = false;
+}
+
+/**
+ * Tells the workspace what the queue's limit is and what it is doing under it.
+ *
+ * One report at a time, so they arrive in the order they were asked for. A
+ * report wanted while one is flying does not queue up behind it: the numbers
+ * are read again when the wire is free, so a burst of transitions costs one
+ * further report rather than one per transition, and every report carries the
+ * state at the moment it was actually sent. Whatever the workspace hears last
+ * is therefore the truth, which is the only property that really matters here.
+ *
+ * Callers may await this and know a report reflecting their change has gone
+ * out — `handleSetConcurrency` depends on exactly that.
+ */
+export function reportConcurrency(
   bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
   queue: TaskQueue,
 ): Promise<void> {
-  await sendConcurrencyNotification(bridge, {
-    maxConcurrency: queue.getMaxConcurrency(),
-    active: queue.getActiveCount(),
-    queued: queue.getQueueLength(),
-  });
+  if (reportOnTheWire) {
+    numbersMovedAgain = true;
+    return reportOnTheWire;
+  }
+  // Assigned from the call rather than after it: `drainConcurrencyReports` runs
+  // as far as its first await before returning, and nothing else can run in
+  // between.
+  return (reportOnTheWire = drainConcurrencyReports(bridge, queue));
+}
+
+/**
+ * Sends reports until nobody has asked for another.
+ *
+ * The slot is cleared in a `finally` inside this function rather than off the
+ * returned promise, so that it happens in the same tick the loop ends. Clearing
+ * it a microtask later would leave a window where a caller sees a report in
+ * flight, sets the flag, and is answered by a loop that has already stopped
+ * reading it — a report asked for and never sent.
+ *
+ * The bridge is whichever caller opened the slot. The gateway has exactly one
+ * for its whole life, and a reconnect replaces what is inside it rather than
+ * the object, so there is no second bridge for a collapsed report to miss.
+ */
+async function drainConcurrencyReports(
+  bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
+  queue: TaskQueue,
+): Promise<void> {
+  try {
+    do {
+      numbersMovedAgain = false;
+      // Read here, not at the call: a collapsed report is worth sending only
+      // because it describes the queue now rather than when it was asked for.
+      await sendConcurrencyNotification(bridge, {
+        maxConcurrency: queue.getMaxConcurrency(),
+        active: queue.getActiveCount(),
+        queued: queue.getQueueLength(),
+      });
+    } while (numbersMovedAgain);
+  } finally {
+    reportOnTheWire = null;
+  }
 }
 
 /**

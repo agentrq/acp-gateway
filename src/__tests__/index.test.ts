@@ -11,6 +11,7 @@ import {
   mapMcpServers,
   TaskQueue,
   createTaskQueue,
+  resetConcurrencyReports,
   getOrCreateSession,
   openIdleSession,
   resetIdleSession,
@@ -1162,6 +1163,101 @@ describe("index", () => {
   });
 
   describe("reportConcurrency", () => {
+    beforeEach(() => resetConcurrencyReports());
+    afterEach(() => resetConcurrencyReports());
+
+    /** A bridge whose sends finish only when the test says so. */
+    const heldBridge = () => {
+      const releases: Array<() => void> = [];
+      const sendNotification = vi.fn(
+        () => new Promise<void>((resolve) => { releases.push(resolve); }),
+      );
+      return { bridge: { sendNotification } as any, sendNotification, releases };
+    };
+
+    it("never puts two reports on the wire at once", async () => {
+      // Each report is its own POST and nothing sequences them, so two in
+      // flight can be processed in either order — and the workspace would then
+      // show whichever landed last rather than whichever is true.
+      const { bridge, sendNotification, releases } = heldBridge();
+      const queue = new TaskQueue(4);
+
+      void reportConcurrency(bridge, queue);
+      void reportConcurrency(bridge, queue);
+      void reportConcurrency(bridge, queue);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // The second and third waited for the first rather than racing it.
+      expect(sendNotification).toHaveBeenCalledTimes(1);
+
+      releases[0]();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(sendNotification).toHaveBeenCalledTimes(2);
+
+      releases[1]();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // Three asks, two reports: the ones that piled up became one.
+      expect(sendNotification).toHaveBeenCalledTimes(2);
+    });
+
+    it("makes the report that follows a burst describe the queue now", async () => {
+      // A collapsed report is worth sending only because it is current; one
+      // carrying the state at the moment it was asked for would be a stale
+      // number arriving late, which is the thing being fixed.
+      const { bridge, sendNotification, releases } = heldBridge();
+      // Wired to the bridge, so a task starting is what asks for the report.
+      const queue = createTaskQueue(4, bridge);
+
+      void reportConcurrency(bridge, queue);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(sendNotification).toHaveBeenLastCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ active: 0, queued: 0 }),
+      );
+
+      // The numbers move while the first report is still flying.
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const running = queue.run(() => held);
+
+      releases[0]();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(sendNotification).toHaveBeenLastCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ active: 1, queued: 0 }),
+      );
+
+      release();
+      releases.slice(1).forEach((r) => r());
+      await running;
+    });
+
+    it("resolves only once the workspace has been told", async () => {
+      // handleSetConcurrency awaits this to make "always answered" true, so it
+      // must not resolve on the strength of somebody else's report.
+      const { bridge, sendNotification, releases } = heldBridge();
+      const queue = new TaskQueue(4);
+
+      void reportConcurrency(bridge, queue);
+      let answered = false;
+      void reportConcurrency(bridge, queue).then(() => { answered = true; });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // The first report has not even landed yet.
+      expect(answered).toBe(false);
+
+      releases[0]();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // Nor on the first one landing — the second is what it is owed.
+      expect(answered).toBe(false);
+
+      releases[1]();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(answered).toBe(true);
+      expect(sendNotification).toHaveBeenCalledTimes(2);
+    });
+
     it("describes the queue as it stands", async () => {
       const bridge: any = { sendNotification: vi.fn().mockResolvedValue(undefined) };
       const queue = new TaskQueue(2);
