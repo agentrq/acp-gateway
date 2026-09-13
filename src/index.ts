@@ -205,6 +205,64 @@ export const activeSessions = new Map<string, AgentSession>();
 let idleSessionInFlight: Promise<AgentSession> | null = null;
 
 /**
+ * The turn in progress for each task, so a second delivery waits for it.
+ *
+ * ACP gives a session one turn at a time, and this gateway gives a task one
+ * session — so two deliveries of a task running at once would put two prompts
+ * on one session, where the second is refused or interleaves and the streamed
+ * output of both lands in a single reply buffer to be flushed twice.
+ *
+ * Two deliveries of a task is ordinary, not exotic: agentrq reuses a chat's id
+ * as the task id, so two messages sent to the same chat arrive as two tasks
+ * with one id, and the repetition guard drops neither because it compares text
+ * and the two say different things. They must both reach the agent — losing the
+ * second would lose what someone typed — so they are serialised rather than
+ * deduplicated. A concurrency of 1 used to serialise them by accident; above 1
+ * nothing did.
+ */
+const taskTurns = new Map<string, Promise<unknown>>();
+
+/**
+ * Runs a task's turn once every earlier turn for that task has finished.
+ *
+ * A failed turn does not block the next one: a task whose first message errored
+ * must still be able to hear the second.
+ */
+export async function runTurnForTask(
+  taskId: string | undefined,
+  turn: () => Promise<void>,
+): Promise<void> {
+  // Nothing to serialise against. A delivery with no task id is not a second
+  // message on anything — there is no chat for it to be the second of.
+  if (taskId === undefined) return turn();
+
+  const previous = taskTurns.get(taskId);
+  if (previous) {
+    console.error(
+      `[bridge] Task ${taskId} is already mid-turn; waiting for it rather than ` +
+        `prompting the same session twice at once`,
+    );
+  }
+  // `then(turn, turn)` rather than `then(turn)`: the next turn runs whether the
+  // one before it succeeded or threw.
+  const mine = previous ? previous.then(turn, turn) : turn();
+  const settled = mine.catch(() => {});
+  taskTurns.set(taskId, settled);
+  try {
+    await mine;
+  } finally {
+    // Only if nothing has queued behind it, or the chain's tail is dropped and
+    // the next delivery starts beside the one still running.
+    if (taskTurns.get(taskId) === settled) taskTurns.delete(taskId);
+  }
+}
+
+/** Forgets every in-progress turn. For tests. */
+export function resetTaskTurns(): void {
+  taskTurns.clear();
+}
+
+/**
  * Sessions that have been asked for but do not exist yet, by session key.
  *
  * `activeSessions` only learns about a session once the agent has spawned,
@@ -1261,17 +1319,22 @@ export async function handleSetConcurrency(
 ): Promise<void> {
   const requested = normalizeConcurrency(maxConcurrency);
 
-  if (requested === undefined) {
-    console.error(
-      `[bridge] Received a set_concurrency notification asking for ` +
-        `"${String(maxConcurrency)}", which is not a number of tasks; ` +
-        `keeping the limit at ${queue.getMaxConcurrency()}`,
-    );
-  } else {
-    queue.setMaxConcurrency(requested);
+  // In a finally, so the answer does not depend on applying the change going
+  // well. "Always answered" is the whole design; leaving it as the last
+  // statement made it true only while nothing above it threw.
+  try {
+    if (requested === undefined) {
+      console.error(
+        `[bridge] Received a set_concurrency notification asking for ` +
+          `"${String(maxConcurrency)}", which is not a number of tasks; ` +
+          `keeping the limit at ${queue.getMaxConcurrency()}`,
+      );
+    } else {
+      queue.setMaxConcurrency(requested);
+    }
+  } finally {
+    if (bridge) await reportConcurrency(bridge, queue);
   }
-
-  if (bridge) await reportConcurrency(bridge, queue);
 }
 
 /** Tells the workspace what the queue's limit is and what it is doing under it. */
@@ -1663,18 +1726,23 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
     switch (args[i]) {
       case "--max-concurrency":
       case "--maxConcurrency": {
-        // The token after the flag is this flag's value even when it is not a
-        // usable one, so it is consumed either way. Leaving a malformed value
-        // behind dropped it into `rest`, which is the agent command when no
-        // `--` was used — so `--max-concurrency 8x claude` went looking for an
-        // agent called "8x" instead of ignoring a mistyped flag.
-        if (value !== undefined) i++;
+        // A token that starts with a digit was meant as this flag's number, so
+        // it is consumed whether or not it reads as one — left behind, it fell
+        // into `rest`, which is the agent command when no `--` was used, and
+        // `--max-concurrency 8x claude` went looking for an agent called "8x".
+        //
+        // A token that does not start with a digit was never the number. It is
+        // the agent command with the number left out, and eating it would turn
+        // `--max-concurrency claude` from a gateway running claude at the
+        // default into a gateway with nothing to run at all.
+        const looksNumeric = value !== undefined && /^[0-9]/.test(value);
+        if (looksNumeric) i++;
 
         // Read by the same rule the workspace's set_concurrency goes through,
         // so the flag and the runtime control cannot disagree about what a
         // number means. It is also what stops `--max-concurrency 0`, which
         // used to be accepted and then held every task in the queue forever.
-        const parsed = normalizeConcurrency(value);
+        const parsed = looksNumeric ? normalizeConcurrency(value) : undefined;
         if (parsed === undefined) {
           if (value !== undefined) {
             console.error(
@@ -2178,37 +2246,44 @@ async function main() {
           );
           return;
         }
-        try {
-          const sessionInfo = await getOrCreateSession(
-            taskId,
-            acpCmdArgs,
-            configs,
-            agentrqConfig,
-            mcpBridge,
-          );
-          if (isTaskCancelled(taskId, queuedSeq)) {
-            console.error(
-              `[bridge] Task ${taskId} was cancelled during session setup, cancelling session`,
+        // Behind any turn already running for this task: one session takes one
+        // turn at a time, and two messages on one chat arrive as two deliveries
+        // of one task.
+        await runTurnForTask(taskId, async () => {
+          try {
+            const sessionInfo = await getOrCreateSession(
+              taskId,
+              acpCmdArgs,
+              configs,
+              agentrqConfig,
+              mcpBridge,
             );
-            await sessionInfo.acpClient.cancelTurn(sessionInfo.sessionId);
-            return;
-          }
-          const result = await sessionInfo.connection.prompt({
-            sessionId: sessionInfo.sessionId,
-            prompt: [{ type: "text", text: content }],
-          });
+            // Checked again here as well as above: waiting for the turn ahead
+            // of this one is another window in which a cancel can land.
+            if (isTaskCancelled(taskId, queuedSeq)) {
+              console.error(
+                `[bridge] Task ${taskId} was cancelled during session setup, cancelling session`,
+              );
+              await sessionInfo.acpClient.cancelTurn(sessionInfo.sessionId);
+              return;
+            }
+            const result = await sessionInfo.connection.prompt({
+              sessionId: sessionInfo.sessionId,
+              prompt: [{ type: "text", text: content }],
+            });
 
-          await sessionInfo.acpClient.flushReply(sessionInfo.sessionId);
-          await sessionInfo.acpClient.reportStopReason(
-            sessionInfo.sessionId,
-            result.stopReason,
-          );
-          console.error(
-            `\n[acp] Agent completed task. Reason: ${result.stopReason}`,
-          );
-        } catch (err) {
-          console.error("[acp] Error during prompt execution:", err);
-        }
+            await sessionInfo.acpClient.flushReply(sessionInfo.sessionId);
+            await sessionInfo.acpClient.reportStopReason(
+              sessionInfo.sessionId,
+              result.stopReason,
+            );
+            console.error(
+              `\n[acp] Agent completed task. Reason: ${result.stopReason}`,
+            );
+          } catch (err) {
+            console.error("[acp] Error during prompt execution:", err);
+          }
+        });
       }).catch((err) => {
         console.error("[bridge] Error queuing task:", err);
       });
@@ -2411,10 +2486,15 @@ export async function checkForNextTask(
         console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
       };
 
+      // Serialised against any turn already running for this task, for the
+      // reason runTurnForTask records: this path and the push notification can
+      // both be handed the same task, and word it differently enough that the
+      // repetition guard drops neither.
+      const turn = () => runTurnForTask(taskId, runFn);
       if (taskQueue) {
-        await taskQueue.run(runFn);
+        await taskQueue.run(turn);
       } else {
-        await runFn();
+        await turn();
       }
     } else {
       console.error("[bridge] No pending tasks available.");

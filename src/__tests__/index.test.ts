@@ -45,6 +45,8 @@ import {
   handleTaskCancellation,
   handleSetModel,
   handleSetConcurrency,
+  runTurnForTask,
+  resetTaskTurns,
   registerConcurrencyListeners,
   reportConcurrency,
   applyModelSelection,
@@ -411,6 +413,39 @@ describe("index", () => {
       expect(mockAcpClient.flushReply).toHaveBeenCalledWith("current-session");
     });
 
+    it("runs a queued task through the queue, and behind any turn it already has", async () => {
+      // The queue is how a concurrency limit is enforced at all, and the turn
+      // guard is what keeps a second delivery of this task off a session that
+      // is already mid-prompt.
+      resetTaskTurns();
+      mockMcpBridge.callTool.mockResolvedValue({
+        isError: false,
+        content: [{ type: "text", text: "Task ID: T-Queued\nwork please" }],
+      });
+      const queue = new TaskQueue(2);
+
+      let releaseEarlier: () => void;
+      const earlier = new Promise<void>((resolve) => { releaseEarlier = resolve; });
+      const earlierTurn = runTurnForTask("T-Queued", () => earlier);
+
+      const checking = checkForNextTask(
+        mockMcpBridge,
+        mockConnection,
+        mockSessionSwitcher,
+        mockAcpClient,
+        queue,
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(mockConnection.prompt).not.toHaveBeenCalled();
+
+      releaseEarlier!();
+      await Promise.all([earlierTurn, checking]);
+
+      expect(mockConnection.prompt).toHaveBeenCalledTimes(1);
+      expect(queue.getActiveCount()).toBe(0);
+    });
+
     it("forwards a slash command to the agent unmodified", async () => {
       // ACP runs a command as ordinary prompt text and the agent matches the
       // prefix at the *start* of it, so anything prepended here — a wrapper, a
@@ -744,12 +779,139 @@ describe("index", () => {
       await Promise.all(runs);
     });
 
+    it("answers even when applying the change throws", async () => {
+      // "Always answered" is the design; it must not depend on the change
+      // itself going well, or the interface is left showing a limit nothing
+      // adopted precisely when something has gone wrong.
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const queue = new TaskQueue(3);
+      const bridge = fakeConcurrencyBridge();
+      vi.spyOn(queue, "setMaxConcurrency").mockImplementation(() => {
+        throw new Error("queue is wedged");
+      });
+
+      await expect(
+        handleSetConcurrency({ maxConcurrency: 5 }, queue, bridge),
+      ).rejects.toThrow("queue is wedged");
+
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ maxConcurrency: 3 }),
+      );
+      errorSpy.mockRestore();
+    });
+
     it("applies the limit even with no bridge to report it to", async () => {
       const queue = new TaskQueue(1);
 
       await handleSetConcurrency({ maxConcurrency: 6 }, queue);
 
       expect(queue.getMaxConcurrency()).toBe(6);
+    });
+  });
+
+  describe("runTurnForTask", () => {
+    beforeEach(() => {
+      resetTaskTurns();
+    });
+
+    it("holds a second message on a chat until the first turn has finished", async () => {
+      // A session takes one turn at a time, and agentrq reuses a chat's id as
+      // the task id — so two messages to one chat are two deliveries of one
+      // task, and running them at once puts two prompts on one session.
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const events: string[] = [];
+      let releaseFirst: () => void;
+      const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+
+      const first = runTurnForTask("T-Chat", async () => {
+        events.push("first:start");
+        await firstHeld;
+        events.push("first:end");
+      });
+      const second = runTurnForTask("T-Chat", async () => {
+        events.push("second:start");
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(events).toEqual(["first:start"]);
+
+      releaseFirst!();
+      await Promise.all([first, second]);
+
+      expect(events).toEqual(["first:start", "first:end", "second:start"]);
+      errorSpy.mockRestore();
+    });
+
+    it("lets a second message through after the first turn failed", async () => {
+      // Losing it would lose what someone typed, and the first message erroring
+      // is no reason the agent should never hear the second.
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const ran: string[] = [];
+
+      const first = runTurnForTask("T-Fail", async () => {
+        ran.push("first");
+        throw new Error("agent blew up");
+      });
+      const second = runTurnForTask("T-Fail", async () => {
+        ran.push("second");
+      });
+
+      await expect(first).rejects.toThrow("agent blew up");
+      await second;
+
+      expect(ran).toEqual(["first", "second"]);
+      errorSpy.mockRestore();
+    });
+
+    it("keeps a queue of messages in the order they were sent", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const ran: number[] = [];
+      const turns = [0, 1, 2, 3].map((n) =>
+        runTurnForTask("T-Order", async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5 - n));
+          ran.push(n);
+        }),
+      );
+
+      await Promise.all(turns);
+
+      expect(ran).toEqual([0, 1, 2, 3]);
+      errorSpy.mockRestore();
+    });
+
+    it("never makes one chat wait on another", async () => {
+      // Serialising per task, not globally — a shared lock would undo the whole
+      // point of a concurrency limit above 1.
+      const started: string[] = [];
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+
+      const a = runTurnForTask("T-One", async () => { started.push("a"); await held; });
+      const b = runTurnForTask("T-Two", async () => { started.push("b"); await held; });
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(started.sort()).toEqual(["a", "b"]);
+
+      release!();
+      await Promise.all([a, b]);
+    });
+
+    it("runs a delivery with no task id straight away", async () => {
+      let ran = false;
+      await runTurnForTask(undefined, async () => { ran = true; });
+      expect(ran).toBe(true);
+    });
+
+    it("forgets a task once its last turn is done, rather than growing forever", async () => {
+      await runTurnForTask("T-Clean", async () => {});
+      const ran: string[] = [];
+
+      // A stale chain tail would make this wait on an already-settled promise
+      // instead of starting at once; a leaked one would never be collected.
+      await runTurnForTask("T-Clean", async () => { ran.push("second"); });
+
+      expect(ran).toEqual(["second"]);
     });
   });
 
@@ -1560,6 +1722,19 @@ describe("index", () => {
       expect(parseGatewayArgs(["--max-concurrency", "4.9"]).maxConcurrency).toBe(4);
 
       expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it("should leave a non-numeric token alone, since it is the agent command", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      // `--max-concurrency claude` is the number left out, not a mistyped
+      // number. Eating the token would leave the gateway nothing to run.
+      expect(parseGatewayArgs(["--max-concurrency", "claude"])).toMatchObject({
+        maxConcurrency: 1,
+        rest: ["claude"],
+      });
+
       errorSpy.mockRestore();
     });
 
