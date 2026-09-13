@@ -10,6 +10,7 @@ import {
   checkForNextTask,
   mapMcpServers,
   TaskQueue,
+  createTaskQueue,
   getOrCreateSession,
   openIdleSession,
   resetIdleSession,
@@ -730,6 +731,134 @@ describe("index", () => {
       expect(queue.getMaxConcurrency()).toBe(4);
       expect(errorSpy).not.toHaveBeenCalled();
       errorSpy.mockRestore();
+    });
+
+    describe("saying when its numbers move", () => {
+      /** Records what the queue looked like at each announcement. */
+      const watch = (queue: () => TaskQueue) => {
+        const seen: Array<{ active: number; queued: number }> = [];
+        return {
+          seen,
+          onChange: () =>
+            seen.push({
+              active: queue().getActiveCount(),
+              queued: queue().getQueueLength(),
+            }),
+        };
+      };
+
+      it("says so when a task starts, and again when it finishes", async () => {
+        // Without this the workspace hears the count once, while the gateway is
+        // idle, and then shows 0 running for the rest of its life.
+        let queue!: TaskQueue;
+        const { seen, onChange } = watch(() => queue);
+        queue = new TaskQueue(2, onChange);
+
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        const running = queue.run(() => held);
+
+        expect(seen).toEqual([{ active: 1, queued: 0 }]);
+
+        release();
+        await running;
+
+        expect(seen).toEqual([
+          { active: 1, queued: 0 },
+          { active: 0, queued: 0 },
+        ]);
+      });
+
+      it("says so when a task is made to wait, with nothing newly running", async () => {
+        let queue!: TaskQueue;
+        const { seen, onChange } = watch(() => queue);
+        queue = new TaskQueue(1, onChange);
+
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        const first = queue.run(() => held);
+        const second = queue.run(async () => {});
+
+        // The second changed what is waiting, not what is running.
+        expect(seen).toEqual([
+          { active: 1, queued: 0 },
+          { active: 1, queued: 1 },
+        ]);
+
+        release();
+        await Promise.all([first, second]);
+
+        // A slot came free, then the waiting task took it, then it finished.
+        expect(seen.slice(2)).toEqual([
+          { active: 0, queued: 1 },
+          { active: 1, queued: 0 },
+          { active: 0, queued: 0 },
+        ]);
+      });
+
+      it("runs tasks normally when nobody is listening", async () => {
+        // The queue is built without a listener throughout these tests and in
+        // --list-models; an optional callback must stay optional.
+        const queue = new TaskQueue(1);
+        let ran = false;
+
+        await expect(queue.run(async () => { ran = true; })).resolves.toBeUndefined();
+
+        expect(ran).toBe(true);
+        expect(queue.getActiveCount()).toBe(0);
+      });
+
+      it("tells the workspace, end to end, when a task starts and finishes", async () => {
+        const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+        // The callback is only worth anything if it reaches the wire, so this
+        // asserts on the notification rather than on the callback firing.
+        const bridge: any = { sendNotification: vi.fn().mockResolvedValue(undefined) };
+        const queue = createTaskQueue(2, bridge);
+
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        const running = queue.run(() => held);
+        await flush();
+
+        expect(bridge.sendNotification).toHaveBeenCalledWith(
+          "notifications/claude/channel/concurrency",
+          expect.objectContaining({ maxConcurrency: 2, active: 1, queued: 0 }),
+        );
+
+        release();
+        await running;
+        await flush();
+
+        expect(bridge.sendNotification).toHaveBeenLastCalledWith(
+          "notifications/claude/channel/concurrency",
+          expect.objectContaining({ maxConcurrency: 2, active: 0, queued: 0 }),
+        );
+      });
+
+      it("keeps running tasks when the listener throws", async () => {
+        // Announcing happens inside execute, including in its finally — a
+        // listener that threw there would replace the task's own error with its
+        // own. Running tasks is the job; telling an interface is a courtesy.
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+        const queue = new TaskQueue(1, () => {
+          throw new Error("the workspace is on fire");
+        });
+
+        let ran = false;
+        await expect(queue.run(async () => { ran = true; })).resolves.toBeUndefined();
+        expect(ran).toBe(true);
+
+        // And a task's own failure still reaches its caller unchanged.
+        await expect(
+          queue.run(async () => { throw new Error("the task itself failed"); }),
+        ).rejects.toThrow("the task itself failed");
+
+        expect(errorSpy).toHaveBeenCalledWith(
+          "[queue] Error reporting the queue's state:",
+          expect.any(Error),
+        );
+        errorSpy.mockRestore();
+      });
     });
   });
 
