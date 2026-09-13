@@ -148,7 +148,7 @@ export class MCPBridge extends EventEmitter {
     this.client = new Client(
       {
         name: "acp-gateway",
-        version: "0.2.17",
+        version: "0.2.18",
       },
       {
         capabilities: {},
