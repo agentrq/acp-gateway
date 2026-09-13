@@ -1385,20 +1385,121 @@ export async function handleSetConcurrency(
       queue.setMaxConcurrency(requested);
     }
   } finally {
+    // Often asked for while the queue's own reports are still going out —
+    // raising the limit starts waiting tasks, and each announces itself. That
+    // is why this is here anyway: the queue says nothing at all when a set
+    // moves no numbers, and a set must always be answered.
+    //
+    // Awaiting it is what makes the answer real. Reports go out one at a time,
+    // and this resolves only once no further report is wanted, so by the time
+    // it returns the workspace has been told the limit that actually took
+    // effect — after, not before, anything the raise set running.
     if (bridge) await reportConcurrency(bridge, queue);
   }
 }
 
-/** Tells the workspace what the queue's limit is and what it is doing under it. */
-export async function reportConcurrency(
+/**
+ * The report on the wire, if one is, and whether the numbers moved while it flew.
+ *
+ * Each report is its own HTTP POST, and two in flight at once may be processed
+ * in either order — so the workspace would be left showing whichever landed
+ * last rather than whichever is true. That cost little while a report followed
+ * a human moving a control. It costs a great deal now that one follows every
+ * task transition, because `execute` announces a freed slot and then `next()`
+ * immediately announces the task that took it: two reports, one tick apart,
+ * disagreeing about the same number. Landing them the wrong way round leaves
+ * the interface wrong until something else moves — which is the very failure
+ * this feature exists to end.
+ */
+let reportOnTheWire: Promise<void> | null = null;
+let numbersMovedAgain = false;
+
+/** Forgets any report in flight. For tests. */
+export function resetConcurrencyReports(): void {
+  reportOnTheWire = null;
+  numbersMovedAgain = false;
+}
+
+/**
+ * Tells the workspace what the queue's limit is and what it is doing under it.
+ *
+ * One report at a time, so they arrive in the order they were asked for. A
+ * report wanted while one is flying does not queue up behind it: the numbers
+ * are read again when the wire is free, so a burst of transitions costs one
+ * further report rather than one per transition, and every report carries the
+ * state at the moment it was actually sent. Whatever the workspace hears last
+ * is therefore the truth, which is the only property that really matters here.
+ *
+ * Callers may await this and know a report reflecting their change has gone
+ * out — `handleSetConcurrency` depends on exactly that.
+ */
+export function reportConcurrency(
   bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
   queue: TaskQueue,
 ): Promise<void> {
-  await sendConcurrencyNotification(bridge, {
-    maxConcurrency: queue.getMaxConcurrency(),
-    active: queue.getActiveCount(),
-    queued: queue.getQueueLength(),
-  });
+  if (reportOnTheWire) {
+    numbersMovedAgain = true;
+    return reportOnTheWire;
+  }
+  // Assigned from the call rather than after it: `drainConcurrencyReports` runs
+  // as far as its first await before returning, and nothing else can run in
+  // between.
+  return (reportOnTheWire = drainConcurrencyReports(bridge, queue));
+}
+
+/**
+ * Sends reports until nobody has asked for another.
+ *
+ * The slot is cleared in a `finally` inside this function rather than off the
+ * returned promise, so that it happens in the same tick the loop ends. Clearing
+ * it a microtask later would leave a window where a caller sees a report in
+ * flight, sets the flag, and is answered by a loop that has already stopped
+ * reading it — a report asked for and never sent.
+ *
+ * The bridge is whichever caller opened the slot. The gateway has exactly one
+ * for its whole life, and a reconnect replaces what is inside it rather than
+ * the object, so there is no second bridge for a collapsed report to miss.
+ */
+async function drainConcurrencyReports(
+  bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
+  queue: TaskQueue,
+): Promise<void> {
+  try {
+    do {
+      numbersMovedAgain = false;
+      // Read here, not at the call: a collapsed report is worth sending only
+      // because it describes the queue now rather than when it was asked for.
+      await sendConcurrencyNotification(bridge, {
+        maxConcurrency: queue.getMaxConcurrency(),
+        active: queue.getActiveCount(),
+        queued: queue.getQueueLength(),
+      });
+    } while (numbersMovedAgain);
+  } finally {
+    reportOnTheWire = null;
+  }
+}
+
+/**
+ * Builds the task queue already able to report itself.
+ *
+ * Out here rather than inline in `main()` for the reason
+ * `registerConcurrencyListeners` is: `main()` spawns processes and never
+ * returns, so nothing written inside it can be tested, and wiring that nothing
+ * exercises is wiring nobody finds out is wrong.
+ *
+ * The callback names the queue it is being handed to. That is safe because it
+ * only ever runs later, from inside the queue's own methods, by which time the
+ * binding exists.
+ */
+export function createTaskQueue(
+  maxConcurrency: number,
+  bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
+): TaskQueue {
+  const queue: TaskQueue = new TaskQueue(maxConcurrency, () =>
+    void reportConcurrency(bridge, queue),
+  );
+  return queue;
 }
 
 /**
@@ -1642,7 +1743,35 @@ export class TaskQueue {
   private activeTasks = 0;
   private queue: (() => Promise<void>)[] = [];
 
-  constructor(private maxConcurrency: number) {}
+  /**
+   * @param onChange Told whenever the number running or waiting moves, so
+   *   somebody can report it. The queue has no idea who is listening — it holds
+   *   no bridge and knows nothing about notifications — because what it owes the
+   *   interface is the fact that its numbers moved, not the delivery of that
+   *   fact. Absent only in tests, matching `handleSetConcurrency`'s `bridge?`.
+   */
+  constructor(
+    private maxConcurrency: number,
+    private onChange?: () => void,
+  ) {}
+
+  /**
+   * Says the numbers moved, and survives a listener that cannot take the news.
+   *
+   * Guarded because this is called from `execute`, including from its `finally`:
+   * a listener that threw there would replace the task's own error with its own,
+   * losing what actually went wrong, and one that threw on the way in would stop
+   * the task before it started. Running tasks is this class's job; telling an
+   * interface about them is a courtesy, and a courtesy must not be able to break
+   * the job.
+   */
+  private announce(): void {
+    try {
+      this.onChange?.();
+    } catch (err) {
+      console.error("[queue] Error reporting the queue's state:", err);
+    }
+  }
 
   async run(taskFn: () => Promise<void>): Promise<void> {
     if (this.activeTasks < this.maxConcurrency) {
@@ -1658,16 +1787,26 @@ export class TaskQueue {
             throw err;
           }
         });
+        // Nothing started, but something is now waiting — which is exactly the
+        // state a full gateway is in, and the one worth seeing.
+        this.announce();
       });
     }
   }
 
   private async execute(taskFn: () => Promise<void>): Promise<void> {
     this.activeTasks++;
+    // Before the task is awaited rather than after, or the report would not go
+    // out until the work it is announcing had already finished.
+    this.announce();
     try {
       await taskFn();
     } finally {
       this.activeTasks--;
+      // Before `next()`, so this says a slot came free; whatever `next()` then
+      // starts announces itself. The other order would report the same settled
+      // state twice and never show the gap.
+      this.announce();
       this.next();
     }
   }
@@ -2228,10 +2367,11 @@ async function main() {
   modelConfig.modelId = options.modelId;
   permissionConfig.timeoutMs = options.permissionTimeoutMs;
 
-  const taskQueue = new TaskQueue(maxConcurrency);
-
   // 3. Initialize MCP Bridge
   const mcpBridge = new MCPBridge(agentrqConfig);
+
+  // After the bridge, because the queue now reports itself to it.
+  const taskQueue = createTaskQueue(maxConcurrency, mcpBridge);
 
   // Auth commands talk to the agent and exit; they never start bridging tasks.
   // They run before the bridge connects, so a first-time login still works when
