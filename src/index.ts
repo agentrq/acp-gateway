@@ -279,10 +279,34 @@ export function resetTaskTurns(): void {
  */
 const sessionsInFlight = new Map<string, Promise<AgentSession>>();
 
+/**
+ * Every agent process this gateway has started and not yet seen exit.
+ *
+ * `activeSessions` holds only the agents that got as far as an open session,
+ * which makes it the wrong thing to reap on the way out: an agent that is still
+ * handshaking — or one stopped waiting for a login that is never coming — is in
+ * no map at all, so shutdown closed nothing and the process was left behind. An
+ * agent that quits when its stdin closes gets away with that; one with an event
+ * loop of its own, which is exactly the sort that waits for a login, does not.
+ *
+ * Spawning is the moment to record it, because every window in which a session
+ * is not yet tracked begins there.
+ */
+const liveAgentProcesses = new Set<AgentProcessHandle>();
+
+/** The little of a child process that ending one needs. */
+type AgentProcessHandle = { pid?: number; kill: () => unknown };
+
+/** Stops tracking a process that has gone away on its own. */
+function forgetAgentProcess(child: AgentProcessHandle): void {
+  liveAgentProcesses.delete(child);
+}
+
 /** Forgets any in-flight startup session. For tests. */
 export function resetIdleSession(): void {
   idleSessionInFlight = null;
   sessionsInFlight.clear();
+  liveAgentProcesses.clear();
 }
 
 /**
@@ -374,9 +398,31 @@ export async function closeAllSessions(
 ): Promise<void> {
   const sessions = Array.from(new Set(activeSessions.values()));
   activeSessions.clear();
-  if (sessions.length === 0) return;
-  console.error(`[acp] Cleanly closing ${sessions.length} active session(s)...`);
-  await Promise.all(sessions.map((session) => closeSession(session, timeoutMs)));
+  if (sessions.length > 0) {
+    console.error(`[acp] Cleanly closing ${sessions.length} active session(s)...`);
+    // Their processes are ended by closeSession; dropping them here keeps the
+    // count below honest about what is actually being left behind.
+    for (const session of sessions) forgetAgentProcess(session.process);
+    await Promise.all(sessions.map((session) => closeSession(session, timeoutMs)));
+  }
+
+  // Whatever is still running never opened a session, so there is no session to
+  // close cleanly and nothing to say goodbye to — only a process to end. This
+  // is the agent that is still handshaking, or the one waiting on a login
+  // nobody is going to give it.
+  const stragglers = Array.from(liveAgentProcesses);
+  liveAgentProcesses.clear();
+  if (stragglers.length === 0) return;
+  console.error(
+    `[acp] Ending ${stragglers.length} agent process(es) that never opened a session...`,
+  );
+  for (const child of stragglers) {
+    try {
+      terminateAgentProcess(child);
+    } catch (err) {
+      console.error("[acp] Error ending an agent process:", err);
+    }
+  }
 }
 
 /**
@@ -666,8 +712,13 @@ export async function openAgentConnection({
   // Guard against unhandled child-process failures. Without these listeners a
   // crashed agent (e.g. on network loss) leaves a broken stdin pipe; the next
   // write raises EPIPE as an uncaught error and takes the gateway down with it.
+  // Tracked from here rather than from the open session, so shutdown can still
+  // end an agent that never reached one — see liveAgentProcesses.
+  liveAgentProcesses.add(agentProcess);
+
   agentProcess.on("error", (err: Error) => {
     console.error(`[acp] Agent process error for ${label}:`, err.message);
+    forgetAgentProcess(agentProcess);
     acpClient.cancelPendingPermissions(`agent process for ${label} failed`);
     onExit?.();
   });
@@ -675,6 +726,7 @@ export async function openAgentConnection({
     console.error(
       `[acp] Agent process for ${label} exited (code=${code}, signal=${signal})`,
     );
+    forgetAgentProcess(agentProcess);
     // Nothing will act on these answers now, but the tool calls waiting on them
     // are holding task-queue slots that would never be given back.
     acpClient.cancelPendingPermissions(`agent process for ${label} exited`);
@@ -2239,17 +2291,20 @@ async function main() {
         "\n[bridge] Incoming task from MCP server. Forwarding to ACP agent...",
       );
       const queuedSeq = nextTaskSeq();
-      taskQueue.run(async () => {
-        if (isTaskCancelled(taskId, queuedSeq)) {
-          console.error(
-            `[bridge] Task ${taskId} was cancelled before execution started, skipping`,
-          );
-          return;
-        }
-        // Behind any turn already running for this task: one session takes one
-        // turn at a time, and two messages on one chat arrive as two deliveries
-        // of one task.
-        await runTurnForTask(taskId, async () => {
+      // Behind any turn already running for this task, and behind it *before*
+      // asking for a queue slot: one session takes one turn at a time, and two
+      // messages on one chat arrive as two deliveries of one task. Waiting
+      // inside a slot would hold a share of the concurrency limit while doing
+      // nothing at all — enough messages on one chat would hold every slot and
+      // stop the gateway running anything else.
+      runTurnForTask(taskId, () =>
+        taskQueue.run(async () => {
+          if (isTaskCancelled(taskId, queuedSeq)) {
+            console.error(
+              `[bridge] Task ${taskId} was cancelled before execution started, skipping`,
+            );
+            return;
+          }
           try {
             const sessionInfo = await getOrCreateSession(
               taskId,
@@ -2283,8 +2338,8 @@ async function main() {
           } catch (err) {
             console.error("[acp] Error during prompt execution:", err);
           }
-        });
-      }).catch((err) => {
+        }),
+      ).catch((err) => {
         console.error("[bridge] Error queuing task:", err);
       });
     });
@@ -2490,12 +2545,13 @@ export async function checkForNextTask(
       // reason runTurnForTask records: this path and the push notification can
       // both be handed the same task, and word it differently enough that the
       // repetition guard drops neither.
-      const turn = () => runTurnForTask(taskId, runFn);
-      if (taskQueue) {
-        await taskQueue.run(turn);
-      } else {
-        await turn();
-      }
+      //
+      // Outside the queue slot rather than inside it, so a delivery that is
+      // only waiting for the turn ahead of it is not also holding a share of
+      // the concurrency limit while it waits.
+      await runTurnForTask(taskId, () =>
+        taskQueue ? taskQueue.run(runFn) : runFn(),
+      );
     } else {
       console.error("[bridge] No pending tasks available.");
     }

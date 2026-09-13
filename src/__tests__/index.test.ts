@@ -446,6 +446,50 @@ describe("index", () => {
       expect(queue.getActiveCount()).toBe(0);
     });
 
+    it("waits for the turn ahead of it without holding a concurrency slot", async () => {
+      // A second message on one chat arrives as a second delivery of one task
+      // and has to wait for the first. Waiting *inside* a queue slot would hold
+      // a share of the limit while doing nothing at all — so a chat with a few
+      // messages in flight could hold every slot the gateway has and stop it
+      // running anything else, which is precisely what raising the limit is
+      // supposed to prevent.
+      resetTaskTurns();
+      mockMcpBridge.callTool.mockResolvedValue({
+        isError: false,
+        content: [{ type: "text", text: "Task ID: T-Chatty\nand another thing" }],
+      });
+      const queue = new TaskQueue(1);
+
+      let releaseEarlier: () => void;
+      const earlier = new Promise<void>((resolve) => { releaseEarlier = resolve; });
+      const earlierTurn = runTurnForTask("T-Chatty", () => earlier);
+
+      const checking = checkForNextTask(
+        mockMcpBridge,
+        mockConnection,
+        mockSessionSwitcher,
+        mockAcpClient,
+        queue,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Behind the turn, but not occupying the gateway's only slot.
+      expect(mockConnection.prompt).not.toHaveBeenCalled();
+      expect(queue.getActiveCount()).toBe(0);
+
+      // So an unrelated task still runs while the duplicate waits.
+      let unrelatedRan = false;
+      const unrelated = queue.run(async () => { unrelatedRan = true; });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(unrelatedRan).toBe(true);
+
+      releaseEarlier!();
+      await Promise.all([earlierTurn, checking, unrelated]);
+
+      expect(mockConnection.prompt).toHaveBeenCalledTimes(1);
+      expect(queue.getActiveCount()).toBe(0);
+    });
+
     it("forwards a slash command to the agent unmodified", async () => {
       // ACP runs a command as ordinary prompt text and the agent matches the
       // prefix at the *start* of it, so anything prepended here — a wrapper, a
@@ -3364,16 +3408,105 @@ describe("index", () => {
       let errorSpy: any;
       beforeEach(() => {
         activeSessions.clear();
+        // Also clears the record of agents spawned by earlier tests, which this
+        // one now reaps.
+        resetIdleSession();
         errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       });
       afterEach(() => {
         activeSessions.clear();
+        resetIdleSession();
         errorSpy.mockRestore();
       });
 
       it("does nothing when activeSessions is empty", async () => {
         await closeAllSessions();
         expect(activeSessions.size).toBe(0);
+      });
+
+      it("ends an agent that spawned but never opened a session", async () => {
+        // activeSessions only holds agents that got as far as an open session,
+        // so shutting down on it alone left behind the agent still handshaking
+        // — and the one stopped waiting for a login, which is the case most
+        // likely to be interrupted, since it can sit there indefinitely. One
+        // that quits when its stdin closes got away with it; one with an event
+        // loop of its own did not.
+        newSessionHangs.value = true;
+        spawnedAgents.length = 0;
+
+        const opening = getOrCreateSession(
+          "T-Interrupted",
+          ["node", "agent.js"],
+          [],
+          { env: {} } as any,
+          fakeBridge(),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // Spawned, and tracked by nothing that shutdown used to look at.
+        expect(spawnedAgents.length).toBe(1);
+        expect(activeSessions.size).toBe(0);
+
+        await closeAllSessions(10);
+
+        expect(spawnedAgents[0].kill).toHaveBeenCalled();
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("never opened a session"),
+        );
+
+        newSessionHangs.value = false;
+        void opening.catch(() => {});
+      });
+
+      it("keeps ending the rest when one refuses to die", async () => {
+        // Shutdown is the last thing that runs; one process that will not go
+        // must not take the others' only chance to go with it.
+        newSessionHangs.value = true;
+        spawnedAgents.length = 0;
+
+        const opening = [
+          getOrCreateSession("T-Stuck-A", ["node", "agent.js"], [], { env: {} } as any, fakeBridge()),
+          getOrCreateSession("T-Stuck-B", ["node", "agent.js"], [], { env: {} } as any, fakeBridge()),
+        ];
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(spawnedAgents.length).toBe(2);
+        spawnedAgents[0].kill.mockImplementation(() => {
+          throw new Error("no such process");
+        });
+
+        await closeAllSessions(10);
+
+        expect(spawnedAgents[1].kill).toHaveBeenCalled();
+        expect(errorSpy).toHaveBeenCalledWith(
+          "[acp] Error ending an agent process:",
+          expect.any(Error),
+        );
+
+        newSessionHangs.value = false;
+        for (const p of opening) void p.catch(() => {});
+      });
+
+      it("does not report a cleanly closed session as one left behind", async () => {
+        // Its process is ended by closeSession; counting it again would report
+        // a leak that is not there.
+        newSessionHangs.value = false;
+        spawnedAgents.length = 0;
+
+        await getOrCreateSession(
+          "T-Clean-Exit",
+          ["node", "agent.js"],
+          [],
+          { env: {} } as any,
+          fakeBridge(),
+        );
+        expect(activeSessions.size).toBe(1);
+
+        await closeAllSessions(10);
+
+        expect(spawnedAgents[0].kill).toHaveBeenCalled();
+        expect(errorSpy).not.toHaveBeenCalledWith(
+          expect.stringContaining("never opened a session"),
+        );
       });
 
       it("closes all unique active sessions in parallel and clears map", async () => {
