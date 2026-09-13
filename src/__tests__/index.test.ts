@@ -1441,7 +1441,74 @@ describe("index", () => {
     });
 
     it("should cap the concurrency flag at the same ceiling the workspace gets", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       expect(parseGatewayArgs(["--max-concurrency", "10000"]).maxConcurrency).toBe(64);
+      errorSpy.mockRestore();
+    });
+
+    it("should say so when it caps the flag, since nothing reports a flag back", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorSpy.mockClear();
+
+      parseGatewayArgs(["--max-concurrency", "128"]);
+
+      // An existing --max-concurrency 128 would otherwise quietly boot at 64.
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("--max-concurrency 128 is outside 1-64; using 64."),
+      );
+      errorSpy.mockRestore();
+    });
+
+    it("should not warn about a fraction, which is truncated rather than capped", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorSpy.mockClear();
+
+      expect(parseGatewayArgs(["--max-concurrency", "4.9"]).maxConcurrency).toBe(4);
+
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it("should consume a malformed concurrency value instead of leaving it to be run", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      // `rest` is the agent command when no `--` was used, so a value left
+      // behind here sent the gateway looking for an agent called "8x".
+      expect(parseGatewayArgs(["--max-concurrency", "8x", "claude"])).toMatchObject({
+        maxConcurrency: 1,
+        rest: ["claude"],
+      });
+      expect(parseGatewayArgs(["--max-concurrency", "8x", "--", "claude"]).rest).toEqual([
+        "--",
+        "claude",
+      ]);
+
+      errorSpy.mockRestore();
+    });
+
+    it("should say why a malformed concurrency value was ignored", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorSpy.mockClear();
+
+      parseGatewayArgs(["--max-concurrency", "8x"]);
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('--max-concurrency "8x" is not a number of tasks'),
+      );
+      errorSpy.mockRestore();
+    });
+
+    it("should stay silent when the flag simply has no value to read", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorSpy.mockClear();
+
+      expect(parseGatewayArgs(["--max-concurrency", "--logout"])).toMatchObject({
+        maxConcurrency: 1,
+        command: "logout",
+      });
+
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
     });
 
     it("should keep the default when the concurrency value is missing or not a number", () => {

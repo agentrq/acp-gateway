@@ -195,7 +195,10 @@ The workspace sends:
 }
 ```
 
-`maxConcurrency` and a bare `concurrency` are accepted too, and the value may be a string.
+`maxConcurrency` and a bare `concurrency` are accepted too, and the value may be a string. A value of any
+other shape — `null`, a boolean, an object — is accepted at the door and refused downstream, so that it can
+still be answered; a notification dropped for being malformed would be a notification the gateway never
+replied to.
 
 The gateway reports the limit in force on `notifications/claude/channel/concurrency` — on connect, on every
 reconnect, and after every `set_concurrency`:
@@ -226,6 +229,10 @@ Two things worth knowing about how a change lands:
 
 The limit lives in memory. It survives MCP reconnects but not a gateway restart, which falls back to
 `--max-concurrency`. A workspace that wants the setting to stick should store it and re-send it on connect.
+
+`--max-concurrency` goes through the same reader, so the flag and the interface cannot disagree about what a
+number means. Nothing reports a flag back to the person who typed it, so unlike the workspace's path the
+gateway says out loud on startup when a flag value was capped or could not be read.
 
 ## How It Works
 

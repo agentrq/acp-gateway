@@ -274,11 +274,20 @@ export class MCPBridge extends EventEmitter {
     this.client.setNotificationHandler(
       z.object({
         method: z.literal(SET_CONCURRENCY_NOTIFICATION_METHOD),
+        // Deliberately untyped values. The SDK drops a notification that fails
+        // this schema before the handler ever runs, so a type named here is a
+        // type whose arrival is silent — and this gateway's contract is that a
+        // set_concurrency is always answered with the limit in force. Refusing
+        // a bad value is normalizeConcurrency's job, downstream, where the
+        // refusal can still be reported. Worse, the workspace mirrors this
+        // gateway's own habit of sending both spellings, so a payload like
+        // `{max_concurrency: 4, maxConcurrency: null}` would have been thrown
+        // away whole — a valid request lost to the spelling beside it.
         params: z
           .object({
-            max_concurrency: z.union([z.number(), z.string()]).optional(),
-            maxConcurrency: z.union([z.number(), z.string()]).optional(),
-            concurrency: z.union([z.number(), z.string()]).optional(),
+            max_concurrency: z.unknown().optional(),
+            maxConcurrency: z.unknown().optional(),
+            concurrency: z.unknown().optional(),
           })
           .passthrough()
           .optional(),
@@ -290,6 +299,8 @@ export class MCPBridge extends EventEmitter {
         // tolerating the alternatives turns a silent no-op into something that
         // simply works.
         const params = notification.params ?? {};
+        // `??` rather than `||`, so an explicit 0 reaches normalizeConcurrency
+        // and is answered, rather than falling through to the next spelling.
         this.emit("setConcurrency", {
           maxConcurrency:
             params.max_concurrency ?? params.maxConcurrency ?? params.concurrency,

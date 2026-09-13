@@ -504,6 +504,61 @@ describe("MCPBridge", () => {
 
       expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: undefined });
     });
+
+    it("keeps a valid limit sent alongside a null in the other spelling", async () => {
+      // The workspace mirrors this gateway's own habit of sending both
+      // spellings. A schema that typed these would drop the whole notification
+      // over the null and lose the 4 sitting next to it — and, because the SDK
+      // discards a notification that fails its schema before the handler runs,
+      // it would do so without the gateway ever answering.
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetConcurrency = vi.fn();
+      bridge.on("setConcurrency", onSetConcurrency);
+
+      getSetConcurrencyHandler()({
+        method: "notifications/claude/channel/set_concurrency",
+        params: { max_concurrency: 4, maxConcurrency: null },
+      });
+
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: 4 });
+    });
+
+    it("falls past a null spelling to one that carries a value", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetConcurrency = vi.fn();
+      bridge.on("setConcurrency", onSetConcurrency);
+
+      getSetConcurrencyHandler()({
+        method: "notifications/claude/channel/set_concurrency",
+        params: { max_concurrency: null, maxConcurrency: 3 },
+      });
+
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: 3 });
+    });
+
+    it("passes a value of any shape on, so every request can still be answered", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      for (const value of [null, true, {}, [], "auto"]) {
+        const onSetConcurrency = vi.fn();
+        bridge.on("setConcurrency", onSetConcurrency);
+
+        // Refusing it is normalizeConcurrency's job, downstream, where the
+        // refusal can still be reported back to the interface.
+        getSetConcurrencyHandler()({
+          method: "notifications/claude/channel/set_concurrency",
+          params: { max_concurrency: value },
+        });
+
+        expect(onSetConcurrency).toHaveBeenCalledTimes(1);
+        bridge.off("setConcurrency", onSetConcurrency);
+      }
+    });
   });
 
   describe("task cancellation notifications", () => {

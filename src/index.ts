@@ -1609,15 +1609,40 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
     switch (args[i]) {
       case "--max-concurrency":
       case "--maxConcurrency": {
+        // The token after the flag is this flag's value even when it is not a
+        // usable one, so it is consumed either way. Leaving a malformed value
+        // behind dropped it into `rest`, which is the agent command when no
+        // `--` was used — so `--max-concurrency 8x claude` went looking for an
+        // agent called "8x" instead of ignoring a mistyped flag.
+        if (value !== undefined) i++;
+
         // Read by the same rule the workspace's set_concurrency goes through,
         // so the flag and the runtime control cannot disagree about what a
         // number means. It is also what stops `--max-concurrency 0`, which
         // used to be accepted and then held every task in the queue forever.
         const parsed = normalizeConcurrency(value);
-        if (parsed !== undefined) {
-          options.maxConcurrency = parsed;
-          i++;
+        if (parsed === undefined) {
+          if (value !== undefined) {
+            console.error(
+              `[acp-gateway] --max-concurrency "${value}" is not a number of ` +
+                `tasks; keeping ${options.maxConcurrency}.`,
+            );
+          }
+          break;
         }
+
+        // Said out loud, unlike the workspace's path, which reports the limit
+        // it settled on back to the interface. Nothing reports a flag back to
+        // the person who typed it, so an existing `--max-concurrency 128` would
+        // otherwise quietly boot at the ceiling with no sign it had been cut.
+        const asked = Number(value);
+        if (Number.isFinite(asked) && Math.trunc(asked) !== parsed) {
+          console.error(
+            `[acp-gateway] --max-concurrency ${value} is outside ` +
+              `${MIN_MAX_CONCURRENCY}-${MAX_MAX_CONCURRENCY}; using ${parsed}.`,
+          );
+        }
+        options.maxConcurrency = parsed;
         break;
       }
       case "--permission-timeout": {
