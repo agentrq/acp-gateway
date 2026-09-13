@@ -11,6 +11,7 @@ import { EventEmitter } from "node:events";
 import { z } from "zod";
 import type { McpServerConfig } from "./config.js";
 import { extractTaskIdFromMeta } from "./taskIdentity.js";
+import { SET_CONCURRENCY_NOTIFICATION_METHOD } from "./concurrency.js";
 
 export class MCPBridge extends EventEmitter {
   private client: Client | null = null;
@@ -266,6 +267,37 @@ export class MCPBridge extends EventEmitter {
           configId: params.config_id || params.configId,
           modelId: params.model_id || params.modelId,
         });
+      },
+    );
+
+    // Set notification handler for a concurrency limit changed in the interface
+    this.client.setNotificationHandler(
+      z.object({
+        method: z.literal(SET_CONCURRENCY_NOTIFICATION_METHOD),
+        // Deliberately untyped. The SDK drops a notification that fails this
+        // schema before the handler ever runs, so a type named here is a type
+        // whose arrival is silent — and this gateway's contract is that a
+        // set_concurrency is always answered with the limit in force. Refusing
+        // a bad value is normalizeConcurrency's job, downstream, where the
+        // refusal can still be reported rather than swallowed.
+        params: z
+          .object({ maxConcurrency: z.unknown().optional() })
+          .passthrough()
+          .optional(),
+      }),
+      (notification) => {
+        console.error("[mcp] Received concurrency notification");
+        // camelCase only, unlike the snake_case siblings above. This pair of
+        // notifications is new enough to have no client that spells it the
+        // other way, so it gets one spelling rather than the two that every
+        // older message on this channel has to carry forever.
+        //
+        // A payload that does spell it the other way is not silently ignored:
+        // the value simply reads as absent, which normalizeConcurrency refuses
+        // and the gateway answers with the limit still in force — so a mistaken
+        // sender sees an unchanged limit come back rather than nothing at all.
+        const params = notification.params ?? {};
+        this.emit("setConcurrency", { maxConcurrency: params.maxConcurrency });
       },
     );
 

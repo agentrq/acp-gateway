@@ -44,6 +44,11 @@ import {
   findActiveSession,
   handleTaskCancellation,
   handleSetModel,
+  handleSetConcurrency,
+  runTurnForTask,
+  resetTaskTurns,
+  registerConcurrencyListeners,
+  reportConcurrency,
   applyModelSelection,
   cancelledTaskSeq,
   markTaskCancelled,
@@ -408,6 +413,83 @@ describe("index", () => {
       expect(mockAcpClient.flushReply).toHaveBeenCalledWith("current-session");
     });
 
+    it("runs a queued task through the queue, and behind any turn it already has", async () => {
+      // The queue is how a concurrency limit is enforced at all, and the turn
+      // guard is what keeps a second delivery of this task off a session that
+      // is already mid-prompt.
+      resetTaskTurns();
+      mockMcpBridge.callTool.mockResolvedValue({
+        isError: false,
+        content: [{ type: "text", text: "Task ID: T-Queued\nwork please" }],
+      });
+      const queue = new TaskQueue(2);
+
+      let releaseEarlier: () => void;
+      const earlier = new Promise<void>((resolve) => { releaseEarlier = resolve; });
+      const earlierTurn = runTurnForTask("T-Queued", () => earlier);
+
+      const checking = checkForNextTask(
+        mockMcpBridge,
+        mockConnection,
+        mockSessionSwitcher,
+        mockAcpClient,
+        queue,
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(mockConnection.prompt).not.toHaveBeenCalled();
+
+      releaseEarlier!();
+      await Promise.all([earlierTurn, checking]);
+
+      expect(mockConnection.prompt).toHaveBeenCalledTimes(1);
+      expect(queue.getActiveCount()).toBe(0);
+    });
+
+    it("waits for the turn ahead of it without holding a concurrency slot", async () => {
+      // A second message on one chat arrives as a second delivery of one task
+      // and has to wait for the first. Waiting *inside* a queue slot would hold
+      // a share of the limit while doing nothing at all — so a chat with a few
+      // messages in flight could hold every slot the gateway has and stop it
+      // running anything else, which is precisely what raising the limit is
+      // supposed to prevent.
+      resetTaskTurns();
+      mockMcpBridge.callTool.mockResolvedValue({
+        isError: false,
+        content: [{ type: "text", text: "Task ID: T-Chatty\nand another thing" }],
+      });
+      const queue = new TaskQueue(1);
+
+      let releaseEarlier: () => void;
+      const earlier = new Promise<void>((resolve) => { releaseEarlier = resolve; });
+      const earlierTurn = runTurnForTask("T-Chatty", () => earlier);
+
+      const checking = checkForNextTask(
+        mockMcpBridge,
+        mockConnection,
+        mockSessionSwitcher,
+        mockAcpClient,
+        queue,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Behind the turn, but not occupying the gateway's only slot.
+      expect(mockConnection.prompt).not.toHaveBeenCalled();
+      expect(queue.getActiveCount()).toBe(0);
+
+      // So an unrelated task still runs while the duplicate waits.
+      let unrelatedRan = false;
+      const unrelated = queue.run(async () => { unrelatedRan = true; });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(unrelatedRan).toBe(true);
+
+      releaseEarlier!();
+      await Promise.all([earlierTurn, checking, unrelated]);
+
+      expect(mockConnection.prompt).toHaveBeenCalledTimes(1);
+      expect(queue.getActiveCount()).toBe(0);
+    });
+
     it("forwards a slash command to the agent unmodified", async () => {
       // ACP runs a command as ordinary prompt text and the agent matches the
       // prefix at the *start* of it, so anything prepended here — a wrapper, a
@@ -529,6 +611,449 @@ describe("index", () => {
 
       logSpy.mockRestore();
     });
+
+    it("reports the limit it was built with", () => {
+      expect(new TaskQueue(3).getMaxConcurrency()).toBe(3);
+    });
+
+    it("starts every task a raised limit has room for, not one at a time", async () => {
+      const queue = new TaskQueue(1);
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+
+      const started: number[] = [];
+      const runs = [
+        queue.run(async () => { started.push(0); await held; }),
+        queue.run(async () => { started.push(1); }),
+        queue.run(async () => { started.push(2); }),
+        queue.run(async () => { started.push(3); }),
+      ];
+
+      // Only the first is running; the other three are waiting on a limit of 1.
+      expect(queue.getActiveCount()).toBe(1);
+      expect(queue.getQueueLength()).toBe(3);
+
+      queue.setMaxConcurrency(4);
+
+      // All three waiting tasks start at once, without the running one
+      // finishing first — a raise that took effect one task per completion
+      // would leave two of them still queued here.
+      expect(started).toEqual([0, 1, 2, 3]);
+      expect(queue.getMaxConcurrency()).toBe(4);
+
+      release!();
+      await Promise.all(runs);
+    });
+
+    it("starts only as many as the new limit allows, and leaves the rest queued", async () => {
+      const queue = new TaskQueue(1);
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+
+      const runs = [
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+      ];
+
+      queue.setMaxConcurrency(2);
+
+      expect(queue.getActiveCount()).toBe(2);
+      expect(queue.getQueueLength()).toBe(2);
+
+      release!();
+      await Promise.all(runs);
+    });
+
+    it("never interrupts work already in flight when the limit is lowered", async () => {
+      const queue = new TaskQueue(3);
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const finished: number[] = [];
+
+      const runs = [
+        queue.run(async () => { await held; finished.push(0); }),
+        queue.run(async () => { await held; finished.push(1); }),
+        queue.run(async () => { await held; finished.push(2); }),
+      ];
+      const queued = queue.run(async () => { finished.push(3); });
+
+      expect(queue.getActiveCount()).toBe(3);
+
+      queue.setMaxConcurrency(1);
+
+      // The three that already have the agent's attention keep it — a lowered
+      // limit is honoured going forward, not retroactively.
+      expect(queue.getActiveCount()).toBe(3);
+      expect(queue.getQueueLength()).toBe(1);
+
+      release!();
+      await Promise.all([...runs, queued]);
+
+      expect(finished).toEqual([0, 1, 2, 3]);
+      expect(queue.getActiveCount()).toBe(0);
+    });
+
+    it("holds the queue until the active count falls under a lowered limit", async () => {
+      const queue = new TaskQueue(2);
+      const releases: Array<() => void> = [];
+      const hold = () => new Promise<void>((resolve) => { releases.push(resolve); });
+
+      const first = queue.run(hold);
+      const second = queue.run(hold);
+      const third = queue.run(async () => {});
+
+      queue.setMaxConcurrency(1);
+      expect(queue.getQueueLength()).toBe(1);
+
+      // One finishing still leaves one running, which is already the whole of
+      // the new limit, so the waiting task must not start yet.
+      releases[0]();
+      await first;
+      expect(queue.getQueueLength()).toBe(1);
+      expect(queue.getActiveCount()).toBe(1);
+
+      releases[1]();
+      await second;
+      await third;
+      expect(queue.getActiveCount()).toBe(0);
+    });
+
+    it("does nothing, and says nothing, when the limit has not actually changed", () => {
+      const queue = new TaskQueue(4);
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorSpy.mockClear();
+
+      queue.setMaxConcurrency(4);
+
+      expect(queue.getMaxConcurrency()).toBe(4);
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+  });
+
+  describe("handleSetConcurrency", () => {
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      errorSpy.mockRestore();
+    });
+
+    const fakeConcurrencyBridge = () => ({
+      sendNotification: vi.fn().mockResolvedValue(undefined),
+    });
+
+    it("applies the limit the workspace asked for and reports it back", async () => {
+      const queue = new TaskQueue(1);
+      const bridge = fakeConcurrencyBridge();
+
+      await handleSetConcurrency({ maxConcurrency: 5 }, queue, bridge);
+
+      expect(queue.getMaxConcurrency()).toBe(5);
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ maxConcurrency: 5, active: 0, queued: 0 }),
+      );
+    });
+
+    it("reports the clamped limit, so the interface shows what took effect", async () => {
+      const queue = new TaskQueue(1);
+      const bridge = fakeConcurrencyBridge();
+
+      await handleSetConcurrency({ maxConcurrency: 100_000 }, queue, bridge);
+
+      expect(queue.getMaxConcurrency()).toBe(64);
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ maxConcurrency: 64 }),
+      );
+    });
+
+    it("keeps the current limit when asked for something that is not a number", async () => {
+      const queue = new TaskQueue(3);
+      const bridge = fakeConcurrencyBridge();
+
+      await handleSetConcurrency({ maxConcurrency: "lots" }, queue, bridge);
+
+      expect(queue.getMaxConcurrency()).toBe(3);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('asking for "lots"'),
+      );
+    });
+
+    it("still answers a rejected value, rather than leaving the control hanging", async () => {
+      const queue = new TaskQueue(3);
+      const bridge = fakeConcurrencyBridge();
+
+      await handleSetConcurrency({}, queue, bridge);
+
+      // The interface moved a control and is waiting to see where it landed;
+      // silence would leave it showing a limit this gateway never adopted.
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ maxConcurrency: 3 }),
+      );
+    });
+
+    it("reports what the queue is doing under the new limit", async () => {
+      const queue = new TaskQueue(1);
+      const bridge = fakeConcurrencyBridge();
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+
+      const runs = [
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+      ];
+
+      await handleSetConcurrency({ maxConcurrency: 2 }, queue, bridge);
+
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ maxConcurrency: 2, active: 2, queued: 1 }),
+      );
+
+      release!();
+      await Promise.all(runs);
+    });
+
+    it("answers even when applying the change throws", async () => {
+      // "Always answered" is the design; it must not depend on the change
+      // itself going well, or the interface is left showing a limit nothing
+      // adopted precisely when something has gone wrong.
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const queue = new TaskQueue(3);
+      const bridge = fakeConcurrencyBridge();
+      vi.spyOn(queue, "setMaxConcurrency").mockImplementation(() => {
+        throw new Error("queue is wedged");
+      });
+
+      await expect(
+        handleSetConcurrency({ maxConcurrency: 5 }, queue, bridge),
+      ).rejects.toThrow("queue is wedged");
+
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ maxConcurrency: 3 }),
+      );
+      errorSpy.mockRestore();
+    });
+
+    it("applies the limit even with no bridge to report it to", async () => {
+      const queue = new TaskQueue(1);
+
+      await handleSetConcurrency({ maxConcurrency: 6 }, queue);
+
+      expect(queue.getMaxConcurrency()).toBe(6);
+    });
+  });
+
+  describe("runTurnForTask", () => {
+    beforeEach(() => {
+      resetTaskTurns();
+    });
+
+    it("holds a second message on a chat until the first turn has finished", async () => {
+      // A session takes one turn at a time, and agentrq reuses a chat's id as
+      // the task id — so two messages to one chat are two deliveries of one
+      // task, and running them at once puts two prompts on one session.
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const events: string[] = [];
+      let releaseFirst: () => void;
+      const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+
+      const first = runTurnForTask("T-Chat", async () => {
+        events.push("first:start");
+        await firstHeld;
+        events.push("first:end");
+      });
+      const second = runTurnForTask("T-Chat", async () => {
+        events.push("second:start");
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(events).toEqual(["first:start"]);
+
+      releaseFirst!();
+      await Promise.all([first, second]);
+
+      expect(events).toEqual(["first:start", "first:end", "second:start"]);
+      errorSpy.mockRestore();
+    });
+
+    it("lets a second message through after the first turn failed", async () => {
+      // Losing it would lose what someone typed, and the first message erroring
+      // is no reason the agent should never hear the second.
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const ran: string[] = [];
+
+      const first = runTurnForTask("T-Fail", async () => {
+        ran.push("first");
+        throw new Error("agent blew up");
+      });
+      const second = runTurnForTask("T-Fail", async () => {
+        ran.push("second");
+      });
+
+      await expect(first).rejects.toThrow("agent blew up");
+      await second;
+
+      expect(ran).toEqual(["first", "second"]);
+      errorSpy.mockRestore();
+    });
+
+    it("keeps a queue of messages in the order they were sent", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const ran: number[] = [];
+      const turns = [0, 1, 2, 3].map((n) =>
+        runTurnForTask("T-Order", async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5 - n));
+          ran.push(n);
+        }),
+      );
+
+      await Promise.all(turns);
+
+      expect(ran).toEqual([0, 1, 2, 3]);
+      errorSpy.mockRestore();
+    });
+
+    it("never makes one chat wait on another", async () => {
+      // Serialising per task, not globally — a shared lock would undo the whole
+      // point of a concurrency limit above 1.
+      const started: string[] = [];
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+
+      const a = runTurnForTask("T-One", async () => { started.push("a"); await held; });
+      const b = runTurnForTask("T-Two", async () => { started.push("b"); await held; });
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(started.sort()).toEqual(["a", "b"]);
+
+      release!();
+      await Promise.all([a, b]);
+    });
+
+    it("runs a delivery with no task id straight away", async () => {
+      let ran = false;
+      await runTurnForTask(undefined, async () => { ran = true; });
+      expect(ran).toBe(true);
+    });
+
+    it("forgets a task once its last turn is done, rather than growing forever", async () => {
+      await runTurnForTask("T-Clean", async () => {});
+      const ran: string[] = [];
+
+      // A stale chain tail would make this wait on an already-settled promise
+      // instead of starting at once; a leaked one would never be collected.
+      await runTurnForTask("T-Clean", async () => { ran.push("second"); });
+
+      expect(ran).toEqual(["second"]);
+    });
+  });
+
+  describe("registerConcurrencyListeners", () => {
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      errorSpy.mockRestore();
+    });
+
+    const listeningBridge = () => {
+      const bridge: any = new EventEmitter();
+      bridge.sendNotification = vi.fn().mockResolvedValue(undefined);
+      return bridge;
+    };
+
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    it("applies a limit the workspace pushes while the gateway is running", async () => {
+      const bridge = listeningBridge();
+      const queue = new TaskQueue(1);
+      registerConcurrencyListeners(bridge, queue);
+
+      bridge.emit("setConcurrency", { maxConcurrency: 5 });
+      await settle();
+
+      expect(queue.getMaxConcurrency()).toBe(5);
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ maxConcurrency: 5 }),
+      );
+    });
+
+    it("re-reports the limit on reconnect, which the workspace has just forgotten", async () => {
+      const bridge = listeningBridge();
+      const queue = new TaskQueue(1);
+      registerConcurrencyListeners(bridge, queue);
+
+      bridge.emit("setConcurrency", { maxConcurrency: 7 });
+      await settle();
+      bridge.sendNotification.mockClear();
+
+      bridge.emit("reconnected");
+      await settle();
+
+      // The limit in force, not the one the gateway booted with.
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ maxConcurrency: 7 }),
+      );
+    });
+
+    it("logs rather than throws when applying the change goes wrong", async () => {
+      const bridge = listeningBridge();
+      const queue = new TaskQueue(1);
+      vi.spyOn(queue, "setMaxConcurrency").mockImplementation(() => {
+        throw new Error("queue is wedged");
+      });
+      registerConcurrencyListeners(bridge, queue);
+
+      // An unhandled rejection here would be logged and swallowed by the
+      // process-level net in production, which is a worse place to find out.
+      bridge.emit("setConcurrency", { maxConcurrency: 2 });
+      await settle();
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        "[bridge] Error handling concurrency change:",
+        expect.any(Error),
+      );
+    });
+  });
+
+  describe("reportConcurrency", () => {
+    it("describes the queue as it stands", async () => {
+      const bridge: any = { sendNotification: vi.fn().mockResolvedValue(undefined) };
+      const queue = new TaskQueue(2);
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const runs = [
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+      ];
+
+      await reportConcurrency(bridge, queue);
+
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ maxConcurrency: 2, active: 2, queued: 1 }),
+      );
+
+      release!();
+      await Promise.all(runs);
+    });
   });
 
   describe("getOrCreateSession", () => {
@@ -560,6 +1085,100 @@ describe("index", () => {
 
       expect(session).toBeDefined();
       expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(true);
+    });
+
+    it("gives two deliveries of one task a single agent, not one each", async () => {
+      // activeSessions only learns about a session once the agent has spawned,
+      // handshaken and opened it. Two deliveries inside that window both missed
+      // the cache and both spawned — two processes on one task, and only the
+      // second reachable afterwards, so the first could never be closed.
+      const mockBridge: any = fakeBridge();
+      spawnedAgents.length = 0;
+
+      const [first, second] = await Promise.all([
+        getOrCreateSession("T-Dup", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+        getOrCreateSession("T-Dup", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+      ]);
+
+      expect(spawnedAgents.length).toBe(1);
+      expect(second).toBe(first);
+      expect(activeSessions.size).toBe(1);
+    });
+
+    it("holds a crowd of simultaneous deliveries to one agent", async () => {
+      const mockBridge: any = fakeBridge();
+      spawnedAgents.length = 0;
+
+      const sessions = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          getOrCreateSession("T-Crowd", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+        ),
+      );
+
+      expect(spawnedAgents.length).toBe(1);
+      expect(new Set(sessions).size).toBe(1);
+    });
+
+    it("still opens separate agents for separate tasks at the same time", async () => {
+      // The guard is per task, not a lock on opening sessions at all — a raised
+      // concurrency limit would be worth nothing if it serialised every spawn.
+      const mockBridge: any = fakeBridge();
+      spawnedAgents.length = 0;
+
+      const [a, b, c] = await Promise.all([
+        getOrCreateSession("T-A", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+        getOrCreateSession("T-B", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+        getOrCreateSession("T-C", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+      ]);
+
+      expect(spawnedAgents.length).toBe(3);
+      expect(new Set([a, b, c]).size).toBe(3);
+      expect(activeSessions.size).toBe(3);
+    });
+
+    it("serves a later delivery from the cache, not from a spent attempt", async () => {
+      const mockBridge: any = fakeBridge();
+      spawnedAgents.length = 0;
+
+      const first = await getOrCreateSession("T-Later", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      const second = await getOrCreateSession("T-Later", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(second).toBe(first);
+      expect(spawnedAgents.length).toBe(1);
+    });
+
+    it("lets a task try again after the attempt it waited on failed", async () => {
+      // A failed attempt must not leave the key wedged, or one bad spawn would
+      // cost the task every later delivery too.
+      const mockBridge: any = fakeBridge();
+      newSessionError.value = new Error("agent said no");
+
+      await expect(
+        getOrCreateSession("T-Retry", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+      ).rejects.toThrow("agent said no");
+
+      newSessionError.value = null;
+      const recovered = await getOrCreateSession(
+        "T-Retry", ["node", "agent.js"], [], { env: {} } as any, mockBridge,
+      );
+
+      expect(recovered).toBeDefined();
+      expect(activeSessions.has("T-Retry")).toBe(true);
+    });
+
+    it("fails both waiters together rather than spawning a second agent to retry", async () => {
+      const mockBridge: any = fakeBridge();
+      newSessionError.value = new Error("agent said no");
+      spawnedAgents.length = 0;
+
+      const results = await Promise.allSettled([
+        getOrCreateSession("T-BothFail", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+        getOrCreateSession("T-BothFail", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+      ]);
+
+      expect(results.every((r) => r.status === "rejected")).toBe(true);
+      expect(spawnedAgents.length).toBe(1);
+      newSessionError.value = null;
     });
 
     it("hands the startup session to the first task rather than opening a second", async () => {
@@ -1112,6 +1731,97 @@ describe("index", () => {
     it("should accept both spellings of the concurrency flag", () => {
       expect(parseGatewayArgs(["--max-concurrency", "4"]).maxConcurrency).toBe(4);
       expect(parseGatewayArgs(["--maxConcurrency", "8"]).maxConcurrency).toBe(8);
+    });
+
+    it("should refuse a concurrency of zero, which used to stall the queue forever", () => {
+      // Accepted before, and then every task waited on a limit of 0 that no
+      // completion could ever get under.
+      expect(parseGatewayArgs(["--max-concurrency", "0"]).maxConcurrency).toBe(1);
+      expect(parseGatewayArgs(["--max-concurrency", "-3"]).maxConcurrency).toBe(1);
+    });
+
+    it("should cap the concurrency flag at the same ceiling the workspace gets", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      expect(parseGatewayArgs(["--max-concurrency", "10000"]).maxConcurrency).toBe(64);
+      errorSpy.mockRestore();
+    });
+
+    it("should say so when it caps the flag, since nothing reports a flag back", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorSpy.mockClear();
+
+      parseGatewayArgs(["--max-concurrency", "128"]);
+
+      // An existing --max-concurrency 128 would otherwise quietly boot at 64.
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("--max-concurrency 128 is outside 1-64; using 64."),
+      );
+      errorSpy.mockRestore();
+    });
+
+    it("should not warn about a fraction, which is truncated rather than capped", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorSpy.mockClear();
+
+      expect(parseGatewayArgs(["--max-concurrency", "4.9"]).maxConcurrency).toBe(4);
+
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it("should leave a non-numeric token alone, since it is the agent command", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      // `--max-concurrency claude` is the number left out, not a mistyped
+      // number. Eating the token would leave the gateway nothing to run.
+      expect(parseGatewayArgs(["--max-concurrency", "claude"])).toMatchObject({
+        maxConcurrency: 1,
+        rest: ["claude"],
+      });
+
+      errorSpy.mockRestore();
+    });
+
+    it("should consume a malformed concurrency value instead of leaving it to be run", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      // `rest` is the agent command when no `--` was used, so a value left
+      // behind here sent the gateway looking for an agent called "8x".
+      expect(parseGatewayArgs(["--max-concurrency", "8x", "claude"])).toMatchObject({
+        maxConcurrency: 1,
+        rest: ["claude"],
+      });
+      expect(parseGatewayArgs(["--max-concurrency", "8x", "--", "claude"]).rest).toEqual([
+        "--",
+        "claude",
+      ]);
+
+      errorSpy.mockRestore();
+    });
+
+    it("should say why a malformed concurrency value was ignored", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorSpy.mockClear();
+
+      parseGatewayArgs(["--max-concurrency", "8x"]);
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('--max-concurrency "8x" is not a number of tasks'),
+      );
+      errorSpy.mockRestore();
+    });
+
+    it("should stay silent when the flag simply has no value to read", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorSpy.mockClear();
+
+      expect(parseGatewayArgs(["--max-concurrency", "--logout"])).toMatchObject({
+        maxConcurrency: 1,
+        command: "logout",
+      });
+
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
     });
 
     it("should keep the default when the concurrency value is missing or not a number", () => {
@@ -1788,6 +2498,11 @@ describe("index", () => {
 
     it("should document the default concurrency of 1", () => {
       expect(helpText()).toContain("Defaults to 1.");
+    });
+
+    it("should document the concurrency range and that agentrq can change it", () => {
+      expect(helpText()).toContain("1 to 64.");
+      expect(helpText()).toContain("agentrq can change it while running.");
     });
   });
 
@@ -2693,16 +3408,105 @@ describe("index", () => {
       let errorSpy: any;
       beforeEach(() => {
         activeSessions.clear();
+        // Also clears the record of agents spawned by earlier tests, which this
+        // one now reaps.
+        resetIdleSession();
         errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       });
       afterEach(() => {
         activeSessions.clear();
+        resetIdleSession();
         errorSpy.mockRestore();
       });
 
       it("does nothing when activeSessions is empty", async () => {
         await closeAllSessions();
         expect(activeSessions.size).toBe(0);
+      });
+
+      it("ends an agent that spawned but never opened a session", async () => {
+        // activeSessions only holds agents that got as far as an open session,
+        // so shutting down on it alone left behind the agent still handshaking
+        // — and the one stopped waiting for a login, which is the case most
+        // likely to be interrupted, since it can sit there indefinitely. One
+        // that quits when its stdin closes got away with it; one with an event
+        // loop of its own did not.
+        newSessionHangs.value = true;
+        spawnedAgents.length = 0;
+
+        const opening = getOrCreateSession(
+          "T-Interrupted",
+          ["node", "agent.js"],
+          [],
+          { env: {} } as any,
+          fakeBridge(),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 10));
+
+        // Spawned, and tracked by nothing that shutdown used to look at.
+        expect(spawnedAgents.length).toBe(1);
+        expect(activeSessions.size).toBe(0);
+
+        await closeAllSessions(10);
+
+        expect(spawnedAgents[0].kill).toHaveBeenCalled();
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.stringContaining("never opened a session"),
+        );
+
+        newSessionHangs.value = false;
+        void opening.catch(() => {});
+      });
+
+      it("keeps ending the rest when one refuses to die", async () => {
+        // Shutdown is the last thing that runs; one process that will not go
+        // must not take the others' only chance to go with it.
+        newSessionHangs.value = true;
+        spawnedAgents.length = 0;
+
+        const opening = [
+          getOrCreateSession("T-Stuck-A", ["node", "agent.js"], [], { env: {} } as any, fakeBridge()),
+          getOrCreateSession("T-Stuck-B", ["node", "agent.js"], [], { env: {} } as any, fakeBridge()),
+        ];
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(spawnedAgents.length).toBe(2);
+        spawnedAgents[0].kill.mockImplementation(() => {
+          throw new Error("no such process");
+        });
+
+        await closeAllSessions(10);
+
+        expect(spawnedAgents[1].kill).toHaveBeenCalled();
+        expect(errorSpy).toHaveBeenCalledWith(
+          "[acp] Error ending an agent process:",
+          expect.any(Error),
+        );
+
+        newSessionHangs.value = false;
+        for (const p of opening) void p.catch(() => {});
+      });
+
+      it("does not report a cleanly closed session as one left behind", async () => {
+        // Its process is ended by closeSession; counting it again would report
+        // a leak that is not there.
+        newSessionHangs.value = false;
+        spawnedAgents.length = 0;
+
+        await getOrCreateSession(
+          "T-Clean-Exit",
+          ["node", "agent.js"],
+          [],
+          { env: {} } as any,
+          fakeBridge(),
+        );
+        expect(activeSessions.size).toBe(1);
+
+        await closeAllSessions(10);
+
+        expect(spawnedAgents[0].kill).toHaveBeenCalled();
+        expect(errorSpy).not.toHaveBeenCalledWith(
+          expect.stringContaining("never opened a session"),
+        );
       });
 
       it("closes all unique active sessions in parallel and clears map", async () => {

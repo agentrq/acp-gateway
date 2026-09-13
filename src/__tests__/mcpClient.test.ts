@@ -163,7 +163,7 @@ describe("MCPBridge", () => {
       expect(StreamableHTTPClientTransport).toHaveBeenCalled();
       expect(lastMockClient.connect).toHaveBeenCalled();
       // permission verdict, cancel, and set_model.
-      expect(lastMockClient.setNotificationHandler).toHaveBeenCalledTimes(4);
+      expect(lastMockClient.setNotificationHandler).toHaveBeenCalledTimes(5);
       expect((bridge as any).isConnected).toBe(true);
     });
 
@@ -414,6 +414,104 @@ describe("MCPBridge", () => {
         configId: undefined,
         modelId: undefined,
       });
+    });
+  });
+
+  describe("concurrency notifications", () => {
+    function getSetConcurrencyHandler() {
+      for (const call of lastMockClient.setNotificationHandler.mock.calls) {
+        const schema = call[0];
+        try {
+          const parsed = schema.safeParse({
+            method: "notifications/claude/channel/set_concurrency",
+          });
+          if (parsed.success) return call[1];
+        } catch {}
+      }
+      return undefined;
+    }
+
+    it("emits setConcurrency for the camelCase this notification uses", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetConcurrency = vi.fn();
+      bridge.on("setConcurrency", onSetConcurrency);
+
+      getSetConcurrencyHandler()({
+        method: "notifications/claude/channel/set_concurrency",
+        params: { maxConcurrency: 4 },
+      });
+
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: 4 });
+    });
+
+    it("passes a number sent as a string straight through to be read later", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetConcurrency = vi.fn();
+      bridge.on("setConcurrency", onSetConcurrency);
+
+      getSetConcurrencyHandler()({
+        method: "notifications/claude/channel/set_concurrency",
+        params: { maxConcurrency: "6" },
+      });
+
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: "6" });
+    });
+
+    it("survives a notification carrying no params at all", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetConcurrency = vi.fn();
+      bridge.on("setConcurrency", onSetConcurrency);
+
+      getSetConcurrencyHandler()({
+        method: "notifications/claude/channel/set_concurrency",
+      });
+
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: undefined });
+    });
+
+    it("still answers a sender that spelled it the older snake_case way", async () => {
+      // Not read — this notification has one spelling. But it must still reach
+      // the handler, which reports the limit still in force, so a mistaken
+      // sender sees an unchanged limit come back rather than silence.
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetConcurrency = vi.fn();
+      bridge.on("setConcurrency", onSetConcurrency);
+
+      getSetConcurrencyHandler()({
+        method: "notifications/claude/channel/set_concurrency",
+        params: { max_concurrency: 4 },
+      });
+
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: undefined });
+    });
+
+    it("passes a value of any shape on, so every request can still be answered", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      for (const value of [null, true, {}, [], "auto"]) {
+        const onSetConcurrency = vi.fn();
+        bridge.on("setConcurrency", onSetConcurrency);
+
+        // The SDK drops a notification that fails this schema before the
+        // handler runs, so refusing a bad value is normalizeConcurrency's job,
+        // downstream, where the refusal can still be reported.
+        getSetConcurrencyHandler()({
+          method: "notifications/claude/channel/set_concurrency",
+          params: { maxConcurrency: value },
+        });
+
+        expect(onSetConcurrency).toHaveBeenCalledTimes(1);
+        bridge.off("setConcurrency", onSetConcurrency);
+      }
     });
   });
 
