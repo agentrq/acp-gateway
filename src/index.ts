@@ -123,6 +123,12 @@ import {
   setSessionModel,
   type AgentModelsResult,
 } from "./models.js";
+import {
+  MAX_MAX_CONCURRENCY,
+  MIN_MAX_CONCURRENCY,
+  normalizeConcurrency,
+  sendConcurrencyNotification,
+} from "./concurrency.js";
 
 const lastTaskContent = new Map<string, string>();
 
@@ -1184,6 +1190,73 @@ export async function handleSetModel(
 }
 
 /**
+ * Applies a concurrency limit the workspace asked for, and reports back the one
+ * actually in force.
+ *
+ * The report is unconditional, which is the whole point of it. Someone moved a
+ * control in the interface and is watching to see where it landed; a value that
+ * was clamped, or one that was not a number at all, has to come back as the
+ * real limit rather than as silence — otherwise the interface goes on showing a
+ * number this gateway never adopted.
+ */
+export async function handleSetConcurrency(
+  { maxConcurrency }: { maxConcurrency?: unknown },
+  queue: TaskQueue,
+  /** Absent only in tests. */
+  bridge?: { sendNotification(method: string, params: unknown): Promise<unknown> },
+): Promise<void> {
+  const requested = normalizeConcurrency(maxConcurrency);
+
+  if (requested === undefined) {
+    console.error(
+      `[bridge] Received a set_concurrency notification asking for ` +
+        `"${String(maxConcurrency)}", which is not a number of tasks; ` +
+        `keeping the limit at ${queue.getMaxConcurrency()}`,
+    );
+  } else {
+    queue.setMaxConcurrency(requested);
+  }
+
+  if (bridge) await reportConcurrency(bridge, queue);
+}
+
+/** Tells the workspace what the queue's limit is and what it is doing under it. */
+export async function reportConcurrency(
+  bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
+  queue: TaskQueue,
+): Promise<void> {
+  await sendConcurrencyNotification(bridge, {
+    maxConcurrency: queue.getMaxConcurrency(),
+    active: queue.getActiveCount(),
+    queued: queue.getQueueLength(),
+  });
+}
+
+/**
+ * Subscribes the queue to the workspace's concurrency directives.
+ *
+ * The reconnect subscription is the less obvious half. A reconnect mints a new
+ * MCP session and the workspace keys this report to the connection it arrived
+ * on — so a workspace that dropped and came back would otherwise go on showing
+ * whatever limit it last heard about, which is the boot default for the rest of
+ * the gateway's life.
+ */
+export function registerConcurrencyListeners(
+  bridge: MCPBridge,
+  queue: TaskQueue,
+): void {
+  bridge.on("setConcurrency", (params: { maxConcurrency?: unknown }) => {
+    handleSetConcurrency(params, queue, bridge).catch((err) => {
+      console.error("[bridge] Error handling concurrency change:", err);
+    });
+  });
+
+  bridge.on("reconnected", () => {
+    void reportConcurrency(bridge, queue);
+  });
+}
+
+/**
  * Handles task cancellation events from the MCP server.
  * Cancels the ACP session/turn and immediately cancels any pending permissions.
  */
@@ -1430,14 +1503,23 @@ export class TaskQueue {
     }
   }
 
+  /**
+   * Starts as many waiting tasks as the limit now has room for.
+   *
+   * A loop rather than a single task, because this is also what runs when the
+   * limit is raised: going from 1 to 4 with three tasks waiting has to start
+   * all three, and starting one and waiting for it to finish would make a raise
+   * take effect one task at a time. `execute` counts the task as active before
+   * it yields, so the condition is re-read against a number that already
+   * includes everything this loop has started.
+   */
   private next() {
-    if (this.queue.length > 0 && this.activeTasks < this.maxConcurrency) {
-      const nextTask = this.queue.shift();
-      if (nextTask) {
-        this.execute(nextTask).catch((err) => {
-          console.log("[queue] Error executing queued task:", err);
-        });
-      }
+    while (this.queue.length > 0 && this.activeTasks < this.maxConcurrency) {
+      // Non-null: the loop condition has just established the queue is not empty.
+      const nextTask = this.queue.shift()!;
+      this.execute(nextTask).catch((err) => {
+        console.log("[queue] Error executing queued task:", err);
+      });
     }
   }
 
@@ -1447,6 +1529,30 @@ export class TaskQueue {
 
   public getQueueLength(): number {
     return this.queue.length;
+  }
+
+  public getMaxConcurrency(): number {
+    return this.maxConcurrency;
+  }
+
+  /**
+   * Changes how many tasks may run at once, while tasks are running.
+   *
+   * Lowering the limit never interrupts anything: a task that has already been
+   * handed to the agent keeps its turn, and the queue simply stops handing out
+   * new ones until enough have finished. So a limit lowered below the number
+   * currently running is honoured going forward rather than retroactively —
+   * killing work already in flight is not what "run fewer at once" means.
+   */
+  public setMaxConcurrency(maxConcurrency: number): void {
+    if (maxConcurrency === this.maxConcurrency) return;
+    const previous = this.maxConcurrency;
+    this.maxConcurrency = maxConcurrency;
+    console.error(
+      `[queue] Concurrency limit ${previous} -> ${maxConcurrency} ` +
+        `(${this.activeTasks} running, ${this.queue.length} queued)`,
+    );
+    this.next();
   }
 }
 
@@ -1462,7 +1568,7 @@ export type GatewayCommand =
   | "help";
 
 /** Default maximum number of concurrent tasks allowed to prompt the ACP agent at once. */
-export const DEFAULT_MAX_CONCURRENCY = 1;
+export const DEFAULT_MAX_CONCURRENCY = MIN_MAX_CONCURRENCY;
 
 export interface GatewayOptions {
   maxConcurrency: number;
@@ -1503,8 +1609,12 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
     switch (args[i]) {
       case "--max-concurrency":
       case "--maxConcurrency": {
-        const parsed = parseInt(value ?? "", 10);
-        if (!isNaN(parsed)) {
+        // Read by the same rule the workspace's set_concurrency goes through,
+        // so the flag and the runtime control cannot disagree about what a
+        // number means. It is also what stops `--max-concurrency 0`, which
+        // used to be accepted and then held every task in the queue forever.
+        const parsed = normalizeConcurrency(value);
+        if (parsed !== undefined) {
           options.maxConcurrency = parsed;
           i++;
         }
@@ -1824,8 +1934,9 @@ AUTHENTICATION
                               mid-run. Defaults to choosing one automatically.
 
 BRIDGE
-  --max-concurrency <number>  How many tasks may prompt the agent at once.
-                              Defaults to ${DEFAULT_MAX_CONCURRENCY}.
+  --max-concurrency <number>  How many tasks may prompt the agent at once, from
+                              ${MIN_MAX_CONCURRENCY} to ${MAX_MAX_CONCURRENCY}. Defaults to ${DEFAULT_MAX_CONCURRENCY}. This is the limit
+                              to start on — agentrq can change it while running.
   --permission-timeout <min>  How long a tool call waits for someone to approve
                               it before the turn is cancelled. Defaults to 30.
                               0 waits indefinitely, which is what a wedged
@@ -2040,6 +2151,8 @@ async function main() {
       },
     );
 
+    registerConcurrencyListeners(mcpBridge, taskQueue);
+
     // Everything above is listening; nothing below can be missed.
     //
     // The agent comes up before the workspace is told anything, so a task can
@@ -2067,6 +2180,12 @@ async function main() {
     }
 
     await mcpBridge.connect();
+
+    // Said before any task runs, because that is when a human looking at the
+    // workspace wants to know how much work it will take at once — and because
+    // the control cannot be rendered at all until the workspace knows both the
+    // current limit and that this gateway is one that will act on a change.
+    void reportConcurrency(mcpBridge, taskQueue);
 
     // Only when the agent has not spoken for itself. A session that came up
     // already reported the agent's own name, title and version from its

@@ -11,6 +11,7 @@ import { EventEmitter } from "node:events";
 import { z } from "zod";
 import type { McpServerConfig } from "./config.js";
 import { extractTaskIdFromMeta } from "./taskIdentity.js";
+import { SET_CONCURRENCY_NOTIFICATION_METHOD } from "./concurrency.js";
 
 export class MCPBridge extends EventEmitter {
   private client: Client | null = null;
@@ -265,6 +266,33 @@ export class MCPBridge extends EventEmitter {
           sessionId: params.session_id || params.sessionId,
           configId: params.config_id || params.configId,
           modelId: params.model_id || params.modelId,
+        });
+      },
+    );
+
+    // Set notification handler for a concurrency limit changed in the interface
+    this.client.setNotificationHandler(
+      z.object({
+        method: z.literal(SET_CONCURRENCY_NOTIFICATION_METHOD),
+        params: z
+          .object({
+            max_concurrency: z.union([z.number(), z.string()]).optional(),
+            maxConcurrency: z.union([z.number(), z.string()]).optional(),
+            concurrency: z.union([z.number(), z.string()]).optional(),
+          })
+          .passthrough()
+          .optional(),
+      }),
+      (notification) => {
+        console.error("[mcp] Received concurrency notification");
+        // Both spellings, and the bare `concurrency`, for the reason the
+        // set_model handler above records: the workspace sends snake_case, and
+        // tolerating the alternatives turns a silent no-op into something that
+        // simply works.
+        const params = notification.params ?? {};
+        this.emit("setConcurrency", {
+          maxConcurrency:
+            params.max_concurrency ?? params.maxConcurrency ?? params.concurrency,
         });
       },
     );

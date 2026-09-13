@@ -163,7 +163,7 @@ describe("MCPBridge", () => {
       expect(StreamableHTTPClientTransport).toHaveBeenCalled();
       expect(lastMockClient.connect).toHaveBeenCalled();
       // permission verdict, cancel, and set_model.
-      expect(lastMockClient.setNotificationHandler).toHaveBeenCalledTimes(4);
+      expect(lastMockClient.setNotificationHandler).toHaveBeenCalledTimes(5);
       expect((bridge as any).isConnected).toBe(true);
     });
 
@@ -414,6 +414,95 @@ describe("MCPBridge", () => {
         configId: undefined,
         modelId: undefined,
       });
+    });
+  });
+
+  describe("concurrency notifications", () => {
+    function getSetConcurrencyHandler() {
+      for (const call of lastMockClient.setNotificationHandler.mock.calls) {
+        const schema = call[0];
+        try {
+          const parsed = schema.safeParse({
+            method: "notifications/claude/channel/set_concurrency",
+          });
+          if (parsed.success) return call[1];
+        } catch {}
+      }
+      return undefined;
+    }
+
+    it("emits setConcurrency for the snake_case the workspace actually sends", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetConcurrency = vi.fn();
+      bridge.on("setConcurrency", onSetConcurrency);
+
+      getSetConcurrencyHandler()({
+        method: "notifications/claude/channel/set_concurrency",
+        params: { max_concurrency: 4 },
+      });
+
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: 4 });
+    });
+
+    it("accepts camelCase too, so a spelling never becomes a silent no-op", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetConcurrency = vi.fn();
+      bridge.on("setConcurrency", onSetConcurrency);
+
+      getSetConcurrencyHandler()({
+        method: "notifications/claude/channel/set_concurrency",
+        params: { maxConcurrency: 8 },
+      });
+
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: 8 });
+    });
+
+    it("accepts a bare concurrency key", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetConcurrency = vi.fn();
+      bridge.on("setConcurrency", onSetConcurrency);
+
+      getSetConcurrencyHandler()({
+        method: "notifications/claude/channel/set_concurrency",
+        params: { concurrency: 2 },
+      });
+
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: 2 });
+    });
+
+    it("passes a number sent as a string straight through to be read later", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetConcurrency = vi.fn();
+      bridge.on("setConcurrency", onSetConcurrency);
+
+      getSetConcurrencyHandler()({
+        method: "notifications/claude/channel/set_concurrency",
+        params: { max_concurrency: "6" },
+      });
+
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: "6" });
+    });
+
+    it("survives a notification carrying no params at all", async () => {
+      const bridge = new MCPBridge(config);
+      await bridge.connect();
+
+      const onSetConcurrency = vi.fn();
+      bridge.on("setConcurrency", onSetConcurrency);
+
+      getSetConcurrencyHandler()({
+        method: "notifications/claude/channel/set_concurrency",
+      });
+
+      expect(onSetConcurrency).toHaveBeenCalledWith({ maxConcurrency: undefined });
     });
   });
 

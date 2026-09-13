@@ -44,6 +44,9 @@ import {
   findActiveSession,
   handleTaskCancellation,
   handleSetModel,
+  handleSetConcurrency,
+  registerConcurrencyListeners,
+  reportConcurrency,
   applyModelSelection,
   cancelledTaskSeq,
   markTaskCancelled,
@@ -528,6 +531,322 @@ describe("index", () => {
       expect(logSpy).toHaveBeenCalledWith("[queue] Error executing queued task:", expect.any(Error));
 
       logSpy.mockRestore();
+    });
+
+    it("reports the limit it was built with", () => {
+      expect(new TaskQueue(3).getMaxConcurrency()).toBe(3);
+    });
+
+    it("starts every task a raised limit has room for, not one at a time", async () => {
+      const queue = new TaskQueue(1);
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+
+      const started: number[] = [];
+      const runs = [
+        queue.run(async () => { started.push(0); await held; }),
+        queue.run(async () => { started.push(1); }),
+        queue.run(async () => { started.push(2); }),
+        queue.run(async () => { started.push(3); }),
+      ];
+
+      // Only the first is running; the other three are waiting on a limit of 1.
+      expect(queue.getActiveCount()).toBe(1);
+      expect(queue.getQueueLength()).toBe(3);
+
+      queue.setMaxConcurrency(4);
+
+      // All three waiting tasks start at once, without the running one
+      // finishing first — a raise that took effect one task per completion
+      // would leave two of them still queued here.
+      expect(started).toEqual([0, 1, 2, 3]);
+      expect(queue.getMaxConcurrency()).toBe(4);
+
+      release!();
+      await Promise.all(runs);
+    });
+
+    it("starts only as many as the new limit allows, and leaves the rest queued", async () => {
+      const queue = new TaskQueue(1);
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+
+      const runs = [
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+      ];
+
+      queue.setMaxConcurrency(2);
+
+      expect(queue.getActiveCount()).toBe(2);
+      expect(queue.getQueueLength()).toBe(2);
+
+      release!();
+      await Promise.all(runs);
+    });
+
+    it("never interrupts work already in flight when the limit is lowered", async () => {
+      const queue = new TaskQueue(3);
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const finished: number[] = [];
+
+      const runs = [
+        queue.run(async () => { await held; finished.push(0); }),
+        queue.run(async () => { await held; finished.push(1); }),
+        queue.run(async () => { await held; finished.push(2); }),
+      ];
+      const queued = queue.run(async () => { finished.push(3); });
+
+      expect(queue.getActiveCount()).toBe(3);
+
+      queue.setMaxConcurrency(1);
+
+      // The three that already have the agent's attention keep it — a lowered
+      // limit is honoured going forward, not retroactively.
+      expect(queue.getActiveCount()).toBe(3);
+      expect(queue.getQueueLength()).toBe(1);
+
+      release!();
+      await Promise.all([...runs, queued]);
+
+      expect(finished).toEqual([0, 1, 2, 3]);
+      expect(queue.getActiveCount()).toBe(0);
+    });
+
+    it("holds the queue until the active count falls under a lowered limit", async () => {
+      const queue = new TaskQueue(2);
+      const releases: Array<() => void> = [];
+      const hold = () => new Promise<void>((resolve) => { releases.push(resolve); });
+
+      const first = queue.run(hold);
+      const second = queue.run(hold);
+      const third = queue.run(async () => {});
+
+      queue.setMaxConcurrency(1);
+      expect(queue.getQueueLength()).toBe(1);
+
+      // One finishing still leaves one running, which is already the whole of
+      // the new limit, so the waiting task must not start yet.
+      releases[0]();
+      await first;
+      expect(queue.getQueueLength()).toBe(1);
+      expect(queue.getActiveCount()).toBe(1);
+
+      releases[1]();
+      await second;
+      await third;
+      expect(queue.getActiveCount()).toBe(0);
+    });
+
+    it("does nothing, and says nothing, when the limit has not actually changed", () => {
+      const queue = new TaskQueue(4);
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      errorSpy.mockClear();
+
+      queue.setMaxConcurrency(4);
+
+      expect(queue.getMaxConcurrency()).toBe(4);
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+  });
+
+  describe("handleSetConcurrency", () => {
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      errorSpy.mockRestore();
+    });
+
+    const fakeConcurrencyBridge = () => ({
+      sendNotification: vi.fn().mockResolvedValue(undefined),
+    });
+
+    it("applies the limit the workspace asked for and reports it back", async () => {
+      const queue = new TaskQueue(1);
+      const bridge = fakeConcurrencyBridge();
+
+      await handleSetConcurrency({ maxConcurrency: 5 }, queue, bridge);
+
+      expect(queue.getMaxConcurrency()).toBe(5);
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ max_concurrency: 5, active: 0, queued: 0 }),
+      );
+    });
+
+    it("reports the clamped limit, so the interface shows what took effect", async () => {
+      const queue = new TaskQueue(1);
+      const bridge = fakeConcurrencyBridge();
+
+      await handleSetConcurrency({ maxConcurrency: 100_000 }, queue, bridge);
+
+      expect(queue.getMaxConcurrency()).toBe(64);
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ max_concurrency: 64 }),
+      );
+    });
+
+    it("keeps the current limit when asked for something that is not a number", async () => {
+      const queue = new TaskQueue(3);
+      const bridge = fakeConcurrencyBridge();
+
+      await handleSetConcurrency({ maxConcurrency: "lots" }, queue, bridge);
+
+      expect(queue.getMaxConcurrency()).toBe(3);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('asking for "lots"'),
+      );
+    });
+
+    it("still answers a rejected value, rather than leaving the control hanging", async () => {
+      const queue = new TaskQueue(3);
+      const bridge = fakeConcurrencyBridge();
+
+      await handleSetConcurrency({}, queue, bridge);
+
+      // The interface moved a control and is waiting to see where it landed;
+      // silence would leave it showing a limit this gateway never adopted.
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ max_concurrency: 3 }),
+      );
+    });
+
+    it("reports what the queue is doing under the new limit", async () => {
+      const queue = new TaskQueue(1);
+      const bridge = fakeConcurrencyBridge();
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+
+      const runs = [
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+      ];
+
+      await handleSetConcurrency({ maxConcurrency: 2 }, queue, bridge);
+
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ max_concurrency: 2, active: 2, queued: 1 }),
+      );
+
+      release!();
+      await Promise.all(runs);
+    });
+
+    it("applies the limit even with no bridge to report it to", async () => {
+      const queue = new TaskQueue(1);
+
+      await handleSetConcurrency({ maxConcurrency: 6 }, queue);
+
+      expect(queue.getMaxConcurrency()).toBe(6);
+    });
+  });
+
+  describe("registerConcurrencyListeners", () => {
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      errorSpy.mockRestore();
+    });
+
+    const listeningBridge = () => {
+      const bridge: any = new EventEmitter();
+      bridge.sendNotification = vi.fn().mockResolvedValue(undefined);
+      return bridge;
+    };
+
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    it("applies a limit the workspace pushes while the gateway is running", async () => {
+      const bridge = listeningBridge();
+      const queue = new TaskQueue(1);
+      registerConcurrencyListeners(bridge, queue);
+
+      bridge.emit("setConcurrency", { maxConcurrency: 5 });
+      await settle();
+
+      expect(queue.getMaxConcurrency()).toBe(5);
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ max_concurrency: 5 }),
+      );
+    });
+
+    it("re-reports the limit on reconnect, which the workspace has just forgotten", async () => {
+      const bridge = listeningBridge();
+      const queue = new TaskQueue(1);
+      registerConcurrencyListeners(bridge, queue);
+
+      bridge.emit("setConcurrency", { maxConcurrency: 7 });
+      await settle();
+      bridge.sendNotification.mockClear();
+
+      bridge.emit("reconnected");
+      await settle();
+
+      // The limit in force, not the one the gateway booted with.
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ max_concurrency: 7 }),
+      );
+    });
+
+    it("logs rather than throws when applying the change goes wrong", async () => {
+      const bridge = listeningBridge();
+      const queue = new TaskQueue(1);
+      vi.spyOn(queue, "setMaxConcurrency").mockImplementation(() => {
+        throw new Error("queue is wedged");
+      });
+      registerConcurrencyListeners(bridge, queue);
+
+      // An unhandled rejection here would be logged and swallowed by the
+      // process-level net in production, which is a worse place to find out.
+      bridge.emit("setConcurrency", { maxConcurrency: 2 });
+      await settle();
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        "[bridge] Error handling concurrency change:",
+        expect.any(Error),
+      );
+    });
+  });
+
+  describe("reportConcurrency", () => {
+    it("describes the queue as it stands", async () => {
+      const bridge: any = { sendNotification: vi.fn().mockResolvedValue(undefined) };
+      const queue = new TaskQueue(2);
+      let release: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const runs = [
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+        queue.run(async () => { await held; }),
+      ];
+
+      await reportConcurrency(bridge, queue);
+
+      expect(bridge.sendNotification).toHaveBeenCalledWith(
+        "notifications/claude/channel/concurrency",
+        expect.objectContaining({ max_concurrency: 2, active: 2, queued: 1 }),
+      );
+
+      release!();
+      await Promise.all(runs);
     });
   });
 
@@ -1112,6 +1431,17 @@ describe("index", () => {
     it("should accept both spellings of the concurrency flag", () => {
       expect(parseGatewayArgs(["--max-concurrency", "4"]).maxConcurrency).toBe(4);
       expect(parseGatewayArgs(["--maxConcurrency", "8"]).maxConcurrency).toBe(8);
+    });
+
+    it("should refuse a concurrency of zero, which used to stall the queue forever", () => {
+      // Accepted before, and then every task waited on a limit of 0 that no
+      // completion could ever get under.
+      expect(parseGatewayArgs(["--max-concurrency", "0"]).maxConcurrency).toBe(1);
+      expect(parseGatewayArgs(["--max-concurrency", "-3"]).maxConcurrency).toBe(1);
+    });
+
+    it("should cap the concurrency flag at the same ceiling the workspace gets", () => {
+      expect(parseGatewayArgs(["--max-concurrency", "10000"]).maxConcurrency).toBe(64);
     });
 
     it("should keep the default when the concurrency value is missing or not a number", () => {
@@ -1788,6 +2118,11 @@ describe("index", () => {
 
     it("should document the default concurrency of 1", () => {
       expect(helpText()).toContain("Defaults to 1.");
+    });
+
+    it("should document the concurrency range and that agentrq can change it", () => {
+      expect(helpText()).toContain("1 to 64.");
+      expect(helpText()).toContain("agentrq can change it while running.");
     });
   });
 

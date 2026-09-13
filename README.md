@@ -65,7 +65,7 @@ acp-gateway -- your-acp-agent --flag1 --flag2
 
 You can specify gateway options before the `--` separator:
 
-- `--max-concurrency` / `--maxConcurrency` `<number>`: Sets the maximum number of concurrent tasks allowed to prompt the ACP agent at once. Defaults to `1`.
+- `--max-concurrency` / `--maxConcurrency` `<number>`: Sets the maximum number of concurrent tasks allowed to prompt the ACP agent at once. Defaults to `1`, and can be anything from `1` to `64`. This is the limit the gateway starts on; it can be changed while running from the agentrq interface.
 - `--agent <registry-id>`: Runs an agent from the ACP registry instead of a command you supply yourself.
 - `--list-agents`: Prints every agent in the registry and how each one can run on this machine, then exits.
 - `--list-models`: Prints the models supported by the agent, then exits.
@@ -180,6 +180,53 @@ Example `.mcp.json`:
 
 `acp-gateway` prefers servers with `agentrq` in the name; it falls back to the first HTTP server with a `url`.
 
+### Changing Concurrency While Running
+
+`--max-concurrency` is the limit the gateway boots with. The workspace can change it on a gateway that is
+already running — raising it to get through a backlog, or lowering it to drain one — without a restart that
+would drop every session the gateway holds.
+
+The workspace sends:
+
+```json
+{
+  "method": "notifications/claude/channel/set_concurrency",
+  "params": { "max_concurrency": 4 }
+}
+```
+
+`maxConcurrency` and a bare `concurrency` are accepted too, and the value may be a string.
+
+The gateway reports the limit in force on `notifications/claude/channel/concurrency` — on connect, on every
+reconnect, and after every `set_concurrency`:
+
+```json
+{
+  "max_concurrency": 4,
+  "active": 2,
+  "queued": 3,
+  "min": 1,
+  "max": 64,
+  "can_set": true
+}
+```
+
+That report is unconditional, including when the requested value was refused or clamped, so the interface
+never goes on showing a limit the gateway did not adopt. `can_set` says this gateway will act on being told
+to change; versions before it report a limit and ignore the instruction, so a client should treat the flag's
+absence as no.
+
+Two things worth knowing about how a change lands:
+
+- **Raising** takes effect at once — every waiting task the new headroom allows starts immediately, rather
+  than one per completion.
+- **Lowering** never interrupts a task already in flight. Those keep the agent's attention and finish; the
+  queue simply stops handing out new ones until enough have. So `active` may exceed `max_concurrency` for a
+  while after a lower, which is expected rather than an error.
+
+The limit lives in memory. It survives MCP reconnects but not a gateway restart, which falls back to
+`--max-concurrency`. A workspace that wants the setting to stick should store it and re-send it on connect.
+
 ## How It Works
 
 ```
@@ -209,11 +256,12 @@ Example `.mcp.json`:
 5. **Task Bridge & Multi-Session Isolation** — When a task is received from the MCP server:
     - `acp-gateway` extracts the `chat_id` (Task ID).
     - It checks if the task content is a duplicate of the last processed task for this Task ID. If it is repetitive, the task is dropped to prevent redundant processing.
-    - If not repetitive, the task is added to a concurrency-limiting queue (honoring the `--max-concurrency` limit).
+    - If not repetitive, the task is added to a concurrency-limiting queue (honoring the current concurrency limit — `--max-concurrency` at startup, or whatever the workspace has since set).
     - It ensures a dedicated ACP session for that specific task.
     - If the task belongs to a different session than the current one, a new ACP session is initialized, providing clean state isolation between concurrent or sequential tasks.
 6. **Permission Bridge** — Permission requests from the ACP agent are forwarded to the MCP server; verdicts are sent back.
-7. **Recursive Execution** — After each task completes, `acp-gateway` checks for the next pending task automatically.
+7. **Concurrency Control** — The gateway reports its queue limit to the workspace on connect and on every reconnect, and applies a new limit whenever the workspace sends one (see below).
+8. **Recursive Execution** — After each task completes, `acp-gateway` checks for the next pending task automatically.
 
 ### Key Components
 
@@ -223,6 +271,7 @@ Example `.mcp.json`:
 | `src/acpClient.ts` | Implements the ACP `Client` interface — routes permission requests, handles session updates, and provides file operations. |
 | `src/mcpClient.ts` | `EventEmitter`-based MCP client with auto-reconnection, notification handling, and tool call dispatch. |
 | `src/config.ts` | Parses `.mcp.json` from the current directory tree up to 3 levels deep. |
+| `src/concurrency.ts` | How many tasks may prompt the agent at once, and the notifications that change it while the gateway runs. |
 | `src/auth.ts` | ACP authentication — lists the agent's login methods, detects `auth_required`, and runs agent or terminal logins. |
 | `src/registry.ts` | Reads the ACP registry index — agent lookup, host platform matching, and package launch commands. |
 | `src/agentInstall.ts` | Downloads, verifies, unpacks and caches a registry agent's binary distribution. |
