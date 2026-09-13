@@ -881,6 +881,100 @@ describe("index", () => {
       expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(true);
     });
 
+    it("gives two deliveries of one task a single agent, not one each", async () => {
+      // activeSessions only learns about a session once the agent has spawned,
+      // handshaken and opened it. Two deliveries inside that window both missed
+      // the cache and both spawned — two processes on one task, and only the
+      // second reachable afterwards, so the first could never be closed.
+      const mockBridge: any = fakeBridge();
+      spawnedAgents.length = 0;
+
+      const [first, second] = await Promise.all([
+        getOrCreateSession("T-Dup", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+        getOrCreateSession("T-Dup", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+      ]);
+
+      expect(spawnedAgents.length).toBe(1);
+      expect(second).toBe(first);
+      expect(activeSessions.size).toBe(1);
+    });
+
+    it("holds a crowd of simultaneous deliveries to one agent", async () => {
+      const mockBridge: any = fakeBridge();
+      spawnedAgents.length = 0;
+
+      const sessions = await Promise.all(
+        Array.from({ length: 8 }, () =>
+          getOrCreateSession("T-Crowd", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+        ),
+      );
+
+      expect(spawnedAgents.length).toBe(1);
+      expect(new Set(sessions).size).toBe(1);
+    });
+
+    it("still opens separate agents for separate tasks at the same time", async () => {
+      // The guard is per task, not a lock on opening sessions at all — a raised
+      // concurrency limit would be worth nothing if it serialised every spawn.
+      const mockBridge: any = fakeBridge();
+      spawnedAgents.length = 0;
+
+      const [a, b, c] = await Promise.all([
+        getOrCreateSession("T-A", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+        getOrCreateSession("T-B", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+        getOrCreateSession("T-C", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+      ]);
+
+      expect(spawnedAgents.length).toBe(3);
+      expect(new Set([a, b, c]).size).toBe(3);
+      expect(activeSessions.size).toBe(3);
+    });
+
+    it("serves a later delivery from the cache, not from a spent attempt", async () => {
+      const mockBridge: any = fakeBridge();
+      spawnedAgents.length = 0;
+
+      const first = await getOrCreateSession("T-Later", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+      const second = await getOrCreateSession("T-Later", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
+
+      expect(second).toBe(first);
+      expect(spawnedAgents.length).toBe(1);
+    });
+
+    it("lets a task try again after the attempt it waited on failed", async () => {
+      // A failed attempt must not leave the key wedged, or one bad spawn would
+      // cost the task every later delivery too.
+      const mockBridge: any = fakeBridge();
+      newSessionError.value = new Error("agent said no");
+
+      await expect(
+        getOrCreateSession("T-Retry", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+      ).rejects.toThrow("agent said no");
+
+      newSessionError.value = null;
+      const recovered = await getOrCreateSession(
+        "T-Retry", ["node", "agent.js"], [], { env: {} } as any, mockBridge,
+      );
+
+      expect(recovered).toBeDefined();
+      expect(activeSessions.has("T-Retry")).toBe(true);
+    });
+
+    it("fails both waiters together rather than spawning a second agent to retry", async () => {
+      const mockBridge: any = fakeBridge();
+      newSessionError.value = new Error("agent said no");
+      spawnedAgents.length = 0;
+
+      const results = await Promise.allSettled([
+        getOrCreateSession("T-BothFail", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+        getOrCreateSession("T-BothFail", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
+      ]);
+
+      expect(results.every((r) => r.status === "rejected")).toBe(true);
+      expect(spawnedAgents.length).toBe(1);
+      newSessionError.value = null;
+    });
+
     it("hands the startup session to the first task rather than opening a second", async () => {
       // Sessions are keyed by task, so without this the first real task would
       // spawn a second agent alongside the one already running.

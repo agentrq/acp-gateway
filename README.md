@@ -268,7 +268,7 @@ gateway says out loud on startup when a flag value was capped or could not be re
     - `acp-gateway` extracts the `chat_id` (Task ID).
     - It checks if the task content is a duplicate of the last processed task for this Task ID. If it is repetitive, the task is dropped to prevent redundant processing.
     - If not repetitive, the task is added to a concurrency-limiting queue (honoring the current concurrency limit — `--max-concurrency` at startup, or whatever the workspace has since set).
-    - It ensures a dedicated ACP session for that specific task.
+    - It ensures a dedicated ACP session for that specific task. A task delivered twice at once joins the session already being opened for it rather than spawning a second agent, and the agent is fully handshaken and authenticated before it is ever prompted.
     - If the task belongs to a different session than the current one, a new ACP session is initialized, providing clean state isolation between concurrent or sequential tasks.
 6. **Permission Bridge** — Permission requests from the ACP agent are forwarded to the MCP server; verdicts are sent back.
 7. **Concurrency Control** — The gateway reports its queue limit to the workspace on connect and on every reconnect, and applies a new limit whenever the workspace sends one (see below).

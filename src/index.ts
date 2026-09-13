@@ -204,9 +204,27 @@ export const activeSessions = new Map<string, AgentSession>();
  */
 let idleSessionInFlight: Promise<AgentSession> | null = null;
 
+/**
+ * Sessions that have been asked for but do not exist yet, by session key.
+ *
+ * `activeSessions` only learns about a session once the agent has spawned,
+ * handshaken, authenticated and opened it — seconds during which the map says
+ * nothing is there. Two deliveries of one task inside that window therefore
+ * both missed the cache and both spawned an agent: two processes prompting the
+ * same agent for the same task, and only the second reachable afterwards, so
+ * the first could never be closed.
+ *
+ * The workspace can deliver one task twice by pushing it and having it picked
+ * up by `getTask` — the repetition guard compares the text, and those two paths
+ * word it differently — and a raised concurrency limit is what lets both run at
+ * once instead of one after the other.
+ */
+const sessionsInFlight = new Map<string, Promise<AgentSession>>();
+
 /** Forgets any in-flight startup session. For tests. */
 export function resetIdleSession(): void {
   idleSessionInFlight = null;
+  sessionsInFlight.clear();
 }
 
 /**
@@ -724,11 +742,47 @@ export async function getOrCreateSession(
   agentrqConfig: McpServerConfig,
   mcpBridge: MCPBridge,
 ): Promise<AgentSession> {
-  let sessionKey = taskId || IDLE_SESSION_KEY;
+  const sessionKey = taskId || IDLE_SESSION_KEY;
   const existing = activeSessions.get(sessionKey);
   if (existing) {
     return existing;
   }
+
+  // Someone already asked for this session and is still waiting for it. Join
+  // that wait rather than starting a second agent for the same work — the
+  // caller wants a session for this task, not a session of its own.
+  const pending = sessionsInFlight.get(sessionKey);
+  if (pending) {
+    console.error(
+      `[acp] A session for ${taskId ? `task ${taskId}` : "the idle session"} is ` +
+        `already being opened; waiting for it rather than spawning a second agent`,
+    );
+    return pending;
+  }
+
+  const creation = createSession(taskId, sessionKey, acpCmdArgs, configs, agentrqConfig, mcpBridge);
+  sessionsInFlight.set(sessionKey, creation);
+  try {
+    return await creation;
+  } finally {
+    // Only if it is still this attempt's: a session that was adopted and then
+    // re-requested may have registered a newer one under the same key.
+    if (sessionsInFlight.get(sessionKey) === creation) {
+      sessionsInFlight.delete(sessionKey);
+    }
+  }
+}
+
+/** Opens a session, with no regard for whether one is already on its way. */
+async function createSession(
+  taskId: string | undefined,
+  initialSessionKey: string,
+  acpCmdArgs: string[],
+  configs: McpServerConfig[],
+  agentrqConfig: McpServerConfig,
+  mcpBridge: MCPBridge,
+): Promise<AgentSession> {
+  let sessionKey = initialSessionKey;
 
   // The session made at startup, before any task, is handed to the first task
   // that arrives rather than left beside a second agent doing the same job. Its
