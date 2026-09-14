@@ -72,6 +72,7 @@ You can specify gateway options before the `--` separator:
 - `--model <model-id>`: Selects the model a session starts on. It can be changed while running from the agentrq interface.
 - `--allow-unverified-agent`: Installs a registry binary that publishes no checksum. Off by default.
 - `--registry-url <url>`: Reads a different registry index (for pinning, or for testing).
+- `--mcp-json <path>`: Reads an MCP config in addition to the one found near the working directory, so the gateway can run from outside its workspace. The path is to the file itself and the filename need not be `.mcp.json`; a directory is taken to mean the `.mcp.json` inside it. Where both files define a server under the same name, the one named here wins. A path that cannot be read is an error rather than a quiet fall back to the directory.
 - `--auth-method <id>`: The authentication method to use when the agent asks for a login. Defaults to picking one automatically.
 - `--help` / `-h`: Explains every option, with examples. Also shown when `acp-gateway` is run with nothing to do.
 - `--list-auth-methods`: Prints the login methods the agent advertises, then exits.
@@ -81,6 +82,7 @@ You can specify gateway options before the `--` separator:
 Example:
 ```bash
 acp-gateway --max-concurrency 4 -- gemini --acp
+acp-gateway --mcp-json ~/work/.mcp.json -- gemini --acp
 ```
 
 ### Running an Agent from the Registry
@@ -164,6 +166,8 @@ Credentials are never stored by the gateway; the agent keeps its own, exactly as
 ### Configuration
 
 `acp-gateway` searches for `.mcp.json` starting in the current working directory and up to 3 parent directories.
+
+`--mcp-json <path>` names a config directly, wherever it lives and whatever it is called. It is read *as well as* whatever the search finds, with the named file winning any name collision — so a gateway started from somewhere other than its workspace still connects to the right one.
 
 Example `.mcp.json`:
 
@@ -282,7 +286,7 @@ gateway says out loud on startup when a flag value was capped or could not be re
 | `src/index.ts` | Entry point; orchestrates config loading, MCP connection, agent spawning, and ACP session lifecycle. |
 | `src/acpClient.ts` | Implements the ACP `Client` interface — routes permission requests, handles session updates, and provides file operations. |
 | `src/mcpClient.ts` | `EventEmitter`-based MCP client with auto-reconnection, notification handling, and tool call dispatch. |
-| `src/config.ts` | Parses `.mcp.json` from the current directory tree up to 3 levels deep. |
+| `src/config.ts` | Parses `.mcp.json` from the current directory tree up to 3 levels deep, plus any config named with `--mcp-json`. |
 | `src/concurrency.ts` | How many tasks may prompt the agent at once, and the notifications that change it while the gateway runs. |
 | `src/auth.ts` | ACP authentication — lists the agent's login methods, detects `auth_required`, and runs agent or terminal logins. |
 | `src/registry.ts` | Reads the ACP registry index — agent lookup, host platform matching, and package launch commands. |

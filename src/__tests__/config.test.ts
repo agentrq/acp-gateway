@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { loadMcpConfig, pickAgentrqServer } from "../config.js";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 
 vi.mock("node:fs");
@@ -115,6 +115,134 @@ describe("config", () => {
     it("should throw error if no .mcp.json is found", () => {
       vi.mocked(readFileSync).mockImplementation(() => { throw new Error("not found"); });
       expect(() => loadMcpConfig("/dummy")).toThrow("Could not find .mcp.json");
+    });
+
+    describe("a config named with --mcp-json", () => {
+      const missing = () => { throw new Error("ENOENT"); };
+      const json = (servers: Record<string, unknown>) =>
+        JSON.stringify({ mcpServers: servers });
+
+      beforeEach(() => {
+        vi.mocked(resolve).mockImplementation((...args: string[]) => args.join("/"));
+      });
+
+      it("reads it whatever the file is called", () => {
+        // The name is a convention, not a requirement — someone keeping their
+        // workspaces apart names the files after the workspaces.
+        vi.mocked(readFileSync)
+          .mockReturnValueOnce(json({ agentrq: { type: "http", url: "http://named" } }))
+          .mockImplementation(missing);
+
+        const configs = loadMcpConfig("/dummy", "/elsewhere/work-servers.json");
+
+        expect(readFileSync).toHaveBeenCalledWith("/elsewhere/work-servers.json", "utf-8");
+        expect(configs).toHaveLength(1);
+        expect(configs[0].url).toBe("http://named");
+      });
+
+      it("reads it as well as the one near the working directory", () => {
+        // "In addition to", not "instead of": the flag adds a workspace rather
+        // than hiding whatever is in the directory.
+        vi.mocked(readFileSync)
+          .mockReturnValueOnce(json({ named: { type: "http", url: "http://named" } }))
+          .mockReturnValueOnce(json({ nearby: { type: "http", url: "http://nearby" } }))
+          .mockImplementation(missing);
+
+        const configs = loadMcpConfig("/dummy", "/elsewhere/servers.json");
+
+        expect(configs.map((c) => c.name)).toEqual(["named", "nearby"]);
+      });
+
+      it("lets the named file win where a name collides", () => {
+        // It was pointed at deliberately; the other was merely nearby. This
+        // also decides pickAgentrqServer's fallback in its favour.
+        vi.mocked(readFileSync)
+          .mockReturnValueOnce(json({ agentrq: { type: "http", url: "http://named" } }))
+          .mockReturnValueOnce(json({
+            agentrq: { type: "http", url: "http://nearby" },
+            other: { type: "http", url: "http://other" },
+          }))
+          .mockImplementation(missing);
+
+        const configs = loadMcpConfig("/dummy", "/elsewhere/servers.json");
+
+        expect(configs).toHaveLength(2);
+        expect(configs.find((c) => c.name === "agentrq")!.url).toBe("http://named");
+        expect(pickAgentrqServer(configs).url).toBe("http://named");
+      });
+
+      it("refuses a path it cannot read rather than falling back to the directory", () => {
+        // A mistyped path quietly becoming "whatever .mcp.json is lying around"
+        // would not look like a failure — it would look like it worked, while
+        // connecting the agent to the wrong workspace.
+        vi.mocked(readFileSync)
+          .mockImplementationOnce(missing)
+          .mockReturnValue(json({ nearby: { type: "http", url: "http://nearby" } }) as any);
+
+        expect(() => loadMcpConfig("/dummy", "/typo/servers.json")).toThrow(
+          /Could not read the MCP config at \/typo\/servers\.json/,
+        );
+      });
+
+      it("reports a read failure that was not thrown as an Error", () => {
+        vi.mocked(readFileSync).mockImplementationOnce(() => { throw "permission denied"; });
+
+        expect(() => loadMcpConfig("/dummy", "/elsewhere/servers.json")).toThrow(
+          /Could not read the MCP config at \/elsewhere\/servers\.json: permission denied/,
+        );
+      });
+
+      it("says when the named file is not JSON", () => {
+        // Told apart from a missing file on purpose: the two send someone to
+        // two different places.
+        vi.mocked(readFileSync).mockReturnValueOnce("{ not json" as any);
+
+        expect(() => loadMcpConfig("/dummy", "/elsewhere/servers.json")).toThrow(
+          /is not valid JSON/,
+        );
+      });
+
+      it("says when the named file defines no servers", () => {
+        // Different from finding nothing anywhere: the file is right there.
+        vi.mocked(readFileSync).mockReturnValueOnce(json({}) as any);
+
+        expect(() => loadMcpConfig("/dummy", "/elsewhere/servers.json")).toThrow(
+          /defines no MCP servers/,
+        );
+      });
+
+      it("takes a directory to mean the .mcp.json inside it", () => {
+        // Handing a flag the folder instead of the file is an easy slip and a
+        // pointless way to fail.
+        vi.mocked(statSync).mockReturnValueOnce({ isDirectory: () => true } as any);
+        vi.mocked(readFileSync)
+          .mockReturnValueOnce(json({ agentrq: { type: "http", url: "http://named" } }))
+          .mockImplementation(missing);
+
+        loadMcpConfig("/dummy", "/elsewhere");
+
+        expect(readFileSync).toHaveBeenCalledWith("/elsewhere/.mcp.json", "utf-8");
+      });
+
+      it("does not need a config near the working directory at all", () => {
+        // Pointing at a file is a complete answer on its own.
+        vi.mocked(readFileSync)
+          .mockReturnValueOnce(json({ agentrq: { type: "http", url: "http://named" } }))
+          .mockImplementation(missing);
+
+        expect(loadMcpConfig("/nowhere-useful", "/elsewhere/servers.json")).toHaveLength(1);
+      });
+
+      it("names the file it is complaining about", () => {
+        // The message used to say ".mcp.json" regardless, which names nothing
+        // when the file is called something else and there are two in play.
+        vi.mocked(readFileSync)
+          .mockReturnValueOnce(json({ odd: { type: "websocket", url: "ws://x" } }));
+
+        expect(() => loadMcpConfig("/dummy", "/elsewhere/servers.json")).toThrow(
+          /in \/elsewhere\/servers\.json has transport "websocket"/,
+        );
+      });
     });
   });
 

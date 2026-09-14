@@ -2105,6 +2105,36 @@ describe("index", () => {
       expect(parseGatewayArgs(["--registry-url"]).registryUrl).toBeUndefined();
     });
 
+    it("should take a path to an MCP config", () => {
+      expect(
+        parseGatewayArgs(["--mcp-json", "/elsewhere/work-servers.json"]),
+      ).toMatchObject({
+        mcpJsonPath: "/elsewhere/work-servers.json",
+        command: "run",
+        rest: [],
+      });
+
+      // The path is consumed, so it cannot fall through into `rest` — which is
+      // the agent command when no `--` was used.
+      expect(
+        parseGatewayArgs(["--mcp-json", "/elsewhere/servers.json", "gemini", "--acp"]).rest,
+      ).toEqual(["gemini", "--acp"]);
+    });
+
+    it("should say so when --mcp-json is given no path", () => {
+      // Ignoring it silently would start the gateway against whatever config
+      // happened to be near the working directory — the very thing the flag
+      // was typed to avoid.
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      expect(parseGatewayArgs(["--mcp-json"]).mcpJsonPath).toBeUndefined();
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("--mcp-json provided without a path"),
+      );
+      errorSpy.mockRestore();
+    });
+
     it("should recognise model options", () => {
       expect(parseGatewayArgs(["--list-models"])).toMatchObject({ command: "list-models" });
       expect(parseGatewayArgs(["--model", "claude-3-7-sonnet"])).toMatchObject({
@@ -2703,6 +2733,7 @@ describe("index", () => {
           "--auth-method",
           "--max-concurrency",
           "--permission-timeout",
+          "--mcp-json",
           "--help",
         ]),
       );
