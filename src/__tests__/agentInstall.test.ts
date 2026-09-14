@@ -8,6 +8,8 @@ import {
   archiveKind,
   assertChecksum,
   assertVerifiable,
+  concatChunks,
+  contentLength,
   defaultCacheDir,
   downloadArchive,
   extractArchive,
@@ -18,6 +20,7 @@ import {
   runExtractionTool,
   resolveExecutable,
   sha256,
+  withProgress,
 } from "../agentInstall.js";
 import type { BinaryTarget, Registry, RegistryAgent } from "../registry.js";
 
@@ -49,6 +52,53 @@ function okResponse(data: Uint8Array): Response {
     statusText: "OK",
     arrayBuffer: async () => data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
   } as Response;
+}
+
+/**
+ * A response that hands its body over in pieces, the way a real download
+ * arrives, so progress reporting has something to report on.
+ */
+function streamingResponse(
+  data: Uint8Array,
+  chunkSize: number,
+  headers: Record<string, string> = { "content-length": String(data.byteLength) },
+): Response {
+  const pieces: (Uint8Array | undefined)[] = [];
+  for (let offset = 0; offset < data.byteLength; offset += chunkSize) {
+    pieces.push(data.slice(offset, offset + chunkSize));
+  }
+  let index = 0;
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: { get: (name: string) => headers[name.toLowerCase()] ?? null },
+    body: {
+      getReader: () => ({
+        read: async () =>
+          index < pieces.length ? { done: false, value: pieces[index++] } : { done: true },
+      }),
+    },
+  } as unknown as Response;
+}
+
+/** A progress bar that records what it was told, standing in for the terminal one. */
+function recordingProgress() {
+  const updates: [number, number | undefined][] = [];
+  return {
+    updates,
+    finished: 0,
+    aborted: 0,
+    update(received: number, total?: number) {
+      updates.push([received, total]);
+    },
+    finish() {
+      this.finished += 1;
+    },
+    abort() {
+      this.aborted += 1;
+    },
+  };
 }
 
 describe("agentInstall", () => {
@@ -182,6 +232,147 @@ describe("agentInstall", () => {
         /Failed to download https:\/\/x\/y.zip: 403 Forbidden/,
       );
     });
+
+    it("reassembles a body that arrives in pieces", async () => {
+      const data = new Uint8Array([1, 2, 3, 4, 5, 6, 7]);
+      const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(data, 3));
+
+      expect(await downloadArchive("https://x/y.zip", fetchImpl as any)).toEqual(data);
+    });
+
+    it("reports each chunk as it lands, against the promised total", async () => {
+      const data = new Uint8Array(10);
+      const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(data, 4));
+      const progress = recordingProgress();
+
+      await downloadArchive("https://x/y.zip", fetchImpl as any, progress);
+
+      expect(progress.updates).toEqual([
+        [0, 10],
+        [4, 10],
+        [8, 10],
+        [10, 10],
+        [10, 10],
+      ]);
+    });
+
+    it("reports bytes with no total when the server sends no content-length", async () => {
+      const data = new Uint8Array(6);
+      const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(data, 6, {}));
+      const progress = recordingProgress();
+
+      await downloadArchive("https://x/y.zip", fetchImpl as any, progress);
+
+      expect(progress.updates[0]).toEqual([0, undefined]);
+      expect(progress.updates.at(-1)).toEqual([6, 6]);
+    });
+
+    it("trusts what arrived over what was promised", async () => {
+      // A server may promise more than it delivers; the bar should not be left
+      // stuck at 90% because of it.
+      const data = new Uint8Array(9);
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValue(streamingResponse(data, 9, { "content-length": "10" }));
+      const progress = recordingProgress();
+
+      await downloadArchive("https://x/y.zip", fetchImpl as any, progress);
+
+      expect(progress.updates.at(-1)).toEqual([9, 9]);
+    });
+
+    it("skips an empty chunk rather than counting it as the end", async () => {
+      const response = streamingResponse(new Uint8Array([1, 2]), 1);
+      const reader = response.body!.getReader();
+      let call = 0;
+      vi.spyOn(response.body!, "getReader").mockReturnValue({
+        read: async () => (call++ === 0 ? { done: false, value: undefined } : reader.read()),
+      } as any);
+      const fetchImpl = vi.fn().mockResolvedValue(response);
+
+      expect(await downloadArchive("https://x/y.zip", fetchImpl as any)).toEqual(
+        new Uint8Array([1, 2]),
+      );
+    });
+
+    it("reports the whole body at once when the response exposes no stream", async () => {
+      const data = new Uint8Array([4, 5]);
+      const fetchImpl = vi.fn().mockResolvedValue(okResponse(data));
+      const progress = recordingProgress();
+
+      expect(await downloadArchive("https://x/y.zip", fetchImpl as any, progress)).toEqual(data);
+      expect(progress.updates).toEqual([[2, 2]]);
+    });
+  });
+
+  describe("contentLength", () => {
+    const withHeader = (value: string | null) =>
+      ({ headers: { get: () => value } }) as unknown as Response;
+
+    it("reads the size the server promised", () => {
+      expect(contentLength(withHeader("1024"))).toBe(1024);
+    });
+
+    it("has no total for a response that does not promise one", () => {
+      expect(contentLength(withHeader(null))).toBeUndefined();
+      expect(contentLength({} as Response)).toBeUndefined();
+    });
+
+    it("ignores a header that is not a usable size", () => {
+      expect(contentLength(withHeader("0"))).toBeUndefined();
+      expect(contentLength(withHeader("-5"))).toBeUndefined();
+      expect(contentLength(withHeader("banana"))).toBeUndefined();
+    });
+  });
+
+  describe("concatChunks", () => {
+    it("joins the pieces back into one buffer", () => {
+      expect(concatChunks([new Uint8Array([1, 2]), new Uint8Array([3])], 3)).toEqual(
+        new Uint8Array([1, 2, 3]),
+      );
+    });
+
+    it("has nothing to join for an empty download", () => {
+      expect(concatChunks([], 0)).toEqual(new Uint8Array(0));
+    });
+  });
+
+  describe("withProgress", () => {
+    it("leaves a finished bar on screen and returns the download", async () => {
+      const progress = recordingProgress();
+
+      const result = await withProgress(progress, "dl", async (bar) => {
+        bar.update(1, 1);
+        return "downloaded";
+      });
+
+      expect(result).toBe("downloaded");
+      expect(progress.finished).toBe(1);
+      expect(progress.aborted).toBe(0);
+    });
+
+    it("erases the bar and rethrows when the download fails", async () => {
+      const progress = recordingProgress();
+
+      await expect(
+        withProgress(progress, "dl", async () => {
+          throw new Error("connection reset");
+        }),
+      ).rejects.toThrow(/connection reset/);
+      expect(progress.aborted).toBe(1);
+      expect(progress.finished).toBe(0);
+    });
+
+    it("makes its own bar when none was supplied", async () => {
+      const original = process.stderr.isTTY;
+      try {
+        // Not a terminal, so the bar it builds draws nothing into the test output.
+        process.stderr.isTTY = false;
+        await expect(withProgress(undefined, "dl", async () => "ok")).resolves.toBe("ok");
+      } finally {
+        process.stderr.isTTY = original;
+      }
+    });
   });
 
   describe("extractArchive", () => {
@@ -251,7 +442,9 @@ describe("agentInstall", () => {
         args: ["--acp"],
         ...overrides.target,
       };
-      const fetchImpl = vi.fn().mockResolvedValue(okResponse(tarball));
+      // Chunked, so an install exercises the streaming download for real.
+      const fetchImpl = vi.fn().mockResolvedValue(streamingResponse(tarball, 64));
+      const progress = recordingProgress();
       const spec = await installBinaryAgent({
         agent,
         target,
@@ -259,9 +452,10 @@ describe("agentInstall", () => {
         cacheDir,
         fetchImpl: fetchImpl as any,
         platform: "darwin",
+        progress,
         ...overrides.options,
       });
-      return { spec, fetchImpl, tarball };
+      return { spec, fetchImpl, tarball, progress };
     }
 
     it("downloads, verifies, unpacks and makes the agent executable", async () => {
@@ -276,6 +470,47 @@ describe("agentInstall", () => {
       expect(existsSync(spec.command)).toBe(true);
       // 0o111 — executable by someone.
       expect((await stat(spec.command)).mode & 0o111).toBeGreaterThan(0);
+    });
+
+    it("shows the download's progress and finishes the bar", async () => {
+      const { progress, tarball } = await install();
+
+      expect(progress.updates.length).toBeGreaterThan(1);
+      expect(progress.updates[0]).toEqual([0, tarball.byteLength]);
+      expect(progress.updates.at(-1)).toEqual([tarball.byteLength, tarball.byteLength]);
+      expect(progress.finished).toBe(1);
+      expect(progress.aborted).toBe(0);
+    });
+
+    it("erases the bar when the download fails partway", async () => {
+      const progress = recordingProgress();
+      const fetchImpl = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        statusText: "Server Error",
+      });
+
+      await expect(
+        installBinaryAgent({
+          agent,
+          target: { archive: "https://x/y.tar.gz", sha256: "a".repeat(64), cmd: "./demo" },
+          platformTarget: "darwin-aarch64",
+          cacheDir,
+          fetchImpl: fetchImpl as any,
+          platform: "darwin",
+          progress,
+        }),
+      ).rejects.toThrow(/Failed to download/);
+      expect(progress.aborted).toBe(1);
+      expect(progress.finished).toBe(0);
+    });
+
+    it("draws no bar for a cached install, which downloads nothing", async () => {
+      await install();
+      const { progress } = await install();
+
+      expect(progress.updates).toEqual([]);
+      expect(progress.finished).toBe(0);
     });
 
     it("skips the executable bit on Windows, which has none", async () => {

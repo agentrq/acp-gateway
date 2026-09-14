@@ -116,6 +116,16 @@ cannot be verified. Re-run with --allow-unverified-agent to install it anyway, o
 agent yourself and pass it after --.
 ```
 
+Registry binaries run to hundreds of megabytes, so a download reports itself as it goes:
+
+```
+[registry] Downloading antigravity-acp 1.0.4 from https://.../agy_acp_server.zip
+[registry] antigravity-acp 1.0.4 [███████████░░░░░░░░░░░░░░░░░░░░░] 35% 229.6 MB/656.0 MB 25.5 MB/s
+```
+
+The bar redraws one line in place and only appears on a terminal; run under a supervisor, with output
+piped to a log, the download stays silent apart from the lines above and below it.
+
 Downloads are cached per agent, version and platform, so each build is fetched once:
 
 | Platform | Cache location |
@@ -291,6 +301,7 @@ gateway says out loud on startup when a flag value was capped or could not be re
 | `src/auth.ts` | ACP authentication — lists the agent's login methods, detects `auth_required`, and runs agent or terminal logins. |
 | `src/registry.ts` | Reads the ACP registry index — agent lookup, host platform matching, and package launch commands. |
 | `src/agentInstall.ts` | Downloads, verifies, unpacks and caches a registry agent's binary distribution. |
+| `src/progress.ts` | Draws the single-line download progress bar, on a terminal and nowhere else. |
 
 ## Development
 
@@ -318,6 +329,7 @@ acp-gateway/
 │   ├── config.ts          # .mcp.json loader
 │   ├── index.ts           # Entry point & orchestrator
 │   ├── mcpClient.ts       # MCP Bridge with auto-reconnect
+│   ├── progress.ts        # Download progress bar
 │   ├── registry.ts        # ACP registry index client
 │   ├── telemetry.ts       # Thought / plan / usage rendering
 │   └── __tests__/         # Unit tests
