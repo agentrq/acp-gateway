@@ -16,6 +16,7 @@ import { chmod, cp, mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promis
 import { existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
+import { createDownloadProgress, type DownloadProgress } from "./progress.js";
 import {
   availableKinds,
   findAgent,
@@ -120,16 +121,95 @@ export function assertChecksum(agent: RegistryAgent, target: BinaryTarget, data:
   }
 }
 
-/** Downloads an archive into memory so it can be checksummed before it touches disk. */
+/**
+ * The size the server promises, where it promises one.
+ *
+ * A missing, malformed or zero `Content-Length` is not an error — chunked
+ * responses simply do not carry one — it only means progress has no total to
+ * measure itself against.
+ */
+export function contentLength(response: Response): number | undefined {
+  const header = response.headers?.get("content-length");
+  if (!header) return undefined;
+  const total = Number(header);
+  return Number.isFinite(total) && total > 0 ? total : undefined;
+}
+
+/** Joins the chunks of a streamed download back into one buffer. */
+export function concatChunks(chunks: Uint8Array[], length: number): Uint8Array {
+  const data = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    data.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return data;
+}
+
+/**
+ * Downloads an archive into memory so it can be checksummed before it touches
+ * disk, reporting what has arrived so far as it goes.
+ *
+ * The body is read chunk by chunk rather than in one `arrayBuffer()` call,
+ * which is the only way to know how far along a download is. Responses without
+ * a readable body still work — some fetch implementations do not expose one —
+ * they just arrive all at once, with nothing to report in between.
+ */
 export async function downloadArchive(
   url: string,
   fetchImpl: typeof fetch = fetch,
+  progress?: DownloadProgress,
 ): Promise<Uint8Array> {
   const response = await fetchImpl(url);
   if (!response.ok) {
     throw new Error(`Failed to download ${url}: ${response.status} ${response.statusText}`);
   }
-  return new Uint8Array(await response.arrayBuffer());
+
+  const total = contentLength(response);
+  if (!response.body) {
+    const data = new Uint8Array(await response.arrayBuffer());
+    progress?.update(data.byteLength, data.byteLength);
+    return data;
+  }
+
+  progress?.update(0, total);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    chunks.push(value);
+    received += value.byteLength;
+    progress?.update(received, total);
+  }
+  // The promised total is only a promise; what actually arrived is the truth.
+  progress?.update(received, received);
+  return concatChunks(chunks, received);
+}
+
+/**
+ * Runs a download under a progress bar, leaving the line in the right state.
+ *
+ * A finished bar stays on screen as the record of what was downloaded; a
+ * failed one is erased, so the error that follows is not printed over a bar
+ * that looks like it was nearly done.
+ */
+export async function withProgress<T>(
+  progress: DownloadProgress | undefined,
+  label: string,
+  download: (bar: DownloadProgress) => Promise<T>,
+): Promise<T> {
+  const bar = progress ?? createDownloadProgress({ label });
+  try {
+    const result = await download(bar);
+    bar.finish();
+    return result;
+  } catch (err) {
+    bar.abort();
+    throw err;
+  }
 }
 
 /** Runs an extraction tool, failing with its own diagnostics attached. */
@@ -205,6 +285,8 @@ export interface InstallOptions {
   allowUnverified?: boolean;
   fetchImpl?: typeof fetch;
   platform?: string;
+  /** Where download progress is drawn; defaults to a bar on the terminal. */
+  progress?: DownloadProgress;
 }
 
 /**
@@ -221,6 +303,7 @@ export async function installBinaryAgent({
   allowUnverified = false,
   fetchImpl = fetch,
   platform = process.platform,
+  progress,
 }: InstallOptions): Promise<LaunchSpec> {
   cacheDir ??= defaultCacheDir(platform);
   const dir = installDir(cacheDir, agent.id, platformTarget, agent.version);
@@ -240,7 +323,9 @@ export async function installBinaryAgent({
   assertVerifiable(agent, target, allowUnverified);
 
   console.error(`[registry] Downloading ${agent.id} ${agent.version} from ${target.archive}`);
-  const data = await downloadArchive(target.archive, fetchImpl);
+  const data = await withProgress(progress, `[registry] ${agent.id} ${agent.version}`, (bar) =>
+    downloadArchive(target.archive, fetchImpl, bar),
+  );
   assertChecksum(agent, target, data);
   if (!target.sha256) {
     console.error(
