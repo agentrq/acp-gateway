@@ -1891,6 +1891,11 @@ export interface GatewayOptions {
   allowUnverifiedAgent: boolean;
   /** A different registry index, for pinning or for testing. */
   registryUrl?: string;
+  /**
+   * A config file to read besides the one found near the working directory,
+   * for a gateway run from somewhere other than the workspace it belongs to.
+   */
+  mcpJsonPath?: string;
   /** Tokens that are not gateway options — the agent command, when no `--` was used. */
   rest: string[];
 }
@@ -2015,6 +2020,19 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
         if (value) {
           options.registryUrl = value;
           i++;
+        }
+        break;
+      case "--mcp-json":
+        if (value) {
+          options.mcpJsonPath = value;
+          i++;
+        } else {
+          // Said out loud rather than ignored. The gateway would otherwise
+          // start against whatever config happened to be near the working
+          // directory, which is exactly what this flag was typed to avoid.
+          console.error(
+            "[acp-gateway] Warning: --mcp-json provided without a path; ignoring.",
+          );
         }
         break;
       case "--help":
@@ -2279,6 +2297,11 @@ BRIDGE
                               it before the turn is cancelled. Defaults to 30.
                               0 waits indefinitely, which is what a wedged
                               gateway looks like — use it knowingly.
+  --mcp-json <path>           An MCP config to read as well as the one found
+                              near the working directory, for running the
+                              gateway from outside its workspace. Any filename;
+                              a directory means the .mcp.json inside it. Its
+                              servers win where the names collide.
 
 OTHER
   --help, -h                  Show this help. Exits.
@@ -2292,9 +2315,11 @@ EXAMPLES
   acp-gateway --agent-info --agent gemini        See what that agent supports
   acp-gateway --login -- gemini --acp            Log in before running anything
   acp-gateway --max-concurrency 4 -- gemini --acp
+  acp-gateway --mcp-json ~/work/.mcp.json -- gemini --acp
 
 The workspace comes from .mcp.json, searched for in the current directory and up
-to three directories above it.`;
+to three directories above it. --mcp-json names one directly, wherever it lives
+and whatever it is called.`;
 }
 
 export function printHelp(): void {
@@ -2337,7 +2362,7 @@ async function main() {
   console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
 
   // 1. Load MCP Config
-  const configs = loadMcpConfig();
+  const configs = loadMcpConfig(process.cwd(), options.mcpJsonPath);
   const agentrqConfig = pickAgentrqServer(configs);
 
   // 2. Work out what actually starts the agent — a registry id, or the command
