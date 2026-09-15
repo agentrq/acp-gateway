@@ -11,6 +11,7 @@ import {
   startPendingTask,
   drainPendingTasks,
   createSelfFillingTaskQueue,
+  MAX_SKIPPED_FETCHES,
   freeSlots,
   resetPendingTaskDrain,
   mapMcpServers,
@@ -519,52 +520,57 @@ describe("index", () => {
         content: [{ type: "text", text: "Task ID: T-Fetch\nplease do it" }],
       });
 
-      const task = await fetchNextTask(bridge);
+      const outcome = await fetchNextTask(bridge);
 
       expect(bridge.callTool).toHaveBeenCalledWith("getTask");
-      expect(task?.text).toBe("Task ID: T-Fetch\nplease do it");
-      expect(task?.taskId).toBe("T-Fetch");
+      expect(outcome.status).toBe("task");
+      const task = (outcome as { status: "task"; task: any }).task;
+      expect(task.text).toBe("Task ID: T-Fetch\nplease do it");
+      expect(task.taskId).toBe("T-Fetch");
       // Stamped at the fetch, so a cancel landing during session setup still bites.
-      expect(task?.queuedSeq).toBeGreaterThan(0);
+      expect(task.queuedSeq).toBeGreaterThan(0);
     });
 
-    it("says there is nothing rather than throwing, so a drain simply stops", async () => {
-      // Each of these is a different failure, and every one of them means the
-      // same thing to a caller trying to fill a slot: not now.
+    it("tells an empty workspace apart from one it could not ask", async () => {
+      // A caller filling slots treats these differently: an empty workspace is
+      // the end of the drain, while a workspace that could not be reached is
+      // the bridge's problem to reconnect rather than this loop's to retry.
       bridge.callTool.mockResolvedValueOnce({
         isError: false,
         content: [{ type: "text", text: "no pending tasks exist" }],
       });
-      expect(await fetchNextTask(bridge)).toBeNull();
-
-      bridge.callTool.mockResolvedValueOnce({ isError: true, content: "nope" });
-      expect(await fetchNextTask(bridge)).toBeNull();
-
-      bridge.callTool.mockRejectedValueOnce(new Error("network error"));
-      expect(await fetchNextTask(bridge)).toBeNull();
-      expect(console.error).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to check for next task"),
-        expect.any(Error),
-      );
+      expect(await fetchNextTask(bridge)).toEqual({ status: "empty" });
 
       bridge.callTool.mockResolvedValueOnce({ isError: false, content: [] });
-      expect(await fetchNextTask(bridge)).toBeNull();
+      expect(await fetchNextTask(bridge)).toEqual({ status: "empty" });
 
       bridge.callTool.mockResolvedValueOnce({
         isError: false,
         content: [{ type: "text", text: "" }],
       });
-      expect(await fetchNextTask(bridge)).toBeNull();
+      expect(await fetchNextTask(bridge)).toEqual({ status: "empty" });
+
+      bridge.callTool.mockResolvedValueOnce({ isError: true, content: "nope" });
+      expect(await fetchNextTask(bridge)).toEqual({ status: "failed" });
+
+      bridge.callTool.mockRejectedValueOnce(new Error("network error"));
+      expect(await fetchNextTask(bridge)).toEqual({ status: "failed" });
+      expect(console.error).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to check for next task"),
+        expect.any(Error),
+      );
     });
 
-    it("drops a task it has already been handed", async () => {
+    it("says a repeat was skipped, not that the workspace is empty", async () => {
+      // The difference matters: a repeat has been dequeued and dropped, so the
+      // slot it was meant to fill is still free and something else may fill it.
       bridge.callTool.mockResolvedValue({
         isError: false,
         content: [{ type: "text", text: "Task ID: T-Twice\nsame words" }],
       });
 
-      expect(await fetchNextTask(bridge)).not.toBeNull();
-      expect(await fetchNextTask(bridge)).toBeNull();
+      expect((await fetchNextTask(bridge)).status).toBe("task");
+      expect(await fetchNextTask(bridge)).toEqual({ status: "skipped" });
     });
 
     it("takes an unnamed task, since not every delivery carries an id", async () => {
@@ -573,9 +579,11 @@ describe("index", () => {
         content: [{ type: "text", text: "/compact keep the API discussion" }],
       });
 
-      const task = await fetchNextTask(bridge);
-      expect(task?.taskId).toBeUndefined();
-      expect(task?.text).toBe("/compact keep the API discussion");
+      const outcome = await fetchNextTask(bridge);
+      expect(outcome.status).toBe("task");
+      const task = (outcome as { status: "task"; task: any }).task;
+      expect(task.taskId).toBeUndefined();
+      expect(task.text).toBe("/compact keep the API discussion");
     });
   });
 
@@ -832,6 +840,103 @@ describe("index", () => {
       release();
       await new Promise((resolve) => setTimeout(resolve, 10));
       expect(connection.prompt).toHaveBeenCalledTimes(3);
+    });
+
+    it("keeps working after a drain that found no room at all", async () => {
+      // The drain that does nothing never waits for anything, so it finishes
+      // before the promise it will be remembered by even exists. Remembering
+      // it anyway left a settled promise in the one-drain-at-a-time slot, and
+      // every later drain joined it and fetched nothing — the whole feature
+      // switching itself off after one harmless call.
+      const queue = new TaskQueue(1);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const running = queue.run(() => held);
+
+      await drainPendingTasks(bridge, queue, deps());
+      expect(bridge.callTool).not.toHaveBeenCalled();
+
+      release();
+      await running;
+
+      bridge.callTool.mockResolvedValueOnce(task("A1")).mockResolvedValue(nothing());
+      await drainPendingTasks(bridge, queue, deps());
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(connection.prompt).toHaveBeenCalledTimes(1);
+    });
+
+    it("counts a task parked behind an earlier turn against the room it has", async () => {
+      // A second message on one chat waits for the first and takes no slot, so
+      // the queue still reads as having room. Fetching against that same room
+      // again and again would empty the workspace into this process, where
+      // nobody else can pick the work up.
+      resetTaskTurns();
+      const queue = new TaskQueue(2);
+      let releaseEarlier!: () => void;
+      const earlier = new Promise<void>((resolve) => { releaseEarlier = resolve; });
+      const earlierTurn = runTurnForTask("P1", () => earlier);
+
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      connection.prompt.mockReturnValue(held.then(() => ({ stopReason: "end_turn" })));
+      bridge.callTool
+        .mockResolvedValueOnce(task("P1"))
+        .mockResolvedValueOnce(task("P2"))
+        .mockResolvedValue(nothing());
+
+      await drainPendingTasks(bridge, queue, deps());
+
+      // Two slots, two tasks taken: the parked one counts, so there is no
+      // third fetch against the slot it is going to want.
+      expect(bridge.callTool).toHaveBeenCalledTimes(2);
+
+      releaseEarlier();
+      release();
+      await earlierTurn;
+    });
+
+    it("moves past a repeat instead of abandoning the slot it was meant to fill", async () => {
+      // A repeat has already been dequeued and dropped. Treating that as "the
+      // workspace is empty" left every slot idle behind it, and with nothing
+      // running there is no completion coming to start another drain.
+      const queue = new TaskQueue(2);
+      bridge.callTool
+        .mockResolvedValueOnce(task("S1"))
+        .mockResolvedValueOnce(task("S1"))
+        .mockResolvedValueOnce(task("S2"))
+        .mockResolvedValue(nothing());
+      // The first S1 is taken and run; the second is the repeat.
+      await drainPendingTasks(bridge, queue, deps());
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(connection.prompt).toHaveBeenCalledTimes(2);
+      expect(connection.prompt).toHaveBeenLastCalledWith({
+        sessionId: "S-S2",
+        prompt: [{ type: "text", text: "Task ID: S2\nwork on S2" }],
+      });
+    });
+
+    it("gives up on a workspace that hands back nothing but repeats", async () => {
+      const queue = new TaskQueue(4);
+      bridge.callTool.mockResolvedValueOnce(task("K1")).mockResolvedValue(task("K1"));
+
+      await drainPendingTasks(bridge, queue, deps());
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // The task itself, then the repeats it is willing to sit through.
+      expect(bridge.callTool).toHaveBeenCalledTimes(1 + MAX_SKIPPED_FETCHES);
+    });
+
+    it("leaves a workspace it could not reach to its own reconnection", async () => {
+      // Retrying a failing call in a tight loop is how a gateway turns a blip
+      // into an outage of its own.
+      const queue = new TaskQueue(3);
+      bridge.callTool.mockRejectedValue(new Error("network error"));
+
+      await drainPendingTasks(bridge, queue, deps());
+
+      expect(bridge.callTool).toHaveBeenCalledTimes(1);
     });
 
     it("asks once and stops when the workspace has nothing waiting", async () => {
@@ -1359,7 +1464,7 @@ describe("index", () => {
       expect(offered).toBe(1);
     });
 
-    it("waits until whatever was queued has taken the slot back", async () => {
+    it("says nothing when what was queued here takes the slot straight back", async () => {
       // Otherwise the gateway hears "room!" and fetches a task to sit beside
       // work it had already promised to run.
       let queue!: TaskQueue;
@@ -1374,10 +1479,28 @@ describe("index", () => {
 
       release();
       await first;
-      expect(roomSeen).toEqual([0]);
+      expect(roomSeen).toEqual([]);
 
       releaseSecond();
       await second;
+      // Only now, with nothing left waiting, is there room worth mentioning.
+      expect(roomSeen).toEqual([1]);
+    });
+
+    it("says nothing when the limit is lowered under work already running", async () => {
+      // Lowering never interrupts, so a lowered limit leaves less room, not
+      // more — and asking the workspace for another task would be absurd.
+      let offered = 0;
+      const queue = new TaskQueue(3, undefined, () => { offered++; });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const running = [queue.run(() => held), queue.run(() => held), queue.run(() => held)];
+
+      queue.setMaxConcurrency(1);
+      expect(offered).toBe(0);
+
+      release();
+      await Promise.all(running);
     });
 
     it("survives a listener that throws, so a finished task still finishes", async () => {

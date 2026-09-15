@@ -1797,6 +1797,11 @@ export class TaskQueue {
    * that just finished.
    */
   private offerCapacity(): void {
+    // Only when there is actually room. Both callers reach here on moves that
+    // may leave none — a task finishing into a backlog that immediately
+    // refills its slot, a limit *lowered* under work already running — and
+    // "there may be room" is a message about the queue, not about the move.
+    if (this.activeTasks >= this.maxConcurrency || this.queue.length > 0) return;
     try {
       this.onCapacity?.();
     } catch (err) {
@@ -1898,6 +1903,7 @@ export class TaskQueue {
     // A raise with nothing waiting internally starts nothing, and used to end
     // there: the gateway sat at one task with room for three because the two
     // it could have run were still sitting in the workspace, unasked for.
+    // (A lowered limit reaches here too, and leaves no room to offer.)
     this.offerCapacity();
   }
 }
@@ -2670,19 +2676,32 @@ export interface TaskRunDeps {
 }
 
 /**
- * Takes the next not-started task off the workspace, or returns null if there
- * is nothing to take.
+ * What one ask of the workspace turned up.
+ *
+ * Three different kinds of nothing, because a caller filling slots has to
+ * treat them differently: an empty workspace means stop, a task dropped as a
+ * repeat means this slot is still free and the next task may fill it, and a
+ * workspace that could not be asked means stop and let the bridge's own
+ * reconnection sort it out rather than hammer it.
+ */
+export type FetchOutcome =
+  | { status: "task"; task: PendingTask }
+  | { status: "empty" }
+  | { status: "skipped" }
+  | { status: "failed" };
+
+/**
+ * Takes the next not-started task off the workspace.
  *
  * `getTask` with no task id dequeues one task, so this is one task per call —
  * which is exactly why the gateway has to call it again to fill a second slot.
  *
- * Never throws. A workspace that cannot be reached, an error from the tool, or
- * a repeat of a task already being run all read the same way to a caller: there
- * is nothing to start right now.
+ * Never throws: a workspace that cannot be reached is an outcome like any
+ * other here, and the caller is in the middle of filling slots.
  */
 export async function fetchNextTask(
   mcpBridge: MCPBridge,
-): Promise<PendingTask | null> {
+): Promise<FetchOutcome> {
   console.error("[bridge] Checking for next task via MCP server...");
   // Stamped before the fetch, so a cancel that arrives while `getTask` is in
   // flight (or while the session is being opened) still stops the task.
@@ -2692,7 +2711,7 @@ export async function fetchNextTask(
 
     if (result.isError) {
       console.error("[mcp] Error getting next task:", result.content);
-      return null;
+      return { status: "failed" };
     }
 
     const contentBlock = result.content as Array<{
@@ -2706,7 +2725,7 @@ export async function fetchNextTask(
       content.text.includes("no pending tasks exist")
     ) {
       console.error("[bridge] No pending tasks available.");
-      return null;
+      return { status: "empty" };
     }
 
     const text = content.text;
@@ -2714,17 +2733,17 @@ export async function fetchNextTask(
     if (taskId) {
       if (lastTaskContent.get(taskId) === text) {
         console.log(`[bridge] Dropping repetitive checked task for ${taskId}`);
-        return null;
+        return { status: "skipped" };
       }
       lastTaskContent.set(taskId, text);
     }
     console.error(
       `[bridge] Found task: "${text.slice(0, 50).replace(/\n/g, " ")}..."`,
     );
-    return { text, taskId, queuedSeq };
+    return { status: "task", task: { text, taskId, queuedSeq } };
   } catch (err) {
     console.error("[bridge] Failed to check for next task:", err);
-    return null;
+    return { status: "failed" };
   }
 }
 
@@ -2851,6 +2870,15 @@ export function resetPendingTaskDrain(): void {
 }
 
 /**
+ * How many repeats in a row the drain will take before it stops asking.
+ *
+ * A repeat has been dequeued and dropped, so the slot it should have filled is
+ * still free and the task behind it may well fill it — but a workspace handing
+ * back the same task forever must not hold the gateway in a fetch loop.
+ */
+export const MAX_SKIPPED_FETCHES = 3;
+
+/**
  * Fills every free slot the queue has with work from the workspace.
  *
  * The gateway used to ask for exactly one task, once, at startup — which was
@@ -2876,9 +2904,20 @@ export function drainPendingTasks(
     capacityMovedAgain = true;
     return drainOnTheWire;
   }
-  // Assigned from the call rather than after it, so that a drain triggered from
-  // inside the first fetch finds the slot already taken.
-  return (drainOnTheWire = pullUntilFull(mcpBridge, queue, deps));
+  // The slot is cleared from a `.finally` on the promise rather than from
+  // inside `pullUntilFull`. An async function that never reaches an `await` —
+  // which is exactly what a drain with no free slot is — runs to completion
+  // before its promise is ever handed back, so a clear written inside it would
+  // happen *before* the assignment below and leave a settled promise sitting
+  // in the slot for the rest of the process. Every later drain would then find
+  // the slot occupied and quietly fetch nothing, which is this whole feature
+  // switching itself off. `.finally` cannot beat the assignment: it settles a
+  // microtask later at the earliest.
+  const drain = pullUntilFull(mcpBridge, queue, deps).finally(() => {
+    drainOnTheWire = null;
+  });
+  drainOnTheWire = drain;
+  return drain;
 }
 
 /** Fetches and starts tasks until the queue is full or the workspace is empty. */
@@ -2887,13 +2926,32 @@ async function pullUntilFull(
   queue: TaskQueue,
   deps: TaskRunDeps,
 ): Promise<void> {
-  try {
-    while (freeSlots(queue) > 0) {
-      const task = await fetchNextTask(mcpBridge);
-      if (!task) break;
+  do {
+    // Read at the top of each pass: room that appears while this one is
+    // mid-fetch is answered by the next pass rather than lost, and joining a
+    // drain already running is what set it.
+    capacityMovedAgain = false;
+    // Tasks started but waiting on an earlier turn for their own chat. They
+    // have taken no slot and will not until that turn ends, so the queue still
+    // reads as having room — and without counting them the loop fetches
+    // against that same room over and over, emptying the workspace into this
+    // process where nothing else can hand the work to anyone else.
+    let parked = 0;
+    let skipped = 0;
+    while (freeSlots(queue) - parked > 0) {
+      const outcome = await fetchNextTask(mcpBridge);
+      if (outcome.status === "empty" || outcome.status === "failed") break;
+      if (outcome.status === "skipped") {
+        // Dropped as a repeat of something already running: the slot is still
+        // free, so try what is behind it rather than abandoning the slot.
+        if (++skipped >= MAX_SKIPPED_FETCHES) break;
+        continue;
+      }
+      skipped = 0;
+      const { task } = outcome;
+      const heldBefore = queue.getActiveCount() + queue.getQueueLength();
       // Deliberately not awaited: this task is running now, and the slot
-      // beside it is what this loop is here to fill. `run` takes the slot
-      // before it yields, so the next `freeSlots` already counts this one.
+      // beside it is what this loop is here to fill.
       void startPendingTask(task, mcpBridge, { ...deps, taskQueue: queue }).catch(
         (err) => {
           console.error(
@@ -2902,17 +2960,11 @@ async function pullUntilFull(
           );
         },
       );
+      // `run` takes its slot before it yields, so a queue that did not move is
+      // a task parked behind a turn rather than one holding a slot.
+      if (queue.getActiveCount() + queue.getQueueLength() === heldBefore) parked++;
     }
-  } finally {
-    // Cleared in the same tick the loop ends, and before the collapsed wake-up
-    // below is answered, so that pass is a drain in its own right rather than
-    // one that finds the slot still held by the drain that started it.
-    drainOnTheWire = null;
-  }
-  if (capacityMovedAgain) {
-    capacityMovedAgain = false;
-    await drainPendingTasks(mcpBridge, queue, deps);
-  }
+  } while (capacityMovedAgain);
 }
 
 /**
