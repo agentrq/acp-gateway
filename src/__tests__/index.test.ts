@@ -7,7 +7,12 @@ import { EventEmitter } from "node:events";
 import * as acp from "@agentclientprotocol/sdk";
 import {
   createAcpSessionSwitcher,
-  checkForNextTask,
+  fetchNextTask,
+  startPendingTask,
+  drainPendingTasks,
+  createSelfFillingTaskQueue,
+  freeSlots,
+  resetPendingTaskDrain,
   mapMcpServers,
   TaskQueue,
   createTaskQueue,
@@ -348,14 +353,23 @@ describe("index", () => {
     });
   });
 
-  describe("checkForNextTask", () => {
+  describe("running a task the workspace handed over", () => {
     let mockMcpBridge: any;
     let mockConnection: any;
     let mockSessionSwitcher: any;
     let mockAcpClient: any;
 
+    /** What the gateway's fetch-and-run path needs, with a session already open. */
+    const deps = (taskQueue?: TaskQueue) => ({
+      acpCmdArgsOrConnection: mockConnection,
+      configsOrSessionSwitcher: mockSessionSwitcher,
+      agentrqConfigOrAcpClient: mockAcpClient,
+      taskQueue,
+    });
+
     beforeEach(() => {
       vi.clearAllMocks();
+      resetPendingTaskDrain();
       mockMcpBridge = {
         callTool: vi.fn(),
       };
@@ -368,45 +382,28 @@ describe("index", () => {
       };
       mockAcpClient = {
         flushReply: vi.fn().mockResolvedValue(undefined),
+        reportStopReason: vi.fn().mockResolvedValue(undefined),
       };
 
       // Mock console.error to avoid cluttering test output
       vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(console, "log").mockImplementation(() => {});
     });
 
-    it("should do nothing if no tasks are found", async () => {
-      mockMcpBridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "no pending tasks exist" }],
-      });
-
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
-
-      expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getTask");
-      expect(mockConnection.prompt).not.toHaveBeenCalled();
+    afterEach(() => {
+      vi.restoreAllMocks();
     });
 
-    it("should handle error from MCP bridge", async () => {
-      mockMcpBridge.callTool.mockResolvedValue({
-        isError: true,
-        content: "some error",
-      });
-
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
-
-      expect(mockMcpBridge.callTool).toHaveBeenCalledWith("getTask");
-      expect(mockConnection.prompt).not.toHaveBeenCalled();
-    });
-
-    it("should process task and NOT recurse if task is found", async () => {
+    it("prompts the agent in the session that belongs to the task", async () => {
+      const queue = new TaskQueue(1);
       mockMcpBridge.callTool.mockResolvedValue({
         isError: false,
         content: [{ type: "text", text: "Task ID: T1\ndo something" }],
       });
 
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
+      await drainPendingTasks(mockMcpBridge, queue, deps(queue));
+      await new Promise((resolve) => setTimeout(resolve, 10));
 
-      expect(mockMcpBridge.callTool).toHaveBeenCalledTimes(1);
       expect(mockSessionSwitcher.ensureForTask).toHaveBeenCalledWith("T1");
       expect(mockConnection.prompt).toHaveBeenCalledWith({
         sessionId: "current-session",
@@ -430,19 +427,14 @@ describe("index", () => {
       const earlier = new Promise<void>((resolve) => { releaseEarlier = resolve; });
       const earlierTurn = runTurnForTask("T-Queued", () => earlier);
 
-      const checking = checkForNextTask(
-        mockMcpBridge,
-        mockConnection,
-        mockSessionSwitcher,
-        mockAcpClient,
-        queue,
-      );
+      const draining = drainPendingTasks(mockMcpBridge, queue, deps(queue));
 
       await new Promise((resolve) => setTimeout(resolve, 10));
       expect(mockConnection.prompt).not.toHaveBeenCalled();
 
       releaseEarlier!();
-      await Promise.all([earlierTurn, checking]);
+      await Promise.all([earlierTurn, draining]);
+      await new Promise((resolve) => setTimeout(resolve, 10));
 
       expect(mockConnection.prompt).toHaveBeenCalledTimes(1);
       expect(queue.getActiveCount()).toBe(0);
@@ -466,13 +458,7 @@ describe("index", () => {
       const earlier = new Promise<void>((resolve) => { releaseEarlier = resolve; });
       const earlierTurn = runTurnForTask("T-Chatty", () => earlier);
 
-      const checking = checkForNextTask(
-        mockMcpBridge,
-        mockConnection,
-        mockSessionSwitcher,
-        mockAcpClient,
-        queue,
-      );
+      const draining = drainPendingTasks(mockMcpBridge, queue, deps(queue));
       await new Promise((resolve) => setTimeout(resolve, 10));
 
       // Behind the turn, but not occupying the gateway's only slot.
@@ -486,7 +472,8 @@ describe("index", () => {
       expect(unrelatedRan).toBe(true);
 
       releaseEarlier!();
-      await Promise.all([earlierTurn, checking, unrelated]);
+      await Promise.all([earlierTurn, draining, unrelated]);
+      await new Promise((resolve) => setTimeout(resolve, 10));
 
       expect(mockConnection.prompt).toHaveBeenCalledTimes(1);
       expect(queue.getActiveCount()).toBe(0);
@@ -497,46 +484,522 @@ describe("index", () => {
       // prefix at the *start* of it, so anything prepended here — a wrapper, a
       // task header, a courtesy sentence — stops it being a command at all.
       // agentrq relies on this passthrough to deliver what the human typed.
+      const queue = new TaskQueue(1);
       mockMcpBridge.callTool.mockResolvedValue({
         isError: false,
         content: [{ type: "text", text: "/compact keep the API discussion" }],
       });
 
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
+      await drainPendingTasks(mockMcpBridge, queue, deps(queue));
+      await new Promise((resolve) => setTimeout(resolve, 10));
 
       expect(mockConnection.prompt).toHaveBeenCalledWith({
         sessionId: "current-session",
         prompt: [{ type: "text", text: "/compact keep the API discussion" }],
       });
     });
+  });
 
-    it("should handle exceptions during execution", async () => {
-      mockMcpBridge.callTool.mockRejectedValue(new Error("network error"));
+  describe("fetchNextTask", () => {
+    let bridge: any;
 
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
+    beforeEach(() => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      bridge = { callTool: vi.fn() };
+    });
 
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("hands back the task the workspace dequeued", async () => {
+      bridge.callTool.mockResolvedValue({
+        isError: false,
+        content: [{ type: "text", text: "Task ID: T-Fetch\nplease do it" }],
+      });
+
+      const task = await fetchNextTask(bridge);
+
+      expect(bridge.callTool).toHaveBeenCalledWith("getTask");
+      expect(task?.text).toBe("Task ID: T-Fetch\nplease do it");
+      expect(task?.taskId).toBe("T-Fetch");
+      // Stamped at the fetch, so a cancel landing during session setup still bites.
+      expect(task?.queuedSeq).toBeGreaterThan(0);
+    });
+
+    it("says there is nothing rather than throwing, so a drain simply stops", async () => {
+      // Each of these is a different failure, and every one of them means the
+      // same thing to a caller trying to fill a slot: not now.
+      bridge.callTool.mockResolvedValueOnce({
+        isError: false,
+        content: [{ type: "text", text: "no pending tasks exist" }],
+      });
+      expect(await fetchNextTask(bridge)).toBeNull();
+
+      bridge.callTool.mockResolvedValueOnce({ isError: true, content: "nope" });
+      expect(await fetchNextTask(bridge)).toBeNull();
+
+      bridge.callTool.mockRejectedValueOnce(new Error("network error"));
+      expect(await fetchNextTask(bridge)).toBeNull();
       expect(console.error).toHaveBeenCalledWith(
         expect.stringContaining("Failed to check for next task"),
-        expect.any(Error)
+        expect.any(Error),
+      );
+
+      bridge.callTool.mockResolvedValueOnce({ isError: false, content: [] });
+      expect(await fetchNextTask(bridge)).toBeNull();
+
+      bridge.callTool.mockResolvedValueOnce({
+        isError: false,
+        content: [{ type: "text", text: "" }],
+      });
+      expect(await fetchNextTask(bridge)).toBeNull();
+    });
+
+    it("drops a task it has already been handed", async () => {
+      bridge.callTool.mockResolvedValue({
+        isError: false,
+        content: [{ type: "text", text: "Task ID: T-Twice\nsame words" }],
+      });
+
+      expect(await fetchNextTask(bridge)).not.toBeNull();
+      expect(await fetchNextTask(bridge)).toBeNull();
+    });
+
+    it("takes an unnamed task, since not every delivery carries an id", async () => {
+      bridge.callTool.mockResolvedValue({
+        isError: false,
+        content: [{ type: "text", text: "/compact keep the API discussion" }],
+      });
+
+      const task = await fetchNextTask(bridge);
+      expect(task?.taskId).toBeUndefined();
+      expect(task?.text).toBe("/compact keep the API discussion");
+    });
+  });
+
+  describe("startPendingTask", () => {
+    afterEach(() => {
+      activeSessions.clear();
+      resetIdleSession();
+      resetTaskTurns();
+      vi.restoreAllMocks();
+    });
+
+    it("opens a session from the agent command when it was given one", async () => {
+      // The gateway's own path passes a command rather than an open
+      // connection, and that is the shape `main` uses — so it is the shape
+      // that has to work when the workspace hands over a task.
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const prompt = vi.fn().mockResolvedValue({ stopReason: "end_turn" });
+      const acpClient = {
+        flushReply: vi.fn().mockResolvedValue(undefined),
+        reportStopReason: vi.fn().mockResolvedValue(undefined),
+      };
+      activeSessions.set("T-Cmd", {
+        process: {},
+        connection: { prompt } as any,
+        acpClient: acpClient as any,
+        sessionId: "S-Cmd",
+        initResult: {} as any,
+        adopt: vi.fn(),
+      } as any);
+
+      await startPendingTask(
+        { text: "Task ID: T-Cmd\nwork", taskId: "T-Cmd", queuedSeq: 1 },
+        { callTool: vi.fn() } as any,
+        {
+          acpCmdArgsOrConnection: ["fake-agent"],
+          configsOrSessionSwitcher: [],
+          agentrqConfigOrAcpClient: { name: "agentrq", type: "http" } as any,
+        },
+      );
+
+      expect(prompt).toHaveBeenCalledWith({
+        sessionId: "S-Cmd",
+        prompt: [{ type: "text", text: "Task ID: T-Cmd\nwork" }],
+      });
+      expect(acpClient.reportStopReason).toHaveBeenCalledWith("S-Cmd", "end_turn");
+    });
+
+    it("uses the session it was handed when there is no switcher to ask", async () => {
+      // --list-models and friends open a session that belongs to no task and
+      // hand it straight over; there is nothing to switch between.
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const prompt = vi.fn().mockResolvedValue({ stopReason: "end_turn" });
+      const acpClient = {
+        flushReply: vi.fn().mockResolvedValue(undefined),
+        reportStopReason: vi.fn().mockResolvedValue(undefined),
+      };
+
+      await startPendingTask(
+        { text: "just do it", queuedSeq: 1 },
+        { callTool: vi.fn() } as any,
+        {
+          acpCmdArgsOrConnection: { prompt } as any,
+          configsOrSessionSwitcher: undefined,
+          agentrqConfigOrAcpClient: acpClient as any,
+        },
+      );
+
+      expect(prompt).toHaveBeenCalledWith({
+        sessionId: undefined,
+        prompt: [{ type: "text", text: "just do it" }],
+      });
+    });
+
+    it("cancels the session when the cancel lands while it is being opened", async () => {
+      // Opening a session takes seconds, and a cancel that arrives inside that
+      // window has no turn to stop yet — so the task must not be handed to the
+      // agent once the session finally exists.
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      cancelledTaskSeq.clear();
+      const prompt = vi.fn().mockResolvedValue({ stopReason: "end_turn" });
+      const acpClient = {
+        flushReply: vi.fn().mockResolvedValue(undefined),
+        reportStopReason: vi.fn().mockResolvedValue(undefined),
+        cancelTurn: vi.fn().mockResolvedValue(undefined),
+      };
+      const switcher = {
+        getSessionId: vi.fn().mockReturnValue("S-Late"),
+        ensureForTask: vi.fn(async (id: string) => {
+          markTaskCancelled(id);
+          return `S-${id}`;
+        }),
+      };
+
+      await startPendingTask(
+        { text: "Task ID: T-Late\nnever mind", taskId: "T-Late", queuedSeq: 1 },
+        { callTool: vi.fn() } as any,
+        {
+          acpCmdArgsOrConnection: { prompt } as any,
+          configsOrSessionSwitcher: switcher,
+          agentrqConfigOrAcpClient: acpClient as any,
+        },
+      );
+
+      expect(acpClient.cancelTurn).toHaveBeenCalledWith("S-T-Late");
+      expect(prompt).not.toHaveBeenCalled();
+      cancelledTaskSeq.clear();
+    });
+  });
+
+  describe("createSelfFillingTaskQueue", () => {
+    it("fetches work whenever the queue has room, at startup and after", async () => {
+      // The whole of "a gateway allowed three tasks runs three tasks": the
+      // queue says it has room, and something goes and fills it.
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      resetPendingTaskDrain();
+      resetTaskTurns();
+      resetConcurrencyReports();
+
+      const bridge: any = {
+        callTool: vi.fn(),
+        sendNotification: vi.fn().mockResolvedValue(undefined),
+      };
+      const connection = {
+        prompt: vi.fn().mockResolvedValue({ stopReason: "end_turn" }),
+      };
+      const acpClient = {
+        flushReply: vi.fn().mockResolvedValue(undefined),
+        reportStopReason: vi.fn().mockResolvedValue(undefined),
+      };
+      const switcher = {
+        getSessionId: vi.fn().mockReturnValue("S"),
+        ensureForTask: vi.fn(async (id: string) => `S-${id}`),
+      };
+      bridge.callTool
+        .mockResolvedValueOnce({
+          isError: false,
+          content: [{ type: "text", text: "Task ID: W1\nfirst" }],
+        })
+        .mockResolvedValue({
+          isError: false,
+          content: [{ type: "text", text: "no pending tasks exist" }],
+        });
+
+      const queue = createSelfFillingTaskQueue(1, bridge, {
+        acpCmdArgsOrConnection: connection as any,
+        configsOrSessionSwitcher: switcher,
+        agentrqConfigOrAcpClient: acpClient as any,
+      });
+
+      await drainPendingTasks(bridge, queue, {
+        acpCmdArgsOrConnection: connection as any,
+        configsOrSessionSwitcher: switcher,
+        agentrqConfigOrAcpClient: acpClient as any,
+        taskQueue: queue,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(connection.prompt).toHaveBeenCalledTimes(1);
+      // The task finished and freed its slot, so the queue went back for more
+      // on its own rather than sitting idle until something pushed it.
+      expect(bridge.callTool.mock.calls.length).toBeGreaterThanOrEqual(2);
+      // And it still reports itself to the workspace, as before.
+      expect(bridge.sendNotification).toHaveBeenCalled();
+      resetConcurrencyReports();
+      vi.restoreAllMocks();
+    });
+  });
+
+  describe("freeSlots", () => {
+    it("counts the room left, with what is waiting already spoken for", () => {
+      const queue = new TaskQueue(3);
+      expect(freeSlots(queue)).toBe(3);
+    });
+
+    it("never goes negative when the limit was lowered under running work", () => {
+      // Lowering never interrupts, so the queue can legitimately hold more than
+      // the limit allows — and a negative number of slots would read as room.
+      const queue = new TaskQueue(3);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const running = [queue.run(() => held), queue.run(() => held), queue.run(() => held)];
+      queue.setMaxConcurrency(1);
+      expect(freeSlots(queue)).toBe(0);
+      release();
+      return Promise.all(running);
+    });
+  });
+
+  describe("drainPendingTasks", () => {
+    let bridge: any;
+    let connection: any;
+    let switcher: any;
+    let acpClient: any;
+
+    /** A workspace answer holding one task. */
+    const task = (id: string) => ({
+      isError: false,
+      content: [{ type: "text", text: `Task ID: ${id}\nwork on ${id}` }],
+    });
+    /** The workspace answer meaning there is nothing left. */
+    const nothing = () => ({
+      isError: false,
+      content: [{ type: "text", text: "no pending tasks exist" }],
+    });
+
+    const deps = () => ({
+      acpCmdArgsOrConnection: connection,
+      configsOrSessionSwitcher: switcher,
+      agentrqConfigOrAcpClient: acpClient,
+    });
+
+    beforeEach(() => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      resetPendingTaskDrain();
+      resetTaskTurns();
+      bridge = { callTool: vi.fn() };
+      connection = { prompt: vi.fn().mockResolvedValue({ stopReason: "end_turn" }) };
+      switcher = {
+        getSessionId: vi.fn().mockReturnValue("S"),
+        ensureForTask: vi.fn(async (id: string) => `S-${id}`),
+      };
+      acpClient = {
+        flushReply: vi.fn().mockResolvedValue(undefined),
+        reportStopReason: vi.fn().mockResolvedValue(undefined),
+      };
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("fills every free slot instead of taking a single task", async () => {
+      // The bug this exists for: three tasks waiting, three slots, and the
+      // gateway running one of them because it only ever asked once.
+      const queue = new TaskQueue(3);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      connection.prompt.mockReturnValue(held.then(() => ({ stopReason: "end_turn" })));
+      bridge.callTool
+        .mockResolvedValueOnce(task("D1"))
+        .mockResolvedValueOnce(task("D2"))
+        .mockResolvedValueOnce(task("D3"))
+        .mockResolvedValue(nothing());
+
+      await drainPendingTasks(bridge, queue, deps());
+
+      expect(queue.getActiveCount()).toBe(3);
+      // Three fetches and no fourth: it stops at the limit rather than
+      // emptying the workspace into a queue nobody asked it to hold.
+      expect(bridge.callTool).toHaveBeenCalledTimes(3);
+
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(connection.prompt).toHaveBeenCalledTimes(3);
+    });
+
+    it("asks once and stops when the workspace has nothing waiting", async () => {
+      const queue = new TaskQueue(3);
+      bridge.callTool.mockResolvedValue(nothing());
+
+      await drainPendingTasks(bridge, queue, deps());
+
+      expect(bridge.callTool).toHaveBeenCalledTimes(1);
+      expect(connection.prompt).not.toHaveBeenCalled();
+    });
+
+    it("does not ask at all while the queue is full", async () => {
+      const queue = new TaskQueue(1);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const running = queue.run(() => held);
+
+      await drainPendingTasks(bridge, queue, deps());
+
+      expect(bridge.callTool).not.toHaveBeenCalled();
+      release();
+      await running;
+    });
+
+    it("counts a task waiting in the queue as a slot already spoken for", async () => {
+      // Queued work is work this gateway has promised to run; fetching more
+      // against it would pull the whole workspace in and hold it here.
+      const queue = new TaskQueue(1);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const running = queue.run(() => held);
+      const waiting = queue.run(async () => {});
+
+      await drainPendingTasks(bridge, queue, deps());
+
+      expect(bridge.callTool).not.toHaveBeenCalled();
+      release();
+      await Promise.all([running, waiting]);
+    });
+
+    it("joins a drain already running, and answers the wake-up that joining collapsed", async () => {
+      // Every trigger — a task finishing, a limit rising — can land while a
+      // drain is waiting on getTask. A second drain started there would be
+      // asking for the task the first one is about to be handed; but simply
+      // swallowing the news would leave the slot that just came free empty,
+      // because the drain that swallowed it may already have been told the
+      // workspace is empty.
+      let queue!: TaskQueue;
+      const rejoined: Array<Promise<void>> = [];
+      queue = new TaskQueue(2, undefined, () => {
+        rejoined.push(drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue }));
+      });
+
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const running = queue.run(() => held);
+
+      const answerFetch: Array<(value: any) => void> = [];
+      bridge.callTool.mockImplementation(
+        () => new Promise((resolve) => { answerFetch.push(resolve); }),
+      );
+
+      const draining = drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(answerFetch.length).toBe(1);
+
+      // The slot comes free while that fetch is still in the air.
+      release();
+      await running;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(rejoined).toHaveLength(1);
+      expect(rejoined[0]).toBe(draining);
+
+      // The drain that collapsed it is told there is nothing — and goes back
+      // anyway, because the slot it heard about came free after it had asked.
+      answerFetch[0](nothing());
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(answerFetch.length).toBe(2);
+
+      answerFetch[1](nothing());
+      await draining;
+      expect(connection.prompt).not.toHaveBeenCalled();
+    });
+
+    it("goes back for more when a finished task frees a slot", async () => {
+      let queue!: TaskQueue;
+      queue = new TaskQueue(1, undefined, () => {
+        void drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue });
+      });
+      bridge.callTool.mockResolvedValueOnce(task("L1")).mockResolvedValue(nothing());
+
+      await drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(connection.prompt).toHaveBeenCalledTimes(1);
+      // Asked again once the slot came back, and was told there was nothing.
+      expect(bridge.callTool.mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it("keeps filling slots when one of the tasks fails", async () => {
+      // One task that cannot run is not a reason to leave the other slots empty.
+      const queue = new TaskQueue(2);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      connection.prompt
+        .mockRejectedValueOnce(new Error("agent said no"))
+        .mockReturnValue(held.then(() => ({ stopReason: "end_turn" })));
+      bridge.callTool
+        .mockResolvedValueOnce(task("F1"))
+        .mockResolvedValueOnce(task("F2"))
+        .mockResolvedValue(nothing());
+
+      await drainPendingTasks(bridge, queue, deps());
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(connection.prompt).toHaveBeenCalledTimes(2);
+      expect(console.error).toHaveBeenCalledWith(
+        expect.stringContaining("Error running task F1"),
+        expect.any(Error),
+      );
+      release();
+    });
+
+    it("names an unnamed task in the log rather than saying nothing went wrong", async () => {
+      const queue = new TaskQueue(1);
+      connection.prompt.mockRejectedValue(new Error("agent said no"));
+      bridge.callTool
+        .mockResolvedValueOnce({
+          isError: false,
+          content: [{ type: "text", text: "/compact and then some" }],
+        })
+        .mockResolvedValue(nothing());
+
+      await drainPendingTasks(bridge, queue, deps());
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(console.error).toHaveBeenCalledWith(
+        expect.stringContaining("Error running task (unnamed)"),
+        expect.any(Error),
       );
     });
 
-    it("should drop repetitive task messages for the same taskId", async () => {
-      mockMcpBridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "Task ID: T-Rep\nsome repetitive task" }],
+    it("fills the slots a raised limit just opened", async () => {
+      // Raising the limit with nothing waiting internally used to start
+      // nothing at all: the tasks it could now run were in the workspace,
+      // and nothing went to ask for them.
+      let queue!: TaskQueue;
+      queue = new TaskQueue(1, undefined, () => {
+        void drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue });
       });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      connection.prompt.mockReturnValue(held.then(() => ({ stopReason: "end_turn" })));
+      bridge.callTool
+        .mockResolvedValueOnce(task("U1"))
+        .mockResolvedValueOnce(task("U2"))
+        .mockResolvedValueOnce(task("U3"))
+        .mockResolvedValue(nothing());
 
-      // First run: should execute
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
-      expect(mockConnection.prompt).toHaveBeenCalledTimes(1);
+      await drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue });
+      expect(queue.getActiveCount()).toBe(1);
 
-      // Reset mock connection call count
-      mockConnection.prompt.mockClear();
+      queue.setMaxConcurrency(3);
+      await new Promise((resolve) => setTimeout(resolve, 10));
 
-      // Second run with same content: should drop and not execute
-      await checkForNextTask(mockMcpBridge, mockConnection, mockSessionSwitcher, mockAcpClient);
-      expect(mockConnection.prompt).not.toHaveBeenCalled();
+      expect(queue.getActiveCount()).toBe(3);
+      release();
     });
   });
 
@@ -860,6 +1323,85 @@ describe("index", () => {
         );
         errorSpy.mockRestore();
       });
+    });
+  });
+
+  describe("offering its free capacity", () => {
+    it("says so when a task finishes, but not when one starts", async () => {
+      // Two different questions: the numbers moved (a start moves them too),
+      // and there may be room now. Only the second is a reason to go and ask
+      // the workspace for more work.
+      let queue!: TaskQueue;
+      const offers: number[] = [];
+      queue = new TaskQueue(1, undefined, () => offers.push(queue.getActiveCount()));
+
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const running = queue.run(() => held);
+      expect(offers).toEqual([]);
+
+      release();
+      await running;
+      expect(offers).toEqual([0]);
+    });
+
+    it("says so when the limit is raised, even with nothing waiting here", async () => {
+      // The tasks a raise makes room for are usually still in the workspace,
+      // so a raise that told nobody would run nothing at all.
+      let offered = 0;
+      const queue = new TaskQueue(1, undefined, () => { offered++; });
+
+      queue.setMaxConcurrency(3);
+      expect(offered).toBe(1);
+
+      // Not a change, so nothing to offer.
+      queue.setMaxConcurrency(3);
+      expect(offered).toBe(1);
+    });
+
+    it("waits until whatever was queued has taken the slot back", async () => {
+      // Otherwise the gateway hears "room!" and fetches a task to sit beside
+      // work it had already promised to run.
+      let queue!: TaskQueue;
+      const roomSeen: number[] = [];
+      queue = new TaskQueue(1, undefined, () => roomSeen.push(freeSlots(queue)));
+
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const first = queue.run(() => held);
+      let releaseSecond!: () => void;
+      const second = queue.run(() => new Promise<void>((resolve) => { releaseSecond = resolve; }));
+
+      release();
+      await first;
+      expect(roomSeen).toEqual([0]);
+
+      releaseSecond();
+      await second;
+    });
+
+    it("survives a listener that throws, so a finished task still finishes", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const queue = new TaskQueue(1, undefined, () => {
+        throw new Error("nobody to tell");
+      });
+
+      await expect(queue.run(async () => {})).resolves.toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Error offering the queue's free capacity"),
+        expect.any(Error),
+      );
+      errorSpy.mockRestore();
+    });
+
+    it("is wired through createTaskQueue, which is how the gateway gets it", () => {
+      const bridge = { sendNotification: vi.fn().mockResolvedValue(undefined) };
+      let offered = 0;
+      const queue = createTaskQueue(2, bridge, () => { offered++; });
+
+      queue.setMaxConcurrency(3);
+      expect(offered).toBe(1);
+      resetConcurrencyReports();
     });
   });
 
@@ -3049,7 +3591,12 @@ describe("index", () => {
           }),
         };
 
-        await checkForNextTask(bridge, connection, switcher, acpClient);
+        resetPendingTaskDrain();
+        await drainPendingTasks(bridge, new TaskQueue(1), {
+          acpCmdArgsOrConnection: connection,
+          configsOrSessionSwitcher: switcher,
+          agentrqConfigOrAcpClient: acpClient,
+        });
 
         expect(promptMock).not.toHaveBeenCalled();
       });
@@ -3070,7 +3617,12 @@ describe("index", () => {
           }),
         };
 
-        await checkForNextTask(bridge, connection, switcher, acpClient);
+        resetPendingTaskDrain();
+        await drainPendingTasks(bridge, new TaskQueue(1), {
+          acpCmdArgsOrConnection: connection,
+          configsOrSessionSwitcher: switcher,
+          agentrqConfigOrAcpClient: acpClient,
+        });
 
         expect(promptMock).toHaveBeenCalled();
       });

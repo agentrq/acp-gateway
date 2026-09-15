@@ -1495,9 +1495,17 @@ async function drainConcurrencyReports(
 export function createTaskQueue(
   maxConcurrency: number,
   bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
+  /**
+   * Told when the queue may have room for another task, so the caller can go
+   * and fetch one. Absent where nothing is fetching — the auth commands, and
+   * tests of the reporting on its own.
+   */
+  onCapacity?: () => void,
 ): TaskQueue {
-  const queue: TaskQueue = new TaskQueue(maxConcurrency, () =>
-    void reportConcurrency(bridge, queue),
+  const queue: TaskQueue = new TaskQueue(
+    maxConcurrency,
+    () => void reportConcurrency(bridge, queue),
+    onCapacity,
   );
   return queue;
 }
@@ -1753,6 +1761,7 @@ export class TaskQueue {
   constructor(
     private maxConcurrency: number,
     private onChange?: () => void,
+    private onCapacity?: () => void,
   ) {}
 
   /**
@@ -1770,6 +1779,28 @@ export class TaskQueue {
       this.onChange?.();
     } catch (err) {
       console.error("[queue] Error reporting the queue's state:", err);
+    }
+  }
+
+  /**
+   * Says there may be room for another task, and survives a listener that
+   * cannot take the news.
+   *
+   * Separate from `announce` because the two answer different questions. A
+   * report of the numbers goes out whenever they move, including when a task
+   * *starts* and the gateway has less room than before; this one fires only
+   * where room may have appeared — a task finished, or the limit went up — and
+   * it is what lets the gateway go and ask the workspace for more work.
+   *
+   * Guarded for the same reason `announce` is: filling the queue is a courtesy
+   * to whoever is waiting, and a courtesy must not be able to break the task
+   * that just finished.
+   */
+  private offerCapacity(): void {
+    try {
+      this.onCapacity?.();
+    } catch (err) {
+      console.error("[queue] Error offering the queue's free capacity:", err);
     }
   }
 
@@ -1808,6 +1839,9 @@ export class TaskQueue {
       // state twice and never show the gap.
       this.announce();
       this.next();
+      // After `next()`, so that whatever was already waiting here has taken its
+      // slot back before anyone is told there is one going spare.
+      this.offerCapacity();
     }
   }
 
@@ -1861,6 +1895,10 @@ export class TaskQueue {
         `(${this.activeTasks} running, ${this.queue.length} queued)`,
     );
     this.next();
+    // A raise with nothing waiting internally starts nothing, and used to end
+    // there: the gateway sat at one task with room for three because the two
+    // it could have run were still sitting in the workspace, unasked for.
+    this.offerCapacity();
   }
 }
 
@@ -2395,8 +2433,19 @@ async function main() {
   // 3. Initialize MCP Bridge
   const mcpBridge = new MCPBridge(agentrqConfig);
 
-  // After the bridge, because the queue now reports itself to it.
-  const taskQueue = createTaskQueue(maxConcurrency, mcpBridge);
+  // What running a task fetched from the workspace takes, in the shape the
+  // gateway's own path uses: a command to open a session from.
+  const taskRunDeps: TaskRunDeps = {
+    acpCmdArgsOrConnection: acpCmdArgs,
+    configsOrSessionSwitcher: configs,
+    agentrqConfigOrAcpClient: agentrqConfig,
+  };
+
+  // After the bridge, because the queue now reports itself to it — and fills
+  // itself from it: the answer to having room is to go and ask the workspace
+  // for more work, or a limit of three runs one task and waits with the other
+  // two still sitting in the workspace because nothing ever asked for them.
+  const taskQueue = createSelfFillingTaskQueue(maxConcurrency, mcpBridge, taskRunDeps);
 
   // Auth commands talk to the agent and exit; they never start bridging tasks.
   // They run before the bridge connects, so a first-time login still works when
@@ -2571,14 +2620,13 @@ async function main() {
       void sendAgentIdentity(mcpBridge, resolved.identity);
     }
 
-    // Initial check for a pending task
-    await checkForNextTask(
-      mcpBridge,
-      acpCmdArgs,
-      configs,
-      agentrqConfig,
-      taskQueue,
-    );
+    // Initial fill: every slot the limit allows, not just the first. A gateway
+    // that comes up to a workspace with work waiting should start as much of it
+    // as it is allowed to run.
+    //
+    // Not awaited for the work itself — this resolves once the slots are filled,
+    // and the tasks in them run on past it.
+    await drainPendingTasks(mcpBridge, taskQueue, { ...taskRunDeps, taskQueue });
 
     // Keep the process alive
     await new Promise(() => { });
@@ -2591,21 +2639,50 @@ async function main() {
   }
 }
 
+/** A task the workspace handed over, and where it fell in the stream of events. */
+export interface PendingTask {
+  /** What the agent is to be prompted with, exactly as the workspace worded it. */
+  text: string;
+  taskId?: string;
+  /**
+   * Stamped when the task was taken, not when it starts: a cancel that arrives
+   * while the session is still being opened has to stop it just the same.
+   */
+  queuedSeq: number;
+}
+
 /**
- * Checks for the next pending task using the 'getTask' tool on the MCP server.
- * Called with no taskId, 'getTask' dequeues the next not-started task.
- * If found, sends it to the ACP agent.
+ * Everything running a fetched task needs, in either of the two shapes callers
+ * pass it — an agent command to open a session from, or a connection and
+ * session switcher already open.
  */
-export async function checkForNextTask(
+export interface TaskRunDeps {
+  acpCmdArgsOrConnection: string[] | acp.ClientSideConnection;
+  configsOrSessionSwitcher:
+    | McpServerConfig[]
+    | ReturnType<typeof createAcpSessionSwitcher>
+    | unknown;
+  agentrqConfigOrAcpClient: McpServerConfig | AgentRQACPClient;
+  taskQueue?: TaskQueue;
+  acpCmdArgs?: string[];
+  configs?: McpServerConfig[];
+  agentrqConfig?: McpServerConfig;
+}
+
+/**
+ * Takes the next not-started task off the workspace, or returns null if there
+ * is nothing to take.
+ *
+ * `getTask` with no task id dequeues one task, so this is one task per call —
+ * which is exactly why the gateway has to call it again to fill a second slot.
+ *
+ * Never throws. A workspace that cannot be reached, an error from the tool, or
+ * a repeat of a task already being run all read the same way to a caller: there
+ * is nothing to start right now.
+ */
+export async function fetchNextTask(
   mcpBridge: MCPBridge,
-  acpCmdArgsOrConnection: string[] | acp.ClientSideConnection,
-  configsOrSessionSwitcher: McpServerConfig[] | ReturnType<typeof createAcpSessionSwitcher> | unknown,
-  agentrqConfigOrAcpClient: McpServerConfig | AgentRQACPClient,
-  taskQueue?: TaskQueue,
-  acpCmdArgs?: string[],
-  configs?: McpServerConfig[],
-  agentrqConfig?: McpServerConfig,
-) {
+): Promise<PendingTask | null> {
   console.error("[bridge] Checking for next task via MCP server...");
   // Stamped before the fetch, so a cancel that arrives while `getTask` is in
   // flight (or while the session is being opened) still stops the task.
@@ -2615,7 +2692,7 @@ export async function checkForNextTask(
 
     if (result.isError) {
       console.error("[mcp] Error getting next task:", result.content);
-      return;
+      return null;
     }
 
     const contentBlock = result.content as Array<{
@@ -2624,106 +2701,243 @@ export async function checkForNextTask(
     }>;
     const content = contentBlock[0] as { type: string; text: string };
     if (
-      content &&
-      content.text &&
-      !content.text.includes("no pending tasks exist")
+      !content ||
+      !content.text ||
+      content.text.includes("no pending tasks exist")
     ) {
-      const text = content.text;
-      const taskId = extractTaskIdFromText(text);
-      if (taskId) {
-        if (lastTaskContent.get(taskId) === text) {
-          console.log(`[bridge] Dropping repetitive checked task for ${taskId}`);
-          return;
-        }
-        lastTaskContent.set(taskId, text);
-      }
-      console.error(
-        `[bridge] Found task: "${text.slice(0, 50).replace(/\n/g, " ")}..."`,
-      );
-
-      const runFn = async () => {
-        if (isTaskCancelled(taskId, queuedSeq)) {
-          console.error(
-            `[bridge] Task ${taskId} was cancelled before execution started, skipping`,
-          );
-          return;
-        }
-        let connectionToUse: acp.ClientSideConnection | undefined;
-        let acpClientToUse: AgentRQACPClient | undefined;
-        let sessionIdToUse: string | undefined;
-
-        let actualAcpCmdArgs: string[] = [];
-        let actualConfigs: McpServerConfig[] = [];
-        let actualAgentrqConfig: McpServerConfig | undefined;
-
-        if (Array.isArray(acpCmdArgsOrConnection)) {
-          actualAcpCmdArgs = acpCmdArgsOrConnection;
-          actualConfigs = configsOrSessionSwitcher as McpServerConfig[];
-          actualAgentrqConfig = agentrqConfigOrAcpClient as McpServerConfig;
-        } else {
-          connectionToUse = acpCmdArgsOrConnection as acp.ClientSideConnection;
-          acpClientToUse = agentrqConfigOrAcpClient as AgentRQACPClient;
-          const switcher = configsOrSessionSwitcher as any;
-          if (switcher && typeof switcher.ensureForTask === "function") {
-            sessionIdToUse = await switcher.ensureForTask(taskId);
-          }
-          actualAcpCmdArgs = acpCmdArgs || [];
-          actualConfigs = configs || [];
-          actualAgentrqConfig = agentrqConfig;
-        }
-
-        if (!connectionToUse) {
-          const sessionInfo = await getOrCreateSession(
-            taskId,
-            actualAcpCmdArgs,
-            actualConfigs,
-            actualAgentrqConfig!,
-            mcpBridge,
-          );
-          connectionToUse = sessionInfo.connection;
-          sessionIdToUse = sessionInfo.sessionId;
-          acpClientToUse = sessionInfo.acpClient;
-        }
-
-        // Spawning the agent and opening the session takes seconds; a cancel
-        // that lands in that window has no turn to stop yet, so check again
-        // before handing the agent the work.
-        if (isTaskCancelled(taskId, queuedSeq)) {
-          console.error(
-            `[bridge] Task ${taskId} was cancelled during session setup, cancelling session`,
-          );
-          await acpClientToUse?.cancelTurn(sessionIdToUse);
-          return;
-        }
-
-        const promptResult = await connectionToUse.prompt({
-          sessionId: sessionIdToUse!,
-          prompt: [{ type: "text", text }],
-        });
-
-        await acpClientToUse!.flushReply(sessionIdToUse!);
-        await acpClientToUse!.reportStopReason(sessionIdToUse!, promptResult.stopReason);
-        console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
-      };
-
-      // Serialised against any turn already running for this task, for the
-      // reason runTurnForTask records: this path and the push notification can
-      // both be handed the same task, and word it differently enough that the
-      // repetition guard drops neither.
-      //
-      // Outside the queue slot rather than inside it, so a delivery that is
-      // only waiting for the turn ahead of it is not also holding a share of
-      // the concurrency limit while it waits.
-      await runTurnForTask(taskId, () =>
-        taskQueue ? taskQueue.run(runFn) : runFn(),
-      );
-    } else {
       console.error("[bridge] No pending tasks available.");
+      return null;
     }
+
+    const text = content.text;
+    const taskId = extractTaskIdFromText(text);
+    if (taskId) {
+      if (lastTaskContent.get(taskId) === text) {
+        console.log(`[bridge] Dropping repetitive checked task for ${taskId}`);
+        return null;
+      }
+      lastTaskContent.set(taskId, text);
+    }
+    console.error(
+      `[bridge] Found task: "${text.slice(0, 50).replace(/\n/g, " ")}..."`,
+    );
+    return { text, taskId, queuedSeq };
   } catch (err) {
     console.error("[bridge] Failed to check for next task:", err);
+    return null;
   }
 }
+
+/**
+ * Hands a fetched task to the agent, through the queue and behind any turn the
+ * task already has running.
+ *
+ * Resolves when the agent is done with it, so a caller that wants to fill the
+ * *next* slot must not wait for this one.
+ */
+export async function startPendingTask(
+  task: PendingTask,
+  mcpBridge: MCPBridge,
+  deps: TaskRunDeps,
+): Promise<void> {
+  const { text, taskId, queuedSeq } = task;
+  const runFn = async () => {
+    if (isTaskCancelled(taskId, queuedSeq)) {
+      console.error(
+        `[bridge] Task ${taskId} was cancelled before execution started, skipping`,
+      );
+      return;
+    }
+    let connectionToUse: acp.ClientSideConnection | undefined;
+    let acpClientToUse: AgentRQACPClient | undefined;
+    let sessionIdToUse: string | undefined;
+
+    let actualAcpCmdArgs: string[] = [];
+    let actualConfigs: McpServerConfig[] = [];
+    let actualAgentrqConfig: McpServerConfig | undefined;
+
+    if (Array.isArray(deps.acpCmdArgsOrConnection)) {
+      actualAcpCmdArgs = deps.acpCmdArgsOrConnection;
+      actualConfigs = deps.configsOrSessionSwitcher as McpServerConfig[];
+      actualAgentrqConfig = deps.agentrqConfigOrAcpClient as McpServerConfig;
+    } else {
+      connectionToUse = deps.acpCmdArgsOrConnection as acp.ClientSideConnection;
+      acpClientToUse = deps.agentrqConfigOrAcpClient as AgentRQACPClient;
+      const switcher = deps.configsOrSessionSwitcher as any;
+      if (switcher && typeof switcher.ensureForTask === "function") {
+        sessionIdToUse = await switcher.ensureForTask(taskId);
+      }
+      actualAcpCmdArgs = deps.acpCmdArgs || [];
+      actualConfigs = deps.configs || [];
+      actualAgentrqConfig = deps.agentrqConfig;
+    }
+
+    if (!connectionToUse) {
+      const sessionInfo = await getOrCreateSession(
+        taskId,
+        actualAcpCmdArgs,
+        actualConfigs,
+        actualAgentrqConfig!,
+        mcpBridge,
+      );
+      connectionToUse = sessionInfo.connection;
+      sessionIdToUse = sessionInfo.sessionId;
+      acpClientToUse = sessionInfo.acpClient;
+    }
+
+    // Spawning the agent and opening the session takes seconds; a cancel
+    // that lands in that window has no turn to stop yet, so check again
+    // before handing the agent the work.
+    if (isTaskCancelled(taskId, queuedSeq)) {
+      console.error(
+        `[bridge] Task ${taskId} was cancelled during session setup, cancelling session`,
+      );
+      await acpClientToUse?.cancelTurn(sessionIdToUse);
+      return;
+    }
+
+    const promptResult = await connectionToUse.prompt({
+      sessionId: sessionIdToUse!,
+      prompt: [{ type: "text", text }],
+    });
+
+    await acpClientToUse!.flushReply(sessionIdToUse!);
+    await acpClientToUse!.reportStopReason(sessionIdToUse!, promptResult.stopReason);
+    console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
+  };
+
+  // Serialised against any turn already running for this task, for the
+  // reason runTurnForTask records: this path and the push notification can
+  // both be handed the same task, and word it differently enough that the
+  // repetition guard drops neither.
+  //
+  // Outside the queue slot rather than inside it, so a delivery that is
+  // only waiting for the turn ahead of it is not also holding a share of
+  // the concurrency limit while it waits.
+  await runTurnForTask(taskId, () =>
+    deps.taskQueue ? deps.taskQueue.run(runFn) : runFn(),
+  );
+}
+
+/** How many more tasks the queue could start right now. */
+export function freeSlots(queue: TaskQueue): number {
+  return Math.max(
+    0,
+    queue.getMaxConcurrency() - queue.getActiveCount() - queue.getQueueLength(),
+  );
+}
+
+/**
+ * The drain in progress, if one is, and whether room appeared while it ran.
+ *
+ * One drain at a time, for the same reason there is one concurrency report at
+ * a time: every trigger for this — a task finishing, a limit being raised —
+ * can land while a drain is already waiting on `getTask`, and a second drain
+ * started there would be asking the workspace for the task the first one is
+ * about to be handed.
+ *
+ * The flag is what keeps collapsing them from losing one. A slot that came
+ * free during a fetch is real, and the drain that swallowed the news may
+ * already have decided the workspace was empty — so the news is answered once
+ * that drain finishes rather than dropped.
+ */
+let drainOnTheWire: Promise<void> | null = null;
+let capacityMovedAgain = false;
+
+/** Forgets any drain in flight. For tests. */
+export function resetPendingTaskDrain(): void {
+  drainOnTheWire = null;
+  capacityMovedAgain = false;
+}
+
+/**
+ * Fills every free slot the queue has with work from the workspace.
+ *
+ * The gateway used to ask for exactly one task, once, at startup — which was
+ * the whole story while it could only run one. Above that, three tasks waiting
+ * in a workspace and three slots here meant one task running and two slots
+ * idle, because nothing ever went back to ask for the second and third.
+ *
+ * Fetches are sequential and the runs are not: `getTask` dequeues a task, so
+ * two fetches in flight at once are two chances to be handed the same one,
+ * while waiting for a task to *finish* before fetching the next would defeat
+ * the point entirely. So each task is started and left to run, and the next
+ * fetch goes out immediately behind it.
+ *
+ * Stops as soon as the workspace says it has nothing — the run that frees the
+ * next slot brings us back here anyway.
+ */
+export function drainPendingTasks(
+  mcpBridge: MCPBridge,
+  queue: TaskQueue,
+  deps: TaskRunDeps,
+): Promise<void> {
+  if (drainOnTheWire) {
+    capacityMovedAgain = true;
+    return drainOnTheWire;
+  }
+  // Assigned from the call rather than after it, so that a drain triggered from
+  // inside the first fetch finds the slot already taken.
+  return (drainOnTheWire = pullUntilFull(mcpBridge, queue, deps));
+}
+
+/** Fetches and starts tasks until the queue is full or the workspace is empty. */
+async function pullUntilFull(
+  mcpBridge: MCPBridge,
+  queue: TaskQueue,
+  deps: TaskRunDeps,
+): Promise<void> {
+  try {
+    while (freeSlots(queue) > 0) {
+      const task = await fetchNextTask(mcpBridge);
+      if (!task) break;
+      // Deliberately not awaited: this task is running now, and the slot
+      // beside it is what this loop is here to fill. `run` takes the slot
+      // before it yields, so the next `freeSlots` already counts this one.
+      void startPendingTask(task, mcpBridge, { ...deps, taskQueue: queue }).catch(
+        (err) => {
+          console.error(
+            `[bridge] Error running task ${task.taskId ?? "(unnamed)"}:`,
+            err,
+          );
+        },
+      );
+    }
+  } finally {
+    // Cleared in the same tick the loop ends, and before the collapsed wake-up
+    // below is answered, so that pass is a drain in its own right rather than
+    // one that finds the slot still held by the drain that started it.
+    drainOnTheWire = null;
+  }
+  if (capacityMovedAgain) {
+    capacityMovedAgain = false;
+    await drainPendingTasks(mcpBridge, queue, deps);
+  }
+}
+
+/**
+ * Builds a queue that goes and fetches its own work.
+ *
+ * Out here rather than inline in `main()` for the reason `createTaskQueue`
+ * records: `main()` spawns processes and never returns, so wiring written
+ * inside it is wiring nothing exercises. And this is wiring worth exercising —
+ * it is the whole of "a gateway with room for three tasks runs three tasks".
+ *
+ * The callback names the queue it is being handed to, which is safe for the
+ * same reason `createTaskQueue`'s is: it only ever runs later, from inside the
+ * queue's own methods.
+ */
+export function createSelfFillingTaskQueue(
+  maxConcurrency: number,
+  mcpBridge: MCPBridge,
+  deps: Omit<TaskRunDeps, "taskQueue">,
+): TaskQueue {
+  const queue: TaskQueue = createTaskQueue(maxConcurrency, mcpBridge, () => {
+    void drainPendingTasks(mcpBridge, queue, { ...deps, taskQueue: queue });
+  });
+  return queue;
+}
+
 
 if (process.env.NODE_ENV !== "test") {
   // Keep the gateway alive across transient failures. The MCP transport has its
