@@ -92,6 +92,44 @@ function mcpCallFromTitle(title: string): { server: string; tool: string } | und
   return undefined;
 }
 
+/** A title that is nothing but a name: no arguments, no attribution, no path. */
+const BARE_TITLE = /^[A-Za-z0-9._-]+$/;
+
+/** Where one name could end and the next begin, longest separator first. */
+const NAME_SEPARATOR = /__|[._-]/g;
+
+/**
+ * Every way a bare `server<sep>tool` title could divide into its two names.
+ *
+ * Some agents drop the `mcp` prefix entirely and announce the call as
+ * `agentrq-workspace_updateTaskStatus`. That leaves nothing to anchor on: the
+ * separator is also a character both names are free to contain, so where the
+ * server ends cannot be read off the title alone.
+ *
+ * So this does not try to decide. It offers every division, and the caller
+ * accepts one only if *both* halves check out — a server it recognises and a
+ * tool that server advertises. Two independent confirmations are what make a
+ * guessed split safe: `write_file` offers `write`/`file`, and no workspace
+ * answers to that.
+ */
+function bareCallCandidates(title: string): { server: string; tool: string }[] {
+  const trimmed = title.trim();
+  if (!BARE_TITLE.test(trimmed)) return [];
+
+  const candidates: { server: string; tool: string }[] = [];
+  NAME_SEPARATOR.lastIndex = 0;
+  for (
+    let match = NAME_SEPARATOR.exec(trimmed);
+    match !== null;
+    match = NAME_SEPARATOR.exec(trimmed)
+  ) {
+    const server = trimmed.slice(0, match.index);
+    const tool = trimmed.slice(match.index + match[0].length);
+    if (server && tool) candidates.push({ server, tool });
+  }
+  return candidates;
+}
+
 /** How long to wait for `session/cancel` before settling permissions regardless. */
 const CANCEL_SESSION_TIMEOUT_MS = 5000;
 
@@ -780,9 +818,19 @@ export class AgentRQACPClient implements acp.Client {
   private isWorkspaceToolCall(title: string): boolean {
     if (AGENTRQ_TOOL_PATTERN.test(title)) return true;
 
+    // A title that names its two halves outright is read as it is written.
     const call = mcpCallFromTitle(title);
-    if (!call) return false;
+    if (call) return this.isWorkspaceCall(call);
 
+    // Otherwise it may be a bare `server_tool`, which only divides one way
+    // that survives both checks — if it divides at all.
+    return bareCallCandidates(title).some((candidate) =>
+      this.isWorkspaceCall(candidate),
+    );
+  }
+
+  /** Whether a server and tool, once separated, are this workspace's own. */
+  private isWorkspaceCall(call: { server: string; tool: string }): boolean {
     // The server has to be agentrq's — either the one this gateway is bridged
     // to, or any other agentrq-named one, since the workspace is free to
     // rename what it hands out.

@@ -315,6 +315,59 @@ describe("AgentRQACPClient", () => {
         );
       });
 
+      // Some agents announce the call with no `mcp` prefix at all, leaving a
+      // title with nothing to anchor the split on but the names themselves.
+      // Every one of these used to go to the human.
+      it.each([
+        "agentrq-workspace_updateTaskStatus",
+        "agentrq-workspace__reply",
+        "agentrq-workspace.loadMemory",
+        "agentrq-workspace-saveMemory",
+      ])("auto-allows a bare title: %s", async (title) => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+
+        const response = await c.requestPermission(ask(title));
+
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((response.outcome as any).optionId).toBe("opt-1");
+      });
+
+      // The split is guessed, so both halves have to confirm it. Neither a
+      // tool the workspace does not advertise nor another server's tool may
+      // ride in on a division that merely happens to be possible.
+      it.each([
+        "agentrq-workspace_deleteRepository",
+        "github_create_issue",
+        "write_file",
+        "_reply",
+        "saveMemory_",
+      ])("still asks the human about a bare title: %s", async (title) => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+        setTimeout(() => {
+          const sent = bridge.sendNotification.mock.calls.at(-1)?.[1];
+          bridge.emit("verdict", { requestId: sent?.request_id, behavior: "allow" });
+        }, 10);
+
+        await c.requestPermission(ask(title));
+
+        expect(bridge.sendNotification).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({ tool_name: title }),
+        );
+      });
+
+      it("reads a bare title against the tools the server advertises", async () => {
+        const { bridge, client: c } = clientFor("agentrq-workspace");
+        bridge.getAdvertisedTools.mockReturnValue(new Set(["summariseWorkspace"]));
+
+        const response = await c.requestPermission(
+          ask("agentrq-workspace_summariseWorkspace"),
+        );
+
+        expect(bridge.sendNotification).not.toHaveBeenCalled();
+        expect((response.outcome as any).optionId).toBe("opt-1");
+      });
+
       it("falls back to the bare-workspace-id pattern when the name is unavailable", async () => {
         const bridge = Object.assign(new EventEmitter(), {
           getSessionId: vi.fn().mockReturnValue("test-session"),
