@@ -2,9 +2,6 @@
 
 ACP+MCP Bridge brings Experimentation Claude Notification Channels feature to all agents that supports Agent Client Protocol.
 
-> [!NOTE]
-> `claude/notifications` is an experimental feature of Claude Code. `@agentrq/acp-gateway` extends this same capability to any `--acp` compatible agent (e.g., Gemini CLI).
-
 ## Overview
 
 `@agentrq/acp-gateway` bridges the [Agent Client Protocol (ACP)](https://agentclientprotocol.com) with the [Model Context Protocol (MCP)](https://modelcontextprotocol.io) to connect ACP-compatible AI agents (e.g., Gemini) to an agentrq MCP server.
