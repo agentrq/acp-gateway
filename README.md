@@ -1,11 +1,6 @@
 # @agentrq/acp-gateway
 
-ACP+MCP Bridge brings Experimentation Claude Notification Channels feature to all agents that supports Agent Client Protocol.
-
-> [!WARNING]
-> **Pre-Alpha**: This project is in early development. APIs, configurations, and behaviors are subject to change without notice.
->
-> **Note**: `claude/notifications` is an experimental feature of Claude Code. `@agentrq/acp-gateway` extends this same capability to any `--acp` compatible agent (e.g., Gemini CLI).
+Agent Client Protocol Gateway to remotely access your agents in AgentRQ.
 
 ## Overview
 
