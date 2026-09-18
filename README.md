@@ -1,6 +1,6 @@
 # @agentrq/acp-gateway
 
-ACP+MCP Bridge brings Experimentation Claude Notification Channels feature to all agents that supports Agent Client Protocol.
+ACP+MCP Bridge brings Claude Notification Channels feature to all agents that supports Agent Client Protocol.
 
 ## Overview
 
