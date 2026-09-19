@@ -108,6 +108,7 @@ import {
   type AgentIdentity,
 } from "./agentInfo.js";
 import {
+  availableKinds,
   describeAgents,
   fetchRegistry,
   findAgent,
@@ -1933,6 +1934,14 @@ export interface GatewayOptions {
   agentId?: string;
   /** Install a registry binary the registry publishes no checksum for. */
   allowUnverifiedAgent: boolean;
+  /**
+   * Machine-readable output for `--list-agents` and `--list-models`, instead
+   * of the tables meant for a terminal. Nothing else on the command line
+   * checks it: a caller parsing this output wants the shape it was written
+   * against to hold across releases, which a table meant for reading is never
+   * promised to do.
+   */
+  json: boolean;
   /** A different registry index, for pinning or for testing. */
   registryUrl?: string;
   /**
@@ -1954,6 +1963,7 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
     permissionTimeoutMs: DEFAULT_PERMISSION_TIMEOUT_MS,
     command: "run",
     allowUnverifiedAgent: false,
+    json: false,
     rest: [],
   };
 
@@ -2060,6 +2070,9 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
       case "--allow-unverified-agent":
         options.allowUnverifiedAgent = true;
         break;
+      case "--json":
+        options.json = true;
+        break;
       case "--registry-url":
         if (value) {
           options.registryUrl = value;
@@ -2095,13 +2108,31 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
 
 /**
  * Prints every agent the registry publishes, and how each one can be run here.
+ *
+ * `json` prints `{ agents: [{ id, name, runtimes }] }` instead — one array
+ * entry per agent, `runtimes` being what [availableKinds] says this machine
+ * can actually run it as, which is empty rather than omitted for an agent
+ * with no build for this platform.
  */
 export async function runListAgents(
   registryUrl?: string,
   fetchImpl: typeof fetch = fetch,
+  json = false,
 ): Promise<void> {
   const registry = await fetchRegistry(registryUrl, fetchImpl);
   const target = hostPlatformTarget();
+  if (json) {
+    console.log(
+      JSON.stringify({
+        agents: registry.agents.map((agent) => ({
+          id: agent.id,
+          name: agent.name,
+          runtimes: availableKinds(agent, target),
+        })),
+      }),
+    );
+    return;
+  }
   console.log(
     `ACP registry v${registry.version} — ${registry.agents.length} agents ` +
       `(this machine: ${target ?? `${process.platform}/${process.arch}, unsupported`})\n`,
@@ -2191,6 +2222,7 @@ export async function runAgentCommand(
   agentrqConfig: McpServerConfig,
   mcpBridge: MCPBridge,
   authMethodId?: string,
+  json = false,
 ): Promise<void> {
   const [cmd, ...cmdArgs] = acpCmdArgs;
   const agent = await openAgentConnection({
@@ -2237,7 +2269,23 @@ export async function runAgentCommand(
 
       try {
         const modelsResult = extractModels(sessionResult.configOptions);
-        if (modelsResult && modelsResult.models.length > 0) {
+        if (json) {
+          // Deliberately narrower than formatModelsText's grouping: a caller
+          // parsing this wants a flat list of what it can pass back as
+          // --model, not the "(High)"/"(Low)" section labels a person reads
+          // the table by.
+          console.log(
+            JSON.stringify({
+              agent: acpCmdArgs.join(" "),
+              models: (modelsResult?.models ?? []).map((m) => ({
+                id: m.id,
+                name: m.name,
+                description: m.description ?? "",
+                current: !!m.current,
+              })),
+            }),
+          );
+        } else if (modelsResult && modelsResult.models.length > 0) {
           console.log(formatModelsText(modelsResult, acpCmdArgs.join(" ")));
         } else if (
           agentCapabilities?.providers &&
@@ -2262,7 +2310,11 @@ export async function runAgentCommand(
         }
       } catch (err) {
         console.error(`[acp] Failed to extract models:`, err);
-        console.log(`No configurable models advertised by "${acpCmdArgs.join(" ")}".`);
+        if (json) {
+          console.log(JSON.stringify({ agent: acpCmdArgs.join(" "), models: [] }));
+        } else {
+          console.log(`No configurable models advertised by "${acpCmdArgs.join(" ")}".`);
+        }
       }
 
       await closeSession({
@@ -2315,6 +2367,8 @@ AGENT
   --list-agents               List every agent in the registry, and how each one
                               can run on this machine. Exits.
   --list-models               List models supported by the agent. Exits.
+  --json                      With --list-agents or --list-models, print
+                              machine-readable JSON instead of a table.
   --model <model-id>          Select a specific model for the session.
   --agent-info                What the agent says it supports — session
                               lifecycle, prompt content, MCP transports and
@@ -2391,7 +2445,7 @@ async function main() {
 
   // Listing the registry needs neither a workspace nor an agent.
   if (command === "list-agents") {
-    await runListAgents(options.registryUrl);
+    await runListAgents(options.registryUrl, undefined, options.json);
     process.exit(0);
   }
 
@@ -2403,7 +2457,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
+  if (!options.json) console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
 
   // 1. Load MCP Config
   const configs = loadMcpConfig(process.cwd(), options.mcpJsonPath);
@@ -2459,7 +2513,7 @@ async function main() {
   // actually needs to reach agentrq.
   if (command !== "run") {
     try {
-      await runAgentCommand(command, acpCmdArgs, agentrqConfig, mcpBridge, authMethodId);
+      await runAgentCommand(command, acpCmdArgs, agentrqConfig, mcpBridge, authMethodId, options.json);
     } finally {
       await mcpBridge.close();
     }

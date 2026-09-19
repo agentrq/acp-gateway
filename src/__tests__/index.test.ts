@@ -2598,6 +2598,7 @@ describe("index", () => {
         permissionTimeoutMs: 30 * 60_000,
         command: "run",
         allowUnverifiedAgent: false,
+        json: false,
         rest: [],
       });
     });
@@ -3110,6 +3111,23 @@ describe("index", () => {
 
       expect(fetchImpl).toHaveBeenCalledWith("http://localhost/registry.json");
     });
+
+    it("should print a single JSON line and nothing else when asked for JSON", async () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue({ ok: true, json: async () => registry });
+
+      await runListAgents(undefined, fetchImpl as any, true);
+
+      // Exactly one console.log call: a caller parsing this as JSON must not
+      // have to reassemble it out of several lines, or filter out the table
+      // this mode exists to replace.
+      const calls = logSpy.mock.calls;
+      logSpy.mockRestore();
+      expect(calls).toHaveLength(1);
+      expect(JSON.parse(calls[0][0])).toEqual({
+        agents: [{ id: "gemini", name: "Gemini CLI", runtimes: ["npx"] }],
+      });
+    });
   });
 
   describe("resolveAgentCommand", () => {
@@ -3118,6 +3136,7 @@ describe("index", () => {
       permissionTimeoutMs: 30 * 60_000,
       command: "run" as const,
       allowUnverifiedAgent: false,
+      json: false,
       rest: [],
       ...overrides,
     });
@@ -3277,6 +3296,77 @@ describe("index", () => {
       expect(spawnedAgents[0].kill).toHaveBeenCalled();
     });
 
+    it("should print models as a single JSON line when asked for JSON", async () => {
+      mockConnection({
+        newSession: vi.fn().mockResolvedValue({
+          sessionId: "m-sess",
+          configOptions: [
+            {
+              id: "model",
+              name: "Model",
+              type: "select",
+              currentValue: "claude-3-7-sonnet",
+              options: [
+                {
+                  value: "claude-3-7-sonnet",
+                  name: "Claude 3.7 Sonnet",
+                  description: "Balanced",
+                },
+                { value: "claude-3-5-haiku", name: "Claude 3.5 Haiku" },
+              ],
+            },
+          ],
+        }),
+      });
+
+      await runAgentCommand(
+        "list-models",
+        ["gemini", "--acp"],
+        agentrqConfig,
+        fakeBridge(),
+        undefined,
+        true,
+      );
+
+      // The most recent call, not the only one: logSpy is shared across this
+      // describe's tests (recreated on the same already-mocked console.log,
+      // which vitest hands back rather than a fresh spy each time), so
+      // earlier tests' output is still in its history. Nothing this call logs
+      // after its own JSON line, so the last entry is always this test's.
+      const lastLog = logSpy.mock.calls.at(-1)?.[0];
+      expect(JSON.parse(lastLog)).toEqual({
+        agent: "gemini --acp",
+        models: [
+          {
+            id: "claude-3-7-sonnet",
+            name: "Claude 3.7 Sonnet",
+            description: "Balanced",
+            current: true,
+          },
+          { id: "claude-3-5-haiku", name: "Claude 3.5 Haiku", description: "", current: false },
+        ],
+      });
+      expect(spawnedAgents[0].kill).toHaveBeenCalled();
+    });
+
+    it("should report an empty JSON model list rather than the free-text fallback", async () => {
+      mockConnection({
+        newSession: vi.fn().mockResolvedValue({ sessionId: "m-sess", configOptions: [] }),
+      });
+
+      await runAgentCommand(
+        "list-models",
+        ["gemini", "--acp"],
+        agentrqConfig,
+        fakeBridge(),
+        undefined,
+        true,
+      );
+
+      const lastLog = logSpy.mock.calls.at(-1)?.[0];
+      expect(JSON.parse(lastLog)).toEqual({ agent: "gemini --acp", models: [] });
+    });
+
     it("should list models from unstable_listProviders fallback", async () => {
       mockConnection({
         newSession: vi.fn().mockResolvedValue({ sessionId: "m-sess", configOptions: [] }),
@@ -3391,6 +3481,7 @@ describe("index", () => {
           "--allow-unverified-agent",
           "--registry-url",
           "--list-models",
+          "--json",
           "--model",
           "--list-auth-methods",
           "--login",
