@@ -11,6 +11,7 @@ import {
   logout,
   pickAuthMethod,
   promptForAuthMethod,
+  promptUrlElicitationOnTerminal,
   runAuthMethod,
   runTerminalAuth,
   supportsLogout,
@@ -202,6 +203,44 @@ describe("auth", () => {
       expect(createInterfaceMock).toHaveBeenCalledWith({
         input: process.stdin,
         output: process.stderr,
+      });
+      expect(close).toHaveBeenCalled();
+    });
+  });
+
+  describe("promptUrlElicitationOnTerminal", () => {
+    const request = {
+      message: "Sign in and enter code ABCD",
+      url: "https://auth.openai.com/codex/device",
+    };
+
+    it("accepts once the human says they are done", async () => {
+      const close = vi.fn();
+      const question = vi.fn().mockResolvedValue("");
+      createInterfaceMock.mockReturnValue({ question, close } as any);
+
+      const signal = new AbortController().signal;
+      await expect(promptUrlElicitationOnTerminal({ ...request, signal })).resolves.toEqual({
+        action: "accept",
+      });
+      expect(createInterfaceMock).toHaveBeenCalledWith({
+        input: process.stdin,
+        output: process.stderr,
+      });
+      expect(question).toHaveBeenCalledWith(expect.stringContaining("Press Enter"), { signal });
+      expect(close).toHaveBeenCalled();
+    });
+
+    it("cancels, without closing over a refusal, when the wait is aborted", async () => {
+      const close = vi.fn();
+      createInterfaceMock.mockReturnValue({
+        question: vi.fn().mockRejectedValue(Object.assign(new Error("aborted"), { name: "AbortError" })),
+        close,
+      } as any);
+
+      const signal = new AbortController().signal;
+      await expect(promptUrlElicitationOnTerminal({ ...request, signal })).resolves.toEqual({
+        action: "cancel",
       });
       expect(close).toHaveBeenCalled();
     });

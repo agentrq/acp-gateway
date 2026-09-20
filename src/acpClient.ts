@@ -313,6 +313,31 @@ function sliceLines(
   return content.slice(start, end);
 }
 
+/**
+ * Asks a human at this terminal to visit a URL, resolving once they say they
+ * are done (or once `signal` fires, when the agent stops needing an answer).
+ *
+ * Injected rather than imported so the client stays free of readline, and so
+ * the gateway can leave it out when there is no terminal to ask at.
+ */
+export type UrlElicitationPrompt = (request: {
+  message: string;
+  url: string;
+  signal: AbortSignal;
+}) => Promise<acp.CreateElicitationResponse>;
+
+/**
+ * Renders a url-mode elicitation for someone reading a terminal.
+ *
+ * The URL goes on a line of its own: an agent's `message` carries the part
+ * only a human can supply — codex-acp puts the one-time device code there —
+ * and says nothing about where to type it, so a log of the message alone
+ * leaves the reader with a code and nowhere to use it.
+ */
+export function formatUrlElicitation(message: string, url: string): string {
+  return `\n[auth] ${message}\n[auth] Open this URL to continue:\n\n    ${url}\n`;
+}
+
 export class AgentRQACPClient implements acp.Client {
   private replyBuffers = new Map<string, string>();
   // sessionId → reasoning accumulated since the last boundary. Thought tokens
@@ -340,7 +365,13 @@ export class AgentRQACPClient implements acp.Client {
   // verdict, so every unanswered request leaked one for the life of the process.
   private pendingPermissions = new Map<string, PendingPermission>();
 
+  // elicitationId → the terminal prompt still waiting on a human. Kept so an
+  // `elicitation/complete` can close a prompt whose answer the agent has
+  // stopped waiting for — a browser login that finished on its own, say.
+  private pendingUrlElicitations = new Map<string, AbortController>();
+
   private permissionTimeoutMs: number;
+  private promptUrlElicitation?: UrlElicitationPrompt;
   private cancelSession?: (sessionId: string) => unknown;
   private onModeChanged?: (sessionId: string, modeId: string) => unknown;
   // The name the workspace server is configured under. Fixed for the life of
@@ -350,10 +381,14 @@ export class AgentRQACPClient implements acp.Client {
   constructor(
     private mcpBridge: MCPBridge,
     private getTaskIdForSession: (sessionId: string) => string | undefined = () => undefined,
-    options: { permissionTimeoutMs?: number } = {},
+    options: {
+      permissionTimeoutMs?: number;
+      promptUrlElicitation?: UrlElicitationPrompt;
+    } = {},
   ) {
     this.workspaceServer = this.mcpBridge.getServerName?.();
     this.permissionTimeoutMs = options.permissionTimeoutMs ?? DEFAULT_PERMISSION_TIMEOUT_MS;
+    this.promptUrlElicitation = options.promptUrlElicitation;
     this.mcpBridge.on("verdict", this.onVerdict);
     this.mcpBridge.on("reconnected", this.onWorkspaceReconnected);
   }
@@ -1066,6 +1101,22 @@ export class AgentRQACPClient implements acp.Client {
     const sessionId = "sessionId" in params ? (params.sessionId as string) : undefined;
     let taskId = sessionId ? this.getTaskIdForSession(sessionId) : undefined;
 
+    // Logged before anything is routed anywhere, and whatever happens next:
+    // wherever the question ends up being answered, the URL is the one thing
+    // the human needs and the one thing nothing else prints.
+    if (params.mode === "url") {
+      const { url } = params as acp.ElicitationUrlMode;
+      console.error(formatUrlElicitation(params.message, url));
+
+      // A url elicitation with no task behind it is a login the human asked
+      // for at this terminal — `--login` reaches here before any session
+      // exists. Ask them where they are standing, rather than opening a task
+      // in a workspace panel they are not watching and timing out.
+      if (!taskId && this.promptUrlElicitation) {
+        return await this.askUrlOnTerminal(params as acp.ElicitationUrlMode & { message: string });
+      }
+    }
+
     if (!taskId) {
       // Request-scoped elicitations (e.g. during an auth/config phase before
       // any session exists) have no task to attach to, but the elicit tool
@@ -1157,7 +1208,40 @@ export class AgentRQACPClient implements acp.Client {
    * that clients ignore completion notices for elicitations they don't
    * still consider pending.
    */
-  async completeElicitation(_params: acp.CompleteElicitationNotification): Promise<void> {}
+  async completeElicitation(params: acp.CompleteElicitationNotification): Promise<void> {
+    const waiting = this.pendingUrlElicitations.get(params.elicitationId);
+    if (!waiting) return;
+    console.error(`[auth] The agent reports this login as finished.`);
+    waiting.abort();
+  }
+
+  /**
+   * Puts a url-mode elicitation to the human at this terminal.
+   *
+   * Registered by `elicitationId` for the length of the wait so that
+   * completeElicitation can close the prompt: the agent may resolve the login
+   * by itself — codex-acp races the browser against our answer — and without
+   * this the human would be left staring at a prompt nobody reads.
+   */
+  private async askUrlOnTerminal(
+    params: acp.ElicitationUrlMode & { message: string },
+  ): Promise<acp.CreateElicitationResponse> {
+    const controller = new AbortController();
+    const id = params.elicitationId;
+    if (id) this.pendingUrlElicitations.set(id, controller);
+    try {
+      return await this.promptUrlElicitation!({
+        message: params.message,
+        url: params.url,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      console.error(`[auth] Could not ask about the login at this terminal:`, err);
+      return { action: "cancel" };
+    } finally {
+      if (id) this.pendingUrlElicitations.delete(id);
+    }
+  }
 
   async writeTextFile(
     params: acp.WriteTextFileRequest
