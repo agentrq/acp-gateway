@@ -228,7 +228,14 @@ describe("progress", () => {
 
     it("pads over a longer previous line so no tail is left behind", () => {
       const stream = fakeStream();
-      const bar = createDownloadProgress({ label: "dl", stream, intervalMs: 0 });
+      // A held clock, so the rate the line carries cannot change between the
+      // two draws and make the second line the longer one.
+      const bar = createDownloadProgress({
+        label: "dl",
+        stream,
+        now: fakeClock().now,
+        intervalMs: 0,
+      });
 
       bar.update(1000, 1000);
       const first = stream.written[0].length;
