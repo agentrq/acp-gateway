@@ -12,6 +12,7 @@ import {
   drainPendingTasks,
   createSelfFillingTaskQueue,
   MAX_SKIPPED_FETCHES,
+  IDLE_TASK_POLL_INTERVAL_MS,
   freeSlots,
   resetPendingTaskDrain,
   mapMcpServers,
@@ -748,6 +749,86 @@ describe("index", () => {
       expect(bridge.callTool.mock.calls.length).toBeGreaterThanOrEqual(2);
       // And it still reports itself to the workspace, as before.
       expect(bridge.sendNotification).toHaveBeenCalled();
+      resetConcurrencyReports();
+      vi.restoreAllMocks();
+    });
+
+    it("keeps checking for work on an interval while idle, so a workspace with nothing at startup is not idle forever", async () => {
+      // Nothing ever runs in this test, so nothing frees a slot and the
+      // event-driven check (a task finishing) never fires. A fetch here can
+      // only be the idle timer.
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      resetPendingTaskDrain();
+      resetTaskTurns();
+      resetConcurrencyReports();
+      vi.useFakeTimers();
+
+      const bridge: any = {
+        callTool: vi.fn().mockResolvedValue({
+          isError: false,
+          content: [{ type: "text", text: "no pending tasks exist" }],
+        }),
+        sendNotification: vi.fn().mockResolvedValue(undefined),
+      };
+
+      createSelfFillingTaskQueue(1, bridge, {
+        acpCmdArgsOrConnection: [] as any,
+        configsOrSessionSwitcher: [] as any,
+        agentrqConfigOrAcpClient: {} as any,
+      });
+
+      expect(bridge.callTool).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(IDLE_TASK_POLL_INTERVAL_MS);
+      expect(bridge.callTool).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(IDLE_TASK_POLL_INTERVAL_MS);
+      expect(bridge.callTool).toHaveBeenCalledTimes(2);
+
+      vi.useRealTimers();
+      resetConcurrencyReports();
+      vi.restoreAllMocks();
+    });
+
+    it("skips the idle check while a task is still running", async () => {
+      // A running task will free its own slot and trigger the event-driven
+      // check when it finishes, so the idle timer firing in the meantime has
+      // nothing to do here.
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      resetPendingTaskDrain();
+      resetTaskTurns();
+      resetConcurrencyReports();
+      vi.useFakeTimers();
+
+      const bridge: any = {
+        callTool: vi.fn().mockResolvedValue({
+          isError: false,
+          content: [{ type: "text", text: "no pending tasks exist" }],
+        }),
+        sendNotification: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const queue = createSelfFillingTaskQueue(1, bridge, {
+        acpCmdArgsOrConnection: [] as any,
+        configsOrSessionSwitcher: [] as any,
+        agentrqConfigOrAcpClient: {} as any,
+      });
+
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      void queue.run(() => held);
+
+      await vi.advanceTimersByTimeAsync(IDLE_TASK_POLL_INTERVAL_MS);
+      expect(bridge.callTool).not.toHaveBeenCalled();
+
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+
+      vi.useRealTimers();
       resetConcurrencyReports();
       vi.restoreAllMocks();
     });
