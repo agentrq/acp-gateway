@@ -1079,12 +1079,192 @@ describe("AgentRQACPClient", () => {
     });
   });
 
+  describe("url elicitations at the terminal", () => {
+    const urlParams = {
+      mode: "url",
+      elicitationId: "oauth-1",
+      url: "https://auth.openai.com/codex/device",
+      message: "Sign in to ChatGPT and enter this code: N8TX-6RKPJ",
+    } as any;
+
+    it("should log the URL itself, not just the message", async () => {
+      const getTaskId = vi.fn().mockReturnValue("task-123");
+      const clientWithTaskId = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, getTaskId);
+      mcpBridge.callTool.mockResolvedValue({
+        content: [{ type: "text", text: JSON.stringify({ action: "accept" }) }],
+      });
+      const logged: string[] = [];
+      const spy = vi.spyOn(console, "error").mockImplementation((...args) => {
+        logged.push(args.join(" "));
+      });
+
+      try {
+        await clientWithTaskId.createElicitation({ ...urlParams, sessionId: "sess-1" });
+      } finally {
+        spy.mockRestore();
+      }
+
+      const banner = logged.join("\n");
+      expect(banner).toContain("https://auth.openai.com/codex/device");
+      expect(banner).toContain("N8TX-6RKPJ");
+    });
+
+    it("should ask at the terminal instead of creating a task when there is no session", async () => {
+      const promptUrlElicitation = vi.fn().mockResolvedValue({ action: "accept" });
+      const terminalClient = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+        { promptUrlElicitation },
+      );
+
+      const response = await terminalClient.createElicitation(urlParams);
+
+      expect(response).toEqual({ action: "accept" });
+      expect(promptUrlElicitation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: urlParams.url,
+          message: urlParams.message,
+          signal: expect.any(AbortSignal),
+        }),
+      );
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+    });
+
+    it("should still use the workspace when a session already has a task", async () => {
+      const promptUrlElicitation = vi.fn().mockResolvedValue({ action: "accept" });
+      const sessionClient = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => "task-123",
+        { promptUrlElicitation },
+      );
+      mcpBridge.callTool.mockResolvedValue({
+        content: [{ type: "text", text: JSON.stringify({ action: "accept" }) }],
+      });
+
+      await sessionClient.createElicitation({ ...urlParams, sessionId: "sess-1" });
+
+      expect(promptUrlElicitation).not.toHaveBeenCalled();
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("elicit", {
+        taskId: "task-123",
+        message: urlParams.message,
+        mode: "url",
+        url: urlParams.url,
+      });
+    });
+
+    it("should create a task when there is no session and no terminal to ask at", async () => {
+      mcpBridge.callTool.mockImplementation(async (name: string) => {
+        if (name === "createTask") return { content: [{ type: "text", text: "id=T-1" }] };
+        if (name === "updateTaskStatus") return { content: [{ type: "text", text: "ok" }] };
+        return { content: [{ type: "text", text: JSON.stringify({ action: "accept" }) }] };
+      });
+
+      const response = await client.createElicitation(urlParams);
+
+      expect(response).toEqual({ action: "accept" });
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("createTask", expect.any(Object));
+    });
+
+    it("should cancel when the terminal prompt itself fails", async () => {
+      const promptUrlElicitation = vi.fn().mockRejectedValue(new Error("stdin is gone"));
+      const terminalClient = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+        { promptUrlElicitation },
+      );
+
+      const response = await terminalClient.createElicitation(urlParams);
+
+      expect(response).toEqual({ action: "cancel" });
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+    });
+
+    it("should prompt even for an elicitation the agent gave no id to", async () => {
+      const promptUrlElicitation = vi.fn().mockResolvedValue({ action: "accept" });
+      const terminalClient = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+        { promptUrlElicitation },
+      );
+
+      const { elicitationId: _omitted, ...withoutId } = urlParams;
+      const response = await terminalClient.createElicitation(withoutId as any);
+
+      expect(response).toEqual({ action: "accept" });
+      expect(promptUrlElicitation).toHaveBeenCalled();
+    });
+
+    it("should cancel a form-mode elicitation at the terminal rather than prompting for a URL", async () => {
+      const promptUrlElicitation = vi.fn();
+      const terminalClient = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+        { promptUrlElicitation },
+      );
+      mcpBridge.callTool.mockImplementation(async (name: string) => {
+        if (name === "createTask") return { content: [{ type: "text", text: "id=T-1" }] };
+        if (name === "updateTaskStatus") return { content: [{ type: "text", text: "ok" }] };
+        return { content: [{ type: "text", text: JSON.stringify({ action: "accept" }) }] };
+      });
+
+      await terminalClient.createElicitation({
+        mode: "form",
+        message: "Name?",
+        requestedSchema: { type: "object", properties: {} },
+      } as any);
+
+      expect(promptUrlElicitation).not.toHaveBeenCalled();
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("createTask", expect.any(Object));
+    });
+  });
+
   describe("completeElicitation", () => {
     it("should resolve without side effects", async () => {
       await expect(
         client.completeElicitation({ elicitationId: "oauth-1" } as any)
       ).resolves.toBeUndefined();
       expect(mcpBridge.callTool).not.toHaveBeenCalled();
+    });
+
+    it("should abort a terminal prompt the agent no longer needs an answer to", async () => {
+      let seenSignal: AbortSignal | undefined;
+      const promptUrlElicitation = vi.fn(
+        ({ signal }: { signal: AbortSignal }) =>
+          new Promise<any>((resolve) => {
+            seenSignal = signal;
+            signal.addEventListener("abort", () => resolve({ action: "cancel" }));
+          }),
+      );
+      const terminalClient = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+        { promptUrlElicitation },
+      );
+
+      const pending = terminalClient.createElicitation({
+        mode: "url",
+        elicitationId: "oauth-1",
+        url: "https://example.com/device",
+        message: "Enter code ABCD",
+      } as any);
+
+      await vi.waitFor(() => expect(seenSignal).toBeDefined());
+      await terminalClient.completeElicitation({ elicitationId: "oauth-1" } as any);
+
+      await expect(pending).resolves.toEqual({ action: "cancel" });
+    });
+
+    it("should ignore a completion for an elicitation it is not waiting on", async () => {
+      const promptUrlElicitation = vi.fn().mockResolvedValue({ action: "accept" });
+      const terminalClient = new AgentRQACPClient(
+        mcpBridge as unknown as MCPBridge,
+        () => undefined,
+        { promptUrlElicitation },
+      );
+
+      await expect(
+        terminalClient.completeElicitation({ elicitationId: "unknown" } as any),
+      ).resolves.toBeUndefined();
     });
   });
 

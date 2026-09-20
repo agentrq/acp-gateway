@@ -151,6 +151,34 @@ export async function promptForAuthMethod(
 }
 
 /**
+ * Waits at the terminal while the human completes a login in a browser.
+ *
+ * The URL and whatever the agent asked them to carry to it — a device code,
+ * usually — are already on screen by the time this runs; all that is left is
+ * to know when they are done. `signal` fires when the agent answers that
+ * question for itself, which the browser flows generally do.
+ */
+export async function promptUrlElicitationOnTerminal({
+  signal,
+}: {
+  message: string;
+  url: string;
+  signal: AbortSignal;
+}): Promise<{ action: "accept" | "cancel" }> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    await rl.question(`[auth] Press Enter once you have finished signing in: `, { signal });
+    return { action: "accept" };
+  } catch {
+    // Either the agent finished the login without us (signal) or stdin closed.
+    // Both mean "stop waiting"; neither means the human refused.
+    return { action: "cancel" };
+  } finally {
+    rl.close();
+  }
+}
+
+/**
  * Runs a `terminal` login by re-launching the configured agent interactively.
  *
  * The protocol has the client reproduce its own agent invocation with the

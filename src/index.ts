@@ -96,6 +96,7 @@ import {
   isAuthRequiredError,
   login,
   logout,
+  promptUrlElicitationOnTerminal,
   supportsLogout,
   type AuthConnection,
   type LoginOptions,
@@ -708,6 +709,10 @@ export async function openAgentConnection({
   let currentTaskId = taskId;
   const acpClient = new AgentRQACPClient(mcpBridge, () => currentTaskId, {
     permissionTimeoutMs: permissionConfig.timeoutMs,
+    // A login URL that arrives before any session belongs to whoever asked for
+    // the login, and at a terminal that is the person reading it — so only
+    // offer the terminal prompt when there is a terminal to read it at.
+    promptUrlElicitation: isInteractiveTerminal() ? promptUrlElicitationOnTerminal : undefined,
   });
 
   // Guard against unhandled child-process failures. Without these listeners a
