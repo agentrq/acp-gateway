@@ -2938,6 +2938,17 @@ export function resetPendingTaskDrain(): void {
 export const MAX_SKIPPED_FETCHES = 3;
 
 /**
+ * How often the self-filling queue checks for work on its own while idle.
+ *
+ * The event-driven path above covers a task finishing and freeing a slot, but
+ * a queue with nothing active has no such event to wait for — a workspace
+ * empty at startup, or one that drained to empty and stayed there, would
+ * otherwise never be asked again. This is the fallback for exactly that gap,
+ * not a replacement for the event-driven check.
+ */
+export const IDLE_TASK_POLL_INTERVAL_MS = 40_000;
+
+/**
  * Fills every free slot the queue has with work from the workspace.
  *
  * The gateway used to ask for exactly one task, once, at startup — which was
@@ -3046,6 +3057,13 @@ export function createSelfFillingTaskQueue(
   const queue: TaskQueue = createTaskQueue(maxConcurrency, mcpBridge, () => {
     void drainPendingTasks(mcpBridge, queue, { ...deps, taskQueue: queue });
   });
+  // Only while idle: a task running (or waiting) will itself free a slot and
+  // trigger the check above, so a tick that found active work would just be
+  // asking the workspace something the event-driven path already has covered.
+  setInterval(() => {
+    if (queue.getActiveCount() > 0) return;
+    void drainPendingTasks(mcpBridge, queue, { ...deps, taskQueue: queue });
+  }, IDLE_TASK_POLL_INTERVAL_MS).unref();
   return queue;
 }
 
