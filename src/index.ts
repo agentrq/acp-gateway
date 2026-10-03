@@ -7,6 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { Writable, Readable } from "node:stream";
 import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
@@ -2215,6 +2216,73 @@ export function assertAgentRunnable(command: string, usedRegistryId: boolean): v
 }
 
 /**
+ * Commands that only ask the agent about itself. None of them hands the agent
+ * a workspace or reports to one, so none should refuse to run for want of a
+ * .mcp.json — `--list-models` is how someone picks a model before they have
+ * set a workspace up at all.
+ */
+export const WORKSPACE_OPTIONAL_COMMANDS: ReadonlySet<GatewayCommand> = new Set([
+  "list-models",
+  "agent-info",
+  "list-auth-methods",
+]);
+
+/** The workspace a command runs against: its servers, and the one to report to. */
+export interface Workspace {
+  configs: McpServerConfig[];
+  agentrqConfig: McpServerConfig;
+  mcpBridge: MCPBridge;
+}
+
+/**
+ * Stands in for the workspace when there is none.
+ *
+ * Whatever the agent asks of it fails, which the ACP client already treats as
+ * the workspace being unreachable: a stray elicitation is cancelled rather than
+ * left waiting on a panel nobody has. A url elicitation at a terminal still
+ * reaches the person there, since that never goes near the workspace.
+ */
+export function createDetachedBridge(): MCPBridge {
+  const bridge: any = new EventEmitter();
+  const noWorkspace = async () => {
+    throw new Error("No agentrq workspace is configured");
+  };
+  bridge.callTool = noWorkspace;
+  bridge.sendNotification = noWorkspace;
+  bridge.getSessionId = () => undefined;
+  bridge.getServerName = () => undefined;
+  bridge.getAdvertisedTools = () => undefined;
+  bridge.close = async () => {};
+  return bridge as MCPBridge;
+}
+
+/**
+ * Finds the workspace a command needs.
+ *
+ * Anything that runs tasks needs one, and fails without it. A command that only
+ * asks the agent about itself does not go looking for one: a .mcp.json that is
+ * missing, or broken, has nothing to do with which models the agent offers.
+ * `--mcp-json` is still honoured there, since someone named it on purpose — to
+ * have a login the agent asks for show up in that workspace, say.
+ */
+export function loadWorkspace(
+  command: GatewayCommand,
+  mcpJsonPath: string | undefined,
+  startDir: string = process.cwd(),
+): Workspace {
+  if (WORKSPACE_OPTIONAL_COMMANDS.has(command) && mcpJsonPath === undefined) {
+    return {
+      configs: [],
+      agentrqConfig: { name: "none", type: "http", env: {} },
+      mcpBridge: createDetachedBridge(),
+    };
+  }
+  const configs = loadMcpConfig(startDir, mcpJsonPath);
+  const agentrqConfig = pickAgentrqServer(configs);
+  return { configs, agentrqConfig, mcpBridge: new MCPBridge(agentrqConfig) };
+}
+
+/**
  * Runs a one-shot command against the agent and shuts it down again.
  *
  * These commands exist so a login — or a look at what the agent supports — can
@@ -2422,7 +2490,8 @@ EXAMPLES
 
 The workspace comes from .mcp.json, searched for in the current directory and up
 to three directories above it. --mcp-json names one directly, wherever it lives
-and whatever it is called.`;
+and whatever it is called. --list-models, --agent-info and --list-auth-methods
+do not need a workspace, and only read one named with --mcp-json.`;
 }
 
 export function printHelp(): void {
@@ -2464,9 +2533,9 @@ async function main() {
 
   if (!options.json) console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
 
-  // 1. Load MCP Config
-  const configs = loadMcpConfig(process.cwd(), options.mcpJsonPath);
-  const agentrqConfig = pickAgentrqServer(configs);
+  // 1. Load MCP Config — optional for the commands that only ask the agent
+  // about itself.
+  const { configs, agentrqConfig, mcpBridge } = loadWorkspace(command, options.mcpJsonPath);
 
   // 2. Work out what actually starts the agent — a registry id, or the command
   // the user gave.
@@ -2494,9 +2563,6 @@ async function main() {
   authConfig.methodId = authMethodId;
   modelConfig.modelId = options.modelId;
   permissionConfig.timeoutMs = options.permissionTimeoutMs;
-
-  // 3. Initialize MCP Bridge
-  const mcpBridge = new MCPBridge(agentrqConfig);
 
   // What running a task fetched from the workspace takes, in the shape the
   // gateway's own path uses: a command to open a session from.

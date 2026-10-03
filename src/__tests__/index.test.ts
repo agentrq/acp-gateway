@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Writable, Readable } from "node:stream";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -50,6 +50,9 @@ import {
   enforceHumanApprovalMode,
   handleAgentModeChange,
   runAgentCommand,
+  loadWorkspace,
+  createDetachedBridge,
+  WORKSPACE_OPTIONAL_COMMANDS,
   findActiveSession,
   handleTaskCancellation,
   handleSetModel,
@@ -3313,6 +3316,111 @@ describe("index", () => {
     });
   });
 
+  describe("loadWorkspace", () => {
+    let errorSpy: any;
+
+    beforeEach(() => {
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      errorSpy.mockRestore();
+    });
+
+    /** A directory with no .mcp.json in it or in the three above it. */
+    function emptyWorkspaceDir(): string {
+      const root = mkdtempSync(join(tmpdir(), "acp-gw-noworkspace-"));
+      const dir = join(root, "a", "b", "c", "d");
+      mkdirSync(dir, { recursive: true });
+      return dir;
+    }
+
+    function writeMcpJson(dir: string, name = ".mcp.json"): string {
+      const file = join(dir, name);
+      writeFileSync(
+        file,
+        JSON.stringify({ mcpServers: { "agentrq-ws": { type: "http", url: "http://localhost:1/mcp" } } }),
+      );
+      return file;
+    }
+
+    it("should name the commands that only ask the agent about itself", () => {
+      expect([...WORKSPACE_OPTIONAL_COMMANDS].sort()).toEqual(
+        ["agent-info", "list-auth-methods", "list-models"],
+      );
+    });
+
+    it.each(["list-models", "agent-info", "list-auth-methods"] as const)(
+      "should let --%s run without a .mcp.json",
+      (command) => {
+        const workspace = loadWorkspace(command, undefined, emptyWorkspaceDir());
+
+        expect(workspace.configs).toEqual([]);
+        expect(workspace.agentrqConfig.env).toEqual({});
+        expect(workspace.mcpBridge.getSessionId()).toBeUndefined();
+      },
+    );
+
+    it("should not read a .mcp.json that is there, when the command does not need it", () => {
+      const dir = emptyWorkspaceDir();
+      // Broken on purpose: had it been read, this would throw.
+      writeFileSync(join(dir, ".mcp.json"), "{ not json");
+
+      expect(loadWorkspace("list-models", undefined, dir).configs).toEqual([]);
+    });
+
+    it("should still use a config named with --mcp-json", () => {
+      const file = writeMcpJson(emptyWorkspaceDir(), "servers.json");
+
+      const workspace = loadWorkspace("list-models", file, emptyWorkspaceDir());
+
+      expect(workspace.agentrqConfig.name).toBe("agentrq-ws");
+      expect(workspace.mcpBridge.getServerName()).toBe("agentrq-ws");
+    });
+
+    it("should still report a --mcp-json path that is wrong", () => {
+      expect(() =>
+        loadWorkspace("list-models", "/nowhere/servers.json", emptyWorkspaceDir()),
+      ).toThrow();
+    });
+
+    it.each(["run", "login", "logout"] as const)(
+      "should still require a .mcp.json to %s",
+      (command) => {
+        expect(() => loadWorkspace(command, undefined, emptyWorkspaceDir())).toThrow(
+          "Could not find .mcp.json",
+        );
+      },
+    );
+
+    it("should connect running tasks to the workspace it finds", () => {
+      const dir = emptyWorkspaceDir();
+      writeMcpJson(dir);
+
+      const workspace = loadWorkspace("run", undefined, dir);
+
+      expect(workspace.configs.map((c) => c.name)).toEqual(["agentrq-ws"]);
+      expect(workspace.mcpBridge.getServerName()).toBe("agentrq-ws");
+    });
+  });
+
+  describe("createDetachedBridge", () => {
+    it("should fail whatever is asked of the workspace, and close quietly", async () => {
+      const bridge = createDetachedBridge();
+
+      await expect(bridge.callTool("elicit", {})).rejects.toThrow(
+        "No agentrq workspace is configured",
+      );
+      await expect(bridge.sendNotification("notifications/x", {})).rejects.toThrow(
+        "No agentrq workspace is configured",
+      );
+      expect(bridge.getSessionId()).toBeUndefined();
+      expect(bridge.getServerName()).toBeUndefined();
+      expect(bridge.getAdvertisedTools()).toBeUndefined();
+      await expect(bridge.close()).resolves.toBeUndefined();
+    });
+  });
+
   describe("runAgentCommand", () => {
     const agentrqConfig: any = { env: {} };
     let logSpy: any;
@@ -3374,6 +3482,33 @@ describe("index", () => {
       expect(printed).toContain("Models supported by \"gemini --acp\":");
       expect(printed).toContain("claude-3-7-sonnet");
       expect(printed).toContain("Claude 3.7 Sonnet");
+      expect(spawnedAgents[0].kill).toHaveBeenCalled();
+    });
+
+    it("should list models with no workspace behind it", async () => {
+      mockConnection({
+        newSession: vi.fn().mockResolvedValue({
+          sessionId: "m-sess",
+          configOptions: [
+            {
+              id: "model",
+              name: "Model",
+              type: "select",
+              currentValue: "gemini-pro",
+              options: [{ value: "gemini-pro", name: "Gemini Pro" }],
+            },
+          ],
+        }),
+      });
+
+      await runAgentCommand(
+        "list-models",
+        ["gemini", "--acp"],
+        { name: "none", type: "http", env: {} },
+        createDetachedBridge(),
+      );
+
+      expect(logSpy.mock.calls.flat().join("\n")).toContain("gemini-pro");
       expect(spawnedAgents[0].kill).toHaveBeenCalled();
     });
 
