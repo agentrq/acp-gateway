@@ -28,6 +28,7 @@ import {
   type Registry,
   type RegistryAgent,
 } from "./registry.js";
+import { debug } from "./log.js";
 
 /**
  * Where downloaded agents live, unless overridden.
@@ -316,7 +317,7 @@ export async function installBinaryAgent({
   };
 
   if (existsSync(executable)) {
-    console.error(`[registry] Using cached ${agent.id} ${agent.version} from ${dir}`);
+    debug(`[registry] Using cached ${agent.id} ${agent.version} from ${dir}`);
     return spec;
   }
 

@@ -62,7 +62,7 @@ export function mapMcpServers(
         return false;
       }
       if (support === "unstated") {
-        console.error(
+        debug(
           `[acp] MCP server "${cfg.name}" is ${cfg.type}, which the agent does not ` +
             `advertise either way — passing it and letting the agent decide.`,
         );
@@ -132,6 +132,7 @@ import {
   normalizeConcurrency,
   sendConcurrencyNotification,
 } from "./concurrency.js";
+import { announceFinished, announceTask, debug, setVerbose } from "./log.js";
 
 const lastTaskContent = new Map<string, string>();
 
@@ -241,7 +242,7 @@ export async function runTurnForTask(
 
   const previous = taskTurns.get(taskId);
   if (previous) {
-    console.error(
+    debug(
       `[bridge] Task ${taskId} is already mid-turn; waiting for it rather than ` +
         `prompting the same session twice at once`,
     );
@@ -402,7 +403,7 @@ export async function closeAllSessions(
   const sessions = Array.from(new Set(activeSessions.values()));
   activeSessions.clear();
   if (sessions.length > 0) {
-    console.error(`[acp] Cleanly closing ${sessions.length} active session(s)...`);
+    debug(`[acp] Cleanly closing ${sessions.length} active session(s)...`);
     // Their processes are ended by closeSession; dropping them here keeps the
     // count below honest about what is actually being left behind.
     for (const session of sessions) forgetAgentProcess(session.process);
@@ -416,7 +417,7 @@ export async function closeAllSessions(
   const stragglers = Array.from(liveAgentProcesses);
   liveAgentProcesses.clear();
   if (stragglers.length === 0) return;
-  console.error(
+  debug(
     `[acp] Ending ${stragglers.length} agent process(es) that never opened a session...`,
   );
   for (const child of stragglers) {
@@ -694,10 +695,10 @@ export async function openAgentConnection({
   onExit,
 }: OpenAgentConnectionOptions): Promise<AgentConnection> {
   const [cmd, ...cmdArgs] = acpCmdArgs;
-  console.error(`[acp] Spawning agent for ${label}: ${cmd} ${cmdArgs.join(" ")}`);
+  debug(`[acp] Spawning agent for ${label}: ${cmd} ${cmdArgs.join(" ")}`);
 
   const target = spawnTarget(cmd);
-  if (target !== cmd) console.error(`[acp] Resolved "${cmd}" to ${target}`);
+  if (target !== cmd) debug(`[acp] Resolved "${cmd}" to ${target}`);
   const agentProcess = spawn(...spawnArgsFor(target, cmdArgs), {
     stdio: ["pipe", "pipe", "inherit"],
     env: { ...process.env, ...env },
@@ -783,11 +784,11 @@ export async function openAgentConnection({
     },
   });
 
-  console.error(
+  debug(
     `[acp] Connected to agent for ${label} (protocol v${initResult.protocolVersion})`,
   );
   if (initResult.authMethods?.length) {
-    console.error(
+    debug(
       `[auth] Agent offers these login methods:\n${describeAuthMethods(initResult.authMethods)}`,
     );
   }
@@ -870,7 +871,7 @@ export async function getOrCreateSession(
   // caller wants a session for this task, not a session of its own.
   const pending = sessionsInFlight.get(sessionKey);
   if (pending) {
-    console.error(
+    debug(
       `[acp] A session for ${taskId ? `task ${taskId}` : "the idle session"} is ` +
         `already being opened; waiting for it rather than spawning a second agent`,
     );
@@ -918,7 +919,7 @@ async function createSession(
     const idle = activeSessions.get(IDLE_SESSION_KEY);
     if (idle) {
       idle.adopt(taskId);
-      console.error(`[acp] Task ${taskId} took over the session opened at startup`);
+      debug(`[acp] Task ${taskId} took over the session opened at startup`);
       const lastModels = idle.acpClient.lastModelsFor(idle.sessionId);
       if (lastModels) {
         void idle.acpClient.sendModelsToWorkspace(idle.sessionId, lastModels);
@@ -966,7 +967,7 @@ async function createSession(
     preferredId: authConfig.methodId,
     interactive: isInteractiveTerminal(),
   });
-  console.error(
+  debug(
     `[acp] Created session ${sessionResult.sessionId} for ${taskId ? `task ${taskId}` : "the idle session"}`,
   );
 
@@ -1347,7 +1348,7 @@ export async function handleSetModel(
     return;
   }
 
-  console.error(
+  debug(
     `[bridge] Switching session ${session.sessionId} to model "${modelId}"`,
   );
   await applyModelSelection({
@@ -1645,7 +1646,7 @@ export async function enforceHumanApprovalMode(
 
   try {
     await connection.setSessionMode({ sessionId: sessionResult.sessionId, modeId });
-    console.error(
+    debug(
       `[acp] Session mode set to "${modeId}" (was "${modes.currentModeId}") so tool calls require agentrq approval`,
     );
   } catch (err) {
@@ -1745,7 +1746,7 @@ export function createAcpSessionSwitcher(
       currentSessionId = next.sessionId;
       taskSessionMap.set(taskId, currentSessionId);
       sessionTaskMap.set(currentSessionId, taskId);
-      console.error(
+      debug(
         `[acp] New ACP session for task ${taskId} (MCP connection unchanged): ${currentSessionId}`,
       );
       return currentSessionId;
@@ -1948,6 +1949,12 @@ export interface GatewayOptions {
    * promised to do.
    */
   json: boolean;
+  /**
+   * Print the gateway's working — connections, notifications, sessions, file
+   * access, tool calls and the agent's streamed answer. Without it only what
+   * the gateway is asked, what it waits on, how each turn ends, and errors.
+   */
+  verbose: boolean;
   /** A different registry index, for pinning or for testing. */
   registryUrl?: string;
   /**
@@ -1970,6 +1977,7 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
     command: "run",
     allowUnverifiedAgent: false,
     json: false,
+    verbose: false,
     rest: [],
   };
 
@@ -2079,6 +2087,9 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
       case "--json":
         options.json = true;
         break;
+      case "--verbose":
+        options.verbose = true;
+        break;
       case "--registry-url":
         if (value) {
           options.registryUrl = value;
@@ -2169,7 +2180,7 @@ export async function resolveAgentCommand(
     allowUnverified: options.allowUnverifiedAgent,
     fetchImpl,
   });
-  console.error(
+  debug(
     `[registry] Running "${options.agentId}" via ${spec.kind}: ${spec.command} ${spec.args.join(" ")}`,
   );
 
@@ -2475,6 +2486,11 @@ BRIDGE
                               servers win where the names collide.
 
 OTHER
+  --verbose                   Print everything the gateway does: connections,
+                              notifications, sessions, file access, tool calls
+                              and the agent's answer as it streams. Without it,
+                              only each task asked of it, permission requests,
+                              how each task ended, and errors.
   --help, -h                  Show this help. Exits.
 
 EXAMPLES
@@ -2511,6 +2527,7 @@ async function main() {
     cmdStartIndex !== -1 ? args.slice(cmdStartIndex + 1) : options.rest;
 
   const { maxConcurrency, command, authMethodId } = options;
+  setVerbose(options.verbose);
 
   if (command === "help") {
     printHelp();
@@ -2627,14 +2644,12 @@ async function main() {
       const taskId = extractTaskIdFromMeta(meta);
       if (taskId) {
         if (lastTaskContent.get(taskId) === content) {
-          console.log(`[bridge] Dropping repetitive task notification for ${taskId}`);
+          debug(`[bridge] Dropping repetitive task notification for ${taskId}`);
           return;
         }
         lastTaskContent.set(taskId, content);
       }
-      console.error(
-        "\n[bridge] Incoming task from MCP server. Forwarding to ACP agent...",
-      );
+      announceTask(content, taskId);
       const queuedSeq = nextTaskSeq();
       // Behind any turn already running for this task, and behind it *before*
       // asking for a queue slot: one session takes one turn at a time, and two
@@ -2677,9 +2692,7 @@ async function main() {
               sessionInfo.sessionId,
               result.stopReason,
             );
-            console.error(
-              `\n[acp] Agent completed task. Reason: ${result.stopReason}`,
-            );
+            announceFinished(taskId, result.stopReason);
           } catch (err) {
             console.error("[acp] Error during prompt execution:", err);
           }
@@ -2827,7 +2840,7 @@ export type FetchOutcome =
 export async function fetchNextTask(
   mcpBridge: MCPBridge,
 ): Promise<FetchOutcome> {
-  console.error("[bridge] Checking for next task via MCP server...");
+  debug("[bridge] Checking for next task via MCP server...");
   // Stamped before the fetch, so a cancel that arrives while `getTask` is in
   // flight (or while the session is being opened) still stops the task.
   const queuedSeq = nextTaskSeq();
@@ -2849,7 +2862,7 @@ export async function fetchNextTask(
       !content.text ||
       content.text.includes("no pending tasks exist")
     ) {
-      console.error("[bridge] No pending tasks available.");
+      debug("[bridge] No pending tasks available.");
       return { status: "empty" };
     }
 
@@ -2857,14 +2870,12 @@ export async function fetchNextTask(
     const taskId = extractTaskIdFromText(text);
     if (taskId) {
       if (lastTaskContent.get(taskId) === text) {
-        console.log(`[bridge] Dropping repetitive checked task for ${taskId}`);
+        debug(`[bridge] Dropping repetitive checked task for ${taskId}`);
         return { status: "skipped" };
       }
       lastTaskContent.set(taskId, text);
     }
-    console.error(
-      `[bridge] Found task: "${text.slice(0, 50).replace(/\n/g, " ")}..."`,
-    );
+    announceTask(text, taskId);
     return { status: "task", task: { text, taskId, queuedSeq } };
   } catch (err) {
     console.error("[bridge] Failed to check for next task:", err);
@@ -2947,7 +2958,7 @@ export async function startPendingTask(
 
     await acpClientToUse!.flushReply(sessionIdToUse!);
     await acpClientToUse!.reportStopReason(sessionIdToUse!, promptResult.stopReason);
-    console.error(`\n[acp] Agent completed with: ${promptResult.stopReason}`);
+    announceFinished(taskId, promptResult.stopReason);
   };
 
   // Serialised against any turn already running for this task, for the

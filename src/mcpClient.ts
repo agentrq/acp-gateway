@@ -12,6 +12,7 @@ import { z } from "zod";
 import type { McpServerConfig } from "./config.js";
 import { extractTaskIdFromMeta } from "./taskIdentity.js";
 import { SET_CONCURRENCY_NOTIFICATION_METHOD } from "./concurrency.js";
+import { debug } from "./log.js";
 
 export class MCPBridge extends EventEmitter {
   private client: Client | null = null;
@@ -64,7 +65,7 @@ export class MCPBridge extends EventEmitter {
     try {
       const { tools } = await this.client!.listTools();
       this.advertisedTools = new Set(tools.map((t) => t.name));
-      console.error(
+      debug(
         `[mcp] ${this.config.name} advertises ${this.advertisedTools.size} tool(s)`,
       );
     } catch (err: any) {
@@ -98,7 +99,11 @@ export class MCPBridge extends EventEmitter {
       try {
         await this._connectOnce();
         this.isConnected = true;
-        console.error(`[mcp] Connected to ${this.config.name}`);
+        // A first connection is routine; coming back after a lost one is
+        // worth saying, since the loss itself was reported.
+        (this.hasConnected ? console.error : debug)(
+          `[mcp] Connected to ${this.config.name}`,
+        );
         if (this.hasConnected) {
           // agentrq routes a permission verdict to the MCP session its request
           // arrived on, and reconnecting mints a new one — so anything already
@@ -190,7 +195,7 @@ export class MCPBridge extends EventEmitter {
         }),
       }),
       (notification) => {
-        console.error("[mcp] Received channel notification");
+        debug("[mcp] Received channel notification");
         const { content, meta } = notification.params;
         this.emit("task", { content, meta });
       },
@@ -206,7 +211,7 @@ export class MCPBridge extends EventEmitter {
         }),
       }),
       (notification) => {
-        console.error("[mcp] Received permission verdict");
+        debug("[mcp] Received permission verdict");
         const { request_id, behavior } = notification.params;
         this.emit("verdict", { requestId: request_id, behavior });
       },
@@ -228,7 +233,7 @@ export class MCPBridge extends EventEmitter {
           .optional(),
       }),
       (notification) => {
-        console.error("[mcp] Received task cancellation notification");
+        debug("[mcp] Received task cancellation notification");
         const params = notification.params ?? {};
         const taskId =
           params.task_id ||
@@ -256,7 +261,7 @@ export class MCPBridge extends EventEmitter {
           .optional(),
       }),
       (notification) => {
-        console.error("[mcp] Received model selection notification");
+        debug("[mcp] Received model selection notification");
         // Both spellings accepted, like the cancel handler above. The workspace
         // sends snake_case — that is the wire format of this whole channel —
         // but tolerating the other costs nothing and turns a whole class of
@@ -286,7 +291,7 @@ export class MCPBridge extends EventEmitter {
           .optional(),
       }),
       (notification) => {
-        console.error("[mcp] Received concurrency notification");
+        debug("[mcp] Received concurrency notification");
         // camelCase only, unlike the snake_case siblings above. This pair of
         // notifications is new enough to have no client that spells it the
         // other way, so it gets one spelling rather than the two that every

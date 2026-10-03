@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { setVerbose } from "../log.js";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -102,6 +103,7 @@ function recordingProgress() {
 }
 
 describe("agentInstall", () => {
+  afterEach(() => setVerbose(false));
   let cacheDir: string;
   let errorSpy: any;
 
@@ -520,6 +522,7 @@ describe("agentInstall", () => {
     });
 
     it("reuses a cached install instead of downloading again", async () => {
+      setVerbose(true);
       await install();
       const { fetchImpl } = await install();
 

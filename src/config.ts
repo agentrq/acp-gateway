@@ -12,6 +12,7 @@
 
 import { readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { debug } from "./log.js";
 
 /** The MCP transports ACP defines that this gateway knows how to hand over. */
 export const MCP_TRANSPORTS = ["http", "sse", "stdio"] as const;
@@ -111,7 +112,7 @@ function loadGivenMcpJson(givenPath: string): McpServerConfig[] {
     // different: the file is right there, and it is empty.
     throw new Error(`${path} defines no MCP servers under "mcpServers".`);
   }
-  console.error(`[config] Loaded MCP config from ${path}`);
+  debug(`[config] Loaded MCP config from ${path}`);
   return servers;
 }
 
@@ -161,7 +162,7 @@ function searchForMcpJson(startDir: string): McpServerConfig[] {
 
     const servers = toServers(parsed, candidate);
     if (servers.length > 0) {
-      console.error(`[config] Loaded .mcp.json from ${candidate}`);
+      debug(`[config] Loaded .mcp.json from ${candidate}`);
       return servers;
     }
   }

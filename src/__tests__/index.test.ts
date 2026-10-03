@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { setVerbose } from "../log.js";
 import { Writable, Readable } from "node:stream";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -133,6 +134,7 @@ vi.mock("@agentclientprotocol/sdk", async () => {
 });
 
 describe("index", () => {
+  afterEach(() => setVerbose(false));
   describe("mapMcpServers", () => {
     it("should correctly map HTTP servers with headers and env", () => {
       const configs: McpServerConfig[] = [{
@@ -2615,6 +2617,7 @@ describe("index", () => {
     });
 
     it("should report the agent's login methods and survive process failures", async () => {
+      setVerbose(true);
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
         return {
@@ -2683,8 +2686,14 @@ describe("index", () => {
         command: "run",
         allowUnverifiedAgent: false,
         json: false,
+        verbose: false,
         rest: [],
       });
+    });
+
+    it("should turn on verbose output with --verbose", () => {
+      expect(parseGatewayArgs(["--verbose"]).verbose).toBe(true);
+      expect(parseGatewayArgs(["--verbose", "gemini"]).rest).toEqual(["gemini"]);
     });
 
     it("should take the permission timeout in minutes", () => {
@@ -2829,9 +2838,9 @@ describe("index", () => {
     });
 
     it("should keep tokens it does not recognise as the agent command", () => {
-      const options = parseGatewayArgs(["--verbose", "--login"]);
+      const options = parseGatewayArgs(["--debug", "--login"]);
       expect(options.command).toBe("login");
-      expect(options.rest).toEqual(["--verbose"]);
+      expect(options.rest).toEqual(["--debug"]);
     });
 
     it("should collect an agent command given without a -- separator", () => {
@@ -3221,6 +3230,7 @@ describe("index", () => {
       command: "run" as const,
       allowUnverifiedAgent: false,
       json: false,
+      verbose: false,
       rest: [],
       ...overrides,
     });
@@ -3706,6 +3716,7 @@ describe("index", () => {
           "--max-concurrency",
           "--permission-timeout",
           "--mcp-json",
+          "--verbose",
           "--help",
         ]),
       );
@@ -4663,6 +4674,7 @@ describe("index", () => {
       });
 
       it("ends an agent that spawned but never opened a session", async () => {
+        setVerbose(true);
         // activeSessions only holds agents that got as far as an open session,
         // so shutting down on it alone left behind the agent still handshaking
         // — and the one stopped waiting for a login, which is the case most
@@ -4748,6 +4760,7 @@ describe("index", () => {
       });
 
       it("closes all unique active sessions in parallel and clears map", async () => {
+        setVerbose(true);
         const cancel1 = vi.fn().mockResolvedValue(undefined);
         const cancel2 = vi.fn().mockResolvedValue(undefined);
         const kill1 = vi.fn();

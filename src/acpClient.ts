@@ -28,6 +28,7 @@ import {
 import { sendAgentIdentity, type AgentIdentity } from "./agentInfo.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { debug, isVerbose } from "./log.js";
 
 /**
  * Identifies a tool call routed through an agentrq MCP server named after a
@@ -238,7 +239,7 @@ export async function sendModelsNotification(
   };
   try {
     await bridge.sendNotification("notifications/claude/channel/models", payload);
-    console.error(
+    debug(
       `[acp] Shared ${modelsResult.models.length} supported model(s) with workspace (current: ${modelsResult.currentModelId ?? "none"})`,
     );
   } catch (err) {
@@ -433,7 +434,7 @@ export class AgentRQACPClient implements acp.Client {
 
     if (toCancel.length === 0) return;
 
-    console.error(
+    debug(
       `[acp] Cancelling ${toCancel.length} waiting permission request(s): ${reason}`,
     );
     for (const pending of toCancel) {
@@ -452,7 +453,7 @@ export class AgentRQACPClient implements acp.Client {
    */
   private onWorkspaceReconnected = (): void => {
     if (this.pendingPermissions.size === 0) return;
-    console.error(
+    debug(
       `[acp] Workspace reconnected — re-sending ${this.pendingPermissions.size} ` +
         `permission request(s) that would otherwise never be answered`,
     );
@@ -472,7 +473,7 @@ export class AgentRQACPClient implements acp.Client {
   private onVerdict = (data: { requestId: string; behavior: string }): void => {
     const pending = this.pendingPermissions.get(data.requestId);
     if (!pending) {
-      console.error(`[acp] Verdict for ${data.requestId} arrived with nothing waiting on it`);
+      debug(`[acp] Verdict for ${data.requestId} arrived with nothing waiting on it`);
       return;
     }
     console.error(`✅ Permission verdict received: ${data.behavior}`);
@@ -607,7 +608,7 @@ export class AgentRQACPClient implements acp.Client {
   ): Promise<void> {
     const taskId = this.getTaskIdForSession(sessionId);
     if (!taskId) {
-      console.error(
+      debug(
         `[acp] No task ID for session ${sessionId}, dropping ${kind} telemetry`,
       );
       return;
@@ -640,20 +641,20 @@ export class AgentRQACPClient implements acp.Client {
 
     const taskId = this.getTaskIdForSession(sessionId);
     if (!taskId) {
-      console.error(`[acp] No task ID for session ${sessionId}, skipping reply`);
+      debug(`[acp] No task ID for session ${sessionId}, skipping reply`);
       return;
     }
 
     const agentReplyText = this.agentReplies.get(taskId);
     this.agentReplies.delete(taskId);
     if (agentReplyText !== undefined && agentReplyText === text) {
-      console.error(`[acp] Skipping reply to task ${taskId} — agent already sent identical reply`);
+      debug(`[acp] Skipping reply to task ${taskId} — agent already sent identical reply`);
       return;
     }
 
     try {
       await this.mcpBridge.callTool("reply", { chatId: taskId, text });
-      console.error(`[acp] Forwarded agent reply to task ${taskId}`);
+      debug(`[acp] Forwarded agent reply to task ${taskId}`);
     } catch (err) {
       console.error(`[acp] Failed to forward reply to task ${taskId}:`, err);
     }
@@ -669,7 +670,7 @@ export class AgentRQACPClient implements acp.Client {
 
     const taskId = this.getTaskIdForSession(sessionId);
     if (!taskId) {
-      console.error(`[acp] No task ID for session ${sessionId}, not reporting "${stopReason}"`);
+      debug(`[acp] No task ID for session ${sessionId}, not reporting "${stopReason}"`);
       return;
     }
 
@@ -679,7 +680,7 @@ export class AgentRQACPClient implements acp.Client {
 
     try {
       await this.mcpBridge.callTool("reply", { chatId: taskId, text });
-      console.error(`[acp] Reported stop reason "${stopReason}" to task ${taskId}`);
+      debug(`[acp] Reported stop reason "${stopReason}" to task ${taskId}`);
     } catch (err) {
       console.error(`[acp] Failed to report stop reason to task ${taskId}:`, err);
     }
@@ -698,7 +699,7 @@ export class AgentRQACPClient implements acp.Client {
 
     // Auto-allow the tool calls the workspace itself is serving.
     if (this.isWorkspaceToolCall(toolTitle)) {
-      console.error(`\n🔓 ACP Auto-allowing tool call: ${toolTitle} (ID: ${toolCallId})`);
+      debug(`\n🔓 ACP Auto-allowing tool call: ${toolTitle} (ID: ${toolCallId})`);
       const option = params.options.find(o =>
         o.kind.startsWith("allow") ||
         o.name.toLowerCase().includes("allow") ||
@@ -730,8 +731,8 @@ export class AgentRQACPClient implements acp.Client {
       description: toolTitle,
       input_preview: JSON.stringify(rawInput ?? {}),
     };
-    console.error(`[acp] Bridge Session ID: ${this.mcpBridge.getSessionId() ?? "unknown"}`);
-    console.error(`[acp] Sending permission request notification:`, JSON.stringify(payload, null, 2));
+    debug(`[acp] Bridge Session ID: ${this.mcpBridge.getSessionId() ?? "unknown"}`);
+    debug(`[acp] Sending permission request notification:`, JSON.stringify(payload, null, 2));
 
     // 1. Forward the permission request to the MCP server as a notification.
     //    If the MCP transport is down (e.g. network outage), sendNotification
@@ -777,7 +778,7 @@ export class AgentRQACPClient implements acp.Client {
         settled = true;
         if (timer) clearTimeout(timer);
         this.pendingPermissions.delete(requestId);
-        console.error(
+        debug(
           `[acp] Selected permission option: ${"optionId" in outcome ? outcome.optionId : "cancelled"}`,
         );
         resolve({ outcome });
@@ -920,7 +921,7 @@ export class AgentRQACPClient implements acp.Client {
         if (update.content.type === "text") {
           // The agent has stopped thinking and started answering.
           this.queueThoughtFlush(params.sessionId);
-          process.stdout.write(update.content.text);
+          if (isVerbose()) process.stdout.write(update.content.text);
           const sid = params.sessionId;
           this.replyBuffers.set(sid, (this.replyBuffers.get(sid) ?? "") + update.content.text);
         }
@@ -955,7 +956,7 @@ export class AgentRQACPClient implements acp.Client {
         this.latestUsage.set(params.sessionId, update);
         break;
       case "current_mode_update":
-        console.error(`[acp] Agent switched session mode to "${update.currentModeId}"`);
+        debug(`[acp] Agent switched session mode to "${update.currentModeId}"`);
         await this.onModeChanged?.(params.sessionId, update.currentModeId);
         break;
       case "config_option_update":
@@ -987,7 +988,7 @@ export class AgentRQACPClient implements acp.Client {
           }
           break;
         }
-        console.error(`\n🔧 [ACP Agent] Tool call: ${update.title} (${update.status})`);
+        debug(`\n🔧 [ACP Agent] Tool call: ${update.title} (${update.status})`);
         break;
       }
       default:
@@ -1054,7 +1055,7 @@ export class AgentRQACPClient implements acp.Client {
         COMMANDS_NOTIFICATION_METHOD,
         payload,
       );
-      console.error(
+      debug(
         `[acp] Shared ${commands.length} slash command(s) with workspace`,
       );
     } catch (err) {
@@ -1247,12 +1248,12 @@ export class AgentRQACPClient implements acp.Client {
     params: acp.WriteTextFileRequest
   ): Promise<acp.WriteTextFileResponse> {
     const filePath = path.resolve(process.cwd(), params.path);
-    console.error(`[acp] Writing file: ${params.path}`);
+    debug(`[acp] Writing file: ${params.path}`);
     
     try {
       await fs.mkdir(path.dirname(filePath), { recursive: true });
       await fs.writeFile(filePath, params.content, "utf8");
-      console.error(`[acp] File written successfully: ${params.path}`);
+      debug(`[acp] File written successfully: ${params.path}`);
       return {};
     } catch (err: any) {
       console.error(`[acp] Error writing file ${params.path}:`, err.message);
@@ -1268,7 +1269,7 @@ export class AgentRQACPClient implements acp.Client {
       params.line != null || params.limit != null
         ? ` (from line ${params.line ?? 1}${params.limit != null ? `, ${params.limit} lines` : ""})`
         : "";
-    console.error(`[acp] Reading file: ${params.path}${window}`);
+    debug(`[acp] Reading file: ${params.path}${window}`);
 
     try {
       const content = await fs.readFile(filePath, "utf8");

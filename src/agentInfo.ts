@@ -10,6 +10,7 @@
 
 import * as acp from "@agentclientprotocol/sdk";
 import { describeAuthMethods } from "./auth.js";
+import { debug } from "./log.js";
 
 /** ACP marks an optional capability as supported by supplying `{}` for it. */
 function supported(value: unknown): boolean {
@@ -68,7 +69,7 @@ export async function sendAgentIdentity(
   };
   try {
     await bridge.sendNotification(AGENT_NOTIFICATION_METHOD, payload);
-    console.error(`[acp] Told the workspace it is talking to "${identity.name}"`);
+    debug(`[acp] Told the workspace it is talking to "${identity.name}"`);
   } catch (err) {
     console.error(`[acp] Failed to send agent notification:`, err);
   }

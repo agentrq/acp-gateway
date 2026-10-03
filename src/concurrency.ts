@@ -10,6 +10,8 @@
  * dropping every session it held.
  */
 
+import { debug } from "./log.js";
+
 /** The notification the workspace sends to change the limit. */
 export const SET_CONCURRENCY_NOTIFICATION_METHOD =
   "notifications/claude/channel/set_concurrency";
@@ -103,7 +105,7 @@ export async function sendConcurrencyNotification(
   };
   try {
     await bridge.sendNotification(CONCURRENCY_NOTIFICATION_METHOD, payload);
-    console.error(
+    debug(
       `[bridge] Told the workspace its concurrency limit is ${state.maxConcurrency} ` +
         `(${state.active} running, ${state.queued} queued)`,
     );
