@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { setVerbose } from "../log.js";
 import { EventEmitter } from "node:events";
 import { AgentRQACPClient, lastModelsForSession } from "../acpClient.js";
 import type { MCPBridge } from "../mcpClient.js";
@@ -10,6 +11,7 @@ vi.mock("node:fs/promises");
 vi.mock("node:path");
 
 describe("AgentRQACPClient", () => {
+  afterEach(() => setVerbose(false));
   let mcpBridge: any;
   let client: AgentRQACPClient;
 
@@ -439,6 +441,7 @@ describe("AgentRQACPClient", () => {
     });
 
     it("should handle missing rawInput and missing session ID", async () => {
+      setVerbose(true);
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       mcpBridge.getSessionId.mockReturnValue(undefined);
 
@@ -1270,6 +1273,7 @@ describe("AgentRQACPClient", () => {
 
   describe("sessionUpdate", () => {
     it("should write text chunks to stdout", async () => {
+      setVerbose(true);
       const writeSpy = vi
         .spyOn(process.stdout, "write")
         .mockImplementation(() => true);
@@ -1284,6 +1288,33 @@ describe("AgentRQACPClient", () => {
       await client.sessionUpdate(params);
       expect(writeSpy).toHaveBeenCalledWith("hello");
       writeSpy.mockRestore();
+    });
+
+    it("should keep the agent's streamed answer off the terminal unless verbose", async () => {
+      const writeSpy = vi
+        .spyOn(process.stdout, "write")
+        .mockImplementation(() => true);
+      const params = {
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "hello" },
+        },
+      } as any;
+
+      await client.sessionUpdate(params);
+      expect(writeSpy).not.toHaveBeenCalled();
+      writeSpy.mockRestore();
+    });
+
+    it("should not print tool calls unless verbose", async () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      await client.sessionUpdate({
+        sessionId: "sess-1",
+        update: { sessionUpdate: "tool_call", toolCallId: "t1", title: "Read file", status: "pending" },
+      } as any);
+      expect(consoleSpy).not.toHaveBeenCalledWith(expect.stringContaining("Tool call: Read file"));
+      consoleSpy.mockRestore();
     });
 
     it("should ignore non-text chunks", async () => {
@@ -1304,6 +1335,7 @@ describe("AgentRQACPClient", () => {
     });
 
     it("should log tool calls", async () => {
+      setVerbose(true);
       const consoleSpy = vi
         .spyOn(console, "error")
         .mockImplementation(() => {});
@@ -1375,6 +1407,7 @@ describe("AgentRQACPClient", () => {
     });
 
     it("should skip reply if no task ID is found for the session", async () => {
+      setVerbose(true);
       mcpBridge.callTool = vi.fn();
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => undefined);
@@ -1389,6 +1422,7 @@ describe("AgentRQACPClient", () => {
     });
 
     it("should skip reply when agent already sent identical reply via tool call", async () => {
+      setVerbose(true);
       mcpBridge.callTool = vi.fn().mockResolvedValue({ isError: false, content: [] });
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
@@ -2221,6 +2255,7 @@ describe("AgentRQACPClient", () => {
     });
 
     it("drops telemetry when the session has no task to attach it to", async () => {
+      setVerbose(true);
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const c = new AgentRQACPClient(
         mcpBridge as unknown as MCPBridge,
@@ -2515,6 +2550,7 @@ describe("AgentRQACPClient", () => {
     });
 
     it("reports a list with nothing selected yet", async () => {
+      setVerbose(true);
       const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const c = new AgentRQACPClient(
         mcpBridge as unknown as MCPBridge,

@@ -623,4 +623,18 @@ describe("MCPBridge", () => {
     expect(reconnected).toHaveBeenCalledTimes(1);
   });
 
+  it("should only print a reconnection when not verbose", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const bridge = new MCPBridge(config);
+
+    await bridge.connect();
+    expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("[mcp] Connected to"));
+
+    lastMockTransport.onclose();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[mcp] Connected to"));
+    errorSpy.mockRestore();
+  });
+
 });
