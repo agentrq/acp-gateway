@@ -1,9 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { PassThrough } from "node:stream";
 import {
+  AGENT_STDERR_TAIL_LENGTH,
   announceFinished,
   announceTask,
   debug,
   describeAsk,
+  followAgentStderr,
   isVerbose,
   setVerbose,
   TASK_PREVIEW_LENGTH,
@@ -96,5 +99,37 @@ describe("announcements", () => {
     announceFinished(undefined, "cancelled");
     expect(errorSpy).toHaveBeenCalledWith("[task t9] Finished: end_turn");
     expect(errorSpy).toHaveBeenCalledWith("[task] Finished: cancelled");
+  });
+});
+
+describe("followAgentStderr", () => {
+  afterEach(() => setVerbose(false));
+
+  it("keeps only the end of what the agent wrote", () => {
+    const stream = new PassThrough();
+    const tail = followAgentStderr(stream);
+    stream.emit("data", Buffer.from("x".repeat(AGENT_STDERR_TAIL_LENGTH)));
+    stream.emit("data", "the end");
+    const kept = tail();
+    expect(kept).toHaveLength(AGENT_STDERR_TAIL_LENGTH);
+    expect(kept.endsWith("the end")).toBe(true);
+    // Handed over once, never twice.
+    expect(tail()).toBe("");
+  });
+
+  it("passes it straight through under --verbose", () => {
+    setVerbose(true);
+    const writeSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const stream = new PassThrough();
+    const tail = followAgentStderr(stream);
+    stream.emit("data", "I1002 hello\n");
+    expect(writeSpy).toHaveBeenCalledWith("I1002 hello\n");
+    expect(tail()).toBe("");
+    writeSpy.mockRestore();
+  });
+
+  it("copes with an agent that has no stderr", () => {
+    expect(followAgentStderr(undefined)()).toBe("");
+    expect(followAgentStderr(null)()).toBe("");
   });
 });

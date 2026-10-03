@@ -69,7 +69,7 @@ You can specify gateway options before the `--` separator:
 - `--registry-url <url>`: Reads a different registry index (for pinning, or for testing).
 - `--mcp-json <path>`: Reads an MCP config in addition to the one found near the working directory, so the gateway can run from outside its workspace. The path is to the file itself and the filename need not be `.mcp.json`; a directory is taken to mean the `.mcp.json` inside it. Where both files define a server under the same name, the one named here wins. A path that cannot be read is an error rather than a quiet fall back to the directory.
 - `--auth-method <id>`: The authentication method to use when the agent asks for a login. Defaults to picking one automatically.
-- `--verbose`: Prints everything the gateway does — MCP connections and notifications, sessions, file reads and writes, tool calls, and the agent's answer as it streams. Without it the gateway only prints each task it is asked to do, permission requests, how each task finished, and any warnings or errors.
+- `--verbose`: Prints everything — MCP connections and notifications, sessions, file reads and writes, tool calls, the agent's own logs, and its answer as it streams. Without it the gateway only prints each task it is asked to do, permission requests, how each task finished, and any warnings or errors; the agent's logs are kept back and shown only if it fails. Commands that print something and exit, like `--list-models`, print just that.
 - `--help` / `-h`: Explains every option, with examples. Also shown when `acp-gateway` is run with nothing to do.
 - `--list-auth-methods`: Prints the login methods the agent advertises, then exits.
 - `--login [method-id]`: Logs in to the agent, then exits.

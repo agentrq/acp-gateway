@@ -32,6 +32,9 @@ import {
   createSessionWithAuth,
   isInteractiveTerminal,
   openAgentConnection,
+  agentExitFailed,
+  showAgentStderr,
+  shouldPrintBanner,
   DEFAULT_MAX_CONCURRENCY,
   parseGatewayArgs,
   assertAgentRunnable,
@@ -95,12 +98,13 @@ const { spawnedAgents } = vi.hoisted(() => ({ spawnedAgents: [] as any[] }));
 
 vi.mock("node:child_process", async () => {
   const { EventEmitter } = await import("node:events");
-  const { Writable, Readable } = await import("node:stream");
+  const { Writable, Readable, PassThrough } = await import("node:stream");
   return {
     spawn: vi.fn(() => {
       const child: any = new EventEmitter();
       child.stdin = new Writable({ write(chunk, encoding, callback) { callback(); } });
       child.stdout = new Readable({ read() { this.push(null); } });
+      child.stderr = new PassThrough();
       child.kill = vi.fn();
       spawnedAgents.push(child);
       return child;
@@ -2644,6 +2648,141 @@ describe("index", () => {
       expect(onExit).toHaveBeenCalledTimes(1);
 
       errorSpy.mockRestore();
+    });
+  });
+
+  describe("agent output", () => {
+    function mockInit() {
+      vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
+        return {
+          initialize: vi.fn().mockResolvedValue({ protocolVersion: "0.1.0" }),
+        } as any;
+      } as any);
+    }
+
+    it("keeps the agent's own logging off the terminal while it runs", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const writeSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      mockInit();
+      const agent = await openAgentConnection({
+        acpCmdArgs: ["node", "agent.js"],
+        mcpBridge: fakeBridge(),
+        label: "list-models",
+      });
+
+      agent.process.stderr.write("I1002 Starting AGY ACP Server...\n");
+      await new Promise((r) => setImmediate(r));
+      agent.process.emit("exit", 0, null);
+
+      expect(writeSpy).not.toHaveBeenCalled();
+      expect(errorSpy).not.toHaveBeenCalled();
+      writeSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("shows the end of the agent's logging when it fails", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      mockInit();
+      const agent = await openAgentConnection({
+        acpCmdArgs: ["node", "agent.js"],
+        mcpBridge: fakeBridge(),
+        label: "task t1",
+      });
+
+      agent.process.stderr.write("E1002 credentials missing\n");
+      await new Promise((r) => setImmediate(r));
+      agent.process.emit("exit", 2, null);
+
+      const printed = errorSpy.mock.calls.flat().join("\n");
+      expect(printed).toContain("Agent process for task t1 exited (code=2, signal=null)");
+      expect(printed).toContain("The agent's last output:\nE1002 credentials missing");
+      errorSpy.mockRestore();
+    });
+
+    it("passes the agent's logging straight through under --verbose", async () => {
+      setVerbose(true);
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const writeSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      mockInit();
+      const agent = await openAgentConnection({
+        acpCmdArgs: ["node", "agent.js"],
+        mcpBridge: fakeBridge(),
+        label: "task t1",
+      });
+
+      agent.process.stderr.write("I1002 hello\n");
+      await new Promise((r) => setImmediate(r));
+      agent.process.emit("exit", 0, null);
+
+      expect(writeSpy.mock.calls.map((c) => String(c[0])).join("")).toContain("I1002 hello");
+      expect(errorSpy).toHaveBeenCalledWith(
+        "[acp] Agent process for task t1 exited (code=0, signal=null)",
+      );
+      writeSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("shows the agent's logging when it dies before the handshake", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      let child: any;
+      vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
+        child = spawnedAgents[spawnedAgents.length - 1];
+        return {
+          initialize: vi.fn().mockImplementation(async () => {
+            child.stderr.write("E1002 fatal: no credentials\n");
+            await new Promise((r) => setImmediate(r));
+            throw new Error("ACP connection closed");
+          }),
+        } as any;
+      } as any);
+
+      await expect(
+        openAgentConnection({ acpCmdArgs: ["node", "agent.js"], mcpBridge: fakeBridge(), label: "list-models" }),
+      ).rejects.toThrow("ACP connection closed");
+      expect(errorSpy).toHaveBeenCalledWith(
+        "[acp] The agent's last output:\nE1002 fatal: no credentials",
+      );
+
+      // Already shown, so a later failed exit does not repeat it.
+      errorSpy.mockClear();
+      child.emit("exit", 1, null);
+      expect(errorSpy.mock.calls.flat().join("\n")).not.toContain("E1002");
+      errorSpy.mockRestore();
+    });
+
+    it("tells a failed exit from a routine one", () => {
+      expect(agentExitFailed(0, null)).toBe(false);
+      expect(agentExitFailed(1, null)).toBe(true);
+      expect(agentExitFailed(null, "SIGTERM")).toBe(false);
+      expect(agentExitFailed(null, "SIGKILL")).toBe(false);
+      expect(agentExitFailed(null, "SIGINT")).toBe(false);
+      expect(agentExitFailed(null, "SIGSEGV")).toBe(true);
+      expect(agentExitFailed(null, null)).toBe(false);
+    });
+
+    it("shows nothing when the failed agent said nothing", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      showAgentStderr("");
+      showAgentStderr("  \n");
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it("does not repeat the agent's logging under --verbose", () => {
+      setVerbose(true);
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      showAgentStderr("already printed");
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+  });
+
+  describe("shouldPrintBanner", () => {
+    it("prints the Starting line only for a gateway that keeps running", () => {
+      expect(shouldPrintBanner({ command: "run", json: false, verbose: false })).toBe(true);
+      expect(shouldPrintBanner({ command: "list-models", json: false, verbose: false })).toBe(false);
+      expect(shouldPrintBanner({ command: "list-models", json: false, verbose: true })).toBe(true);
+      expect(shouldPrintBanner({ command: "run", json: true, verbose: true })).toBe(false);
     });
   });
 

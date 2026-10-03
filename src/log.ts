@@ -8,6 +8,8 @@
  * is only printed under `--verbose`.
  */
 
+import type { Readable } from "node:stream";
+
 let verbose = false;
 
 export function setVerbose(on: boolean): void {
@@ -48,4 +50,31 @@ export function announceTask(text: string, taskId?: string): void {
 /** Says, by default, how a task's turn ended. */
 export function announceFinished(taskId: string | undefined, stopReason: string): void {
   console.error(`[task${taskId ? ` ${taskId}` : ""}] Finished: ${stopReason}`);
+}
+
+/** How much of an agent's stderr is kept to explain a failure, in characters. */
+export const AGENT_STDERR_TAIL_LENGTH = 8 * 1024;
+
+/**
+ * Agents write a lot of their own logging to stderr. Under `--verbose` it is
+ * passed straight through. Otherwise only the end of it is kept, so that when
+ * the agent fails there is still something to show for it.
+ *
+ * Returns a function that hands over what has been kept and forgets it, so
+ * the same lines are never shown twice.
+ */
+export function followAgentStderr(stream: Readable | null | undefined): () => string {
+  let tail = "";
+  stream?.on("data", (chunk: Buffer | string) => {
+    if (verbose) {
+      process.stderr.write(chunk);
+      return;
+    }
+    tail = (tail + chunk.toString()).slice(-AGENT_STDERR_TAIL_LENGTH);
+  });
+  return () => {
+    const kept = tail;
+    tail = "";
+    return kept;
+  };
 }

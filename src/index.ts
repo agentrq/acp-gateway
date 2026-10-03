@@ -132,7 +132,14 @@ import {
   normalizeConcurrency,
   sendConcurrencyNotification,
 } from "./concurrency.js";
-import { announceFinished, announceTask, debug, setVerbose } from "./log.js";
+import {
+  announceFinished,
+  announceTask,
+  debug,
+  followAgentStderr,
+  isVerbose,
+  setVerbose,
+} from "./log.js";
 
 const lastTaskContent = new Map<string, string>();
 
@@ -682,6 +689,33 @@ export function spawnArgsFor(
 }
 
 /**
+ * Whether an agent process ended badly. A clean exit, or one of the signals
+ * the gateway itself ends agents with, is routine and not worth printing.
+ */
+export function agentExitFailed(code: number | null, signal: string | null): boolean {
+  if (code !== null) return code !== 0;
+  return signal !== null && !["SIGTERM", "SIGKILL", "SIGINT"].includes(signal);
+}
+
+/**
+ * Shows the end of what a failed agent wrote to stderr. Under `--verbose` it
+ * has already been printed as it arrived.
+ */
+export function showAgentStderr(tail: string): void {
+  if (isVerbose() || !tail.trim()) return;
+  console.error(`[acp] The agent's last output:\n${tail.trimEnd()}`);
+}
+
+/**
+ * The "Starting" line is for a gateway that is going to keep running. A
+ * command that prints an answer and exits should print just that answer.
+ */
+export function shouldPrintBanner(options: Pick<GatewayOptions, "command" | "json" | "verbose">): boolean {
+  if (options.json) return false;
+  return options.command === "run" || options.verbose;
+}
+
+/**
  * Spawns an ACP agent, wires the JSON-RPC streams to it and completes the
  * `initialize` handshake, returning the connection plus what the agent said
  * about itself — including the login methods it advertises.
@@ -700,10 +734,11 @@ export async function openAgentConnection({
   const target = spawnTarget(cmd);
   if (target !== cmd) debug(`[acp] Resolved "${cmd}" to ${target}`);
   const agentProcess = spawn(...spawnArgsFor(target, cmdArgs), {
-    stdio: ["pipe", "pipe", "inherit"],
+    stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, ...env },
     shell: needsShell(target),
   });
+  const agentStderr = followAgentStderr(agentProcess.stderr);
 
   // Read through a holder rather than captured directly: a session created
   // before any task exists is later handed to the first one, and everything it
@@ -726,14 +761,19 @@ export async function openAgentConnection({
 
   agentProcess.on("error", (err: Error) => {
     console.error(`[acp] Agent process error for ${label}:`, err.message);
+    showAgentStderr(agentStderr());
     forgetAgentProcess(agentProcess);
     acpClient.cancelPendingPermissions(`agent process for ${label} failed`);
     onExit?.();
   });
   agentProcess.on("exit", (code: number | null, signal: string | null) => {
-    console.error(
-      `[acp] Agent process for ${label} exited (code=${code}, signal=${signal})`,
-    );
+    const message = `[acp] Agent process for ${label} exited (code=${code}, signal=${signal})`;
+    if (agentExitFailed(code, signal)) {
+      console.error(message);
+      showAgentStderr(agentStderr());
+    } else {
+      debug(message);
+    }
     forgetAgentProcess(agentProcess);
     // Nothing will act on these answers now, but the tool calls waiting on them
     // are holding task-queue slots that would never be given back.
@@ -782,6 +822,11 @@ export async function openAgentConnection({
         terminal: isInteractiveTerminal(),
       },
     },
+  }).catch((err) => {
+    // An agent that dies on startup takes the gateway with it before its exit
+    // is ever reported, so its own explanation is shown here.
+    showAgentStderr(agentStderr());
+    throw err;
   });
 
   debug(
@@ -2486,11 +2531,13 @@ BRIDGE
                               servers win where the names collide.
 
 OTHER
-  --verbose                   Print everything the gateway does: connections,
-                              notifications, sessions, file access, tool calls
-                              and the agent's answer as it streams. Without it,
-                              only each task asked of it, permission requests,
-                              how each task ended, and errors.
+  --verbose                   Print everything: connections, notifications,
+                              sessions, file access, tool calls, the agent's
+                              own logs and its answer as it streams. Without
+                              it, only each task asked of it, permission
+                              requests, how each task ended, and errors — and
+                              commands that print something and exit print
+                              only that.
   --help, -h                  Show this help. Exits.
 
 EXAMPLES
@@ -2548,7 +2595,7 @@ async function main() {
     process.exit(1);
   }
 
-  if (!options.json) console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
+  if (shouldPrintBanner(options)) console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
 
   // 1. Load MCP Config — optional for the commands that only ask the agent
   // about itself.
