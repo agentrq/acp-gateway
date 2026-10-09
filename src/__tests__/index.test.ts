@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { setVerbose } from "../log.js";
 import { Writable, Readable } from "node:stream";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -56,6 +56,7 @@ import {
   runAgentCommand,
   loadWorkspace,
   createDetachedBridge,
+  makeIsolatedDir,
   WORKSPACE_OPTIONAL_COMMANDS,
   findActiveSession,
   handleTaskCancellation,
@@ -3518,13 +3519,28 @@ describe("index", () => {
       expect(loadWorkspace("list-models", undefined, dir).configs).toEqual([]);
     });
 
-    it("should still use a config named with --mcp-json", () => {
+    it.each(["agent-info", "list-auth-methods"] as const)(
+      "should still use a config named with --mcp-json for --%s",
+      (command) => {
+        const file = writeMcpJson(emptyWorkspaceDir(), "servers.json");
+
+        const workspace = loadWorkspace(command, file, emptyWorkspaceDir());
+
+        expect(workspace.agentrqConfig.name).toBe("agentrq-ws");
+        expect(workspace.mcpBridge.getServerName()).toBe("agentrq-ws");
+      },
+    );
+
+    it("should never connect --list-models to the workspace, even one named with --mcp-json", async () => {
       const file = writeMcpJson(emptyWorkspaceDir(), "servers.json");
 
       const workspace = loadWorkspace("list-models", file, emptyWorkspaceDir());
 
       expect(workspace.agentrqConfig.name).toBe("agentrq-ws");
-      expect(workspace.mcpBridge.getServerName()).toBe("agentrq-ws");
+      expect(workspace.mcpBridge.getServerName()).toBeUndefined();
+      await expect(
+        workspace.mcpBridge.sendNotification("notifications/claude/channel/models", {}),
+      ).rejects.toThrow("No agentrq workspace is configured");
     });
 
     it("should still report a --mcp-json path that is wrong", () => {
@@ -3550,6 +3566,19 @@ describe("index", () => {
 
       expect(workspace.configs.map((c) => c.name)).toEqual(["agentrq-ws"]);
       expect(workspace.mcpBridge.getServerName()).toBe("agentrq-ws");
+    });
+  });
+
+  describe("makeIsolatedDir", () => {
+    it("should make an empty directory and remove it again", () => {
+      const isolated = makeIsolatedDir();
+
+      expect(existsSync(isolated.dir)).toBe(true);
+      expect(isolated.dir.startsWith(tmpdir())).toBe(true);
+      isolated.remove();
+      expect(existsSync(isolated.dir)).toBe(false);
+      // Removing twice, or after something else did, is harmless.
+      expect(() => isolated.remove()).not.toThrow();
     });
   });
 
@@ -3604,6 +3633,50 @@ describe("index", () => {
       expect(printed).toContain("Agent login (agent-login)");
       expect(printed).toContain("--logout");
       expect(spawnedAgents[0].kill).toHaveBeenCalled();
+    });
+
+    it("should run --list-models in an empty directory of its own, and remove it after", async () => {
+      // Run from the workspace's own directory, the agent would find the
+      // workspace's .mcp.json there and connect to it as though it were the
+      // workspace's agent.
+      const { spawn } = await import("node:child_process");
+      const newSession = vi.fn().mockResolvedValue({ sessionId: "m-sess", configOptions: [] });
+      mockConnection({ newSession });
+
+      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+
+      const sessionCwd = newSession.mock.calls[0][0].cwd;
+      expect(sessionCwd).not.toBe(process.cwd());
+      expect(sessionCwd.startsWith(tmpdir())).toBe(true);
+      expect(newSession.mock.calls[0][0].mcpServers).toEqual([]);
+      expect(vi.mocked(spawn)).toHaveBeenLastCalledWith(
+        "gemini",
+        ["--acp"],
+        expect.objectContaining({ cwd: sessionCwd }),
+      );
+      expect(existsSync(sessionCwd)).toBe(false);
+    });
+
+    it("should remove the --list-models directory when the agent fails to start", async () => {
+      const { spawn } = await import("node:child_process");
+      mockConnection({ initialize: vi.fn().mockRejectedValue(new Error("boom")) });
+
+      await expect(
+        runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig, fakeBridge()),
+      ).rejects.toThrow();
+
+      const cwd = (vi.mocked(spawn).mock.calls.at(-1)![2] as any).cwd;
+      expect(cwd.startsWith(tmpdir())).toBe(true);
+      expect(existsSync(cwd)).toBe(false);
+    });
+
+    it("should leave the other commands running where the gateway runs", async () => {
+      const { spawn } = await import("node:child_process");
+      mockConnection({});
+
+      await runAgentCommand("agent-info", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+
+      expect(vi.mocked(spawn).mock.calls.at(-1)![2]).not.toHaveProperty("cwd");
     });
 
     it("should list models from configOptions and cleanly close session", async () => {

@@ -173,7 +173,7 @@ Credentials are never stored by the gateway; the agent keeps its own, exactly as
 
 `acp-gateway` searches for `.mcp.json` starting in the current working directory and up to 3 parent directories.
 
-`--list-models`, `--agent-info` and `--list-auth-methods` only ask the agent about itself, so they do not need a workspace: they skip the search and run without a `.mcp.json`. They still read a config named with `--mcp-json`.
+`--list-models`, `--agent-info` and `--list-auth-methods` only ask the agent about itself, so they do not need a workspace: they skip the search and run without a `.mcp.json`. They still read a config named with `--mcp-json`, but `--list-models` never connects to the workspace: it runs the agent in an empty temporary directory, so the agent does not pick up the workspace's `.mcp.json` and get taken for the workspace's agent.
 
 `--mcp-json <path>` names a config directly, wherever it lives and whatever it is called. It is read *as well as* whatever the search finds, with the named file winning any name collision — so a gateway started from somewhere other than its workspace still connects to the right one.
 
