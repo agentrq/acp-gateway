@@ -29,6 +29,7 @@ import { sendAgentIdentity, type AgentIdentity } from "./agentInfo.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { debug, isVerbose } from "./log.js";
+import { BoundedMap } from "./collections.js";
 
 /**
  * Identifies a tool call routed through an agentrq MCP server named after a
@@ -162,12 +163,14 @@ export const DEFAULT_PERMISSION_TIMEOUT_MS = 30 * 60 * 1000;
  * with the process — an instance field would take the only record of what that
  * session was on with it, leaving the one case that most needs answering unable
  * to be answered. Session ids are unique, so nothing collides here.
+ * Bounded because every session the gateway ever opened would otherwise stay
+ * here; one evicted is answered as if nothing had been reported for it yet.
  *
  * Written in sendModelsToWorkspace because that is the single point every report
  * leaves through, which is what keeps this current without a second place to
  * remember to update.
  */
-const lastModels = new Map<string, AgentModelsResult>();
+const lastModels = new BoundedMap<string, AgentModelsResult>(256);
 
 /** What was last reported for a session, from anywhere, including after it ends. */
 export function lastModelsForSession(sessionId: string): AgentModelsResult | undefined {

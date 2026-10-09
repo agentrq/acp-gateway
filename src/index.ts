@@ -24,6 +24,7 @@ import {
   type McpTransport,
 } from "./config.js";
 import { MCPBridge } from "./mcpClient.js";
+import { BoundedMap, FifoQueue } from "./collections.js";
 
 /**
  * What the agent said about a transport, if anything.
@@ -142,7 +143,9 @@ import {
   setVerbose,
 } from "./log.js";
 
-const lastTaskContent = new Map<string, string>();
+// Only compared against the next notification for the same task, so the last
+// few hundred tasks are plenty; keeping every task's full text forever is not.
+const lastTaskContent = new BoundedMap<string, string>(200);
 
 // Cancellations are remembered by *where they fall in the stream of events*
 // rather than as a one-shot flag. agentrq reuses a chat's id as the task id, so
@@ -152,20 +155,13 @@ const lastTaskContent = new Map<string, string>();
 // two events in the same millisecond, so this is a plain counter.
 let taskSeq = 0;
 export const nextTaskSeq = (): number => ++taskSeq;
-export const cancelledTaskSeq = new Map<string, number>();
 // A cancel for a task that never runs (a stale id, a task that already
-// finished) leaves an entry behind, so keep the map from growing without bound.
-const MAX_REMEMBERED_CANCELLATIONS = 200;
+// finished) leaves an entry behind, so the map is bounded.
+export const cancelledTaskSeq = new BoundedMap<string, number>(200);
 
 /** Records that `taskId` has just been cancelled. */
 export function markTaskCancelled(taskId: string): void {
-  // Re-inserting moves the id to the end, so eviction stays oldest-first.
-  cancelledTaskSeq.delete(taskId);
   cancelledTaskSeq.set(taskId, nextTaskSeq());
-  while (cancelledTaskSeq.size > MAX_REMEMBERED_CANCELLATIONS) {
-    const oldest = cancelledTaskSeq.keys().next().value as string;
-    cancelledTaskSeq.delete(oldest);
-  }
 }
 
 /**
@@ -1714,8 +1710,11 @@ export async function enforceHumanApprovalMode(
  */
 const MAX_MODE_REENFORCEMENTS = 3;
 
-/** sessionId → how many times its mode has already been put back. */
-const modeReenforcements = new Map<string, number>();
+/**
+ * sessionId → how many times its mode has already been put back. Bounded
+ * because sessions end without telling this map.
+ */
+const modeReenforcements = new BoundedMap<string, number>(256);
 
 /**
  * Puts a session back into a mode that asks the human, after the agent moved
@@ -1807,7 +1806,7 @@ export function createAcpSessionSwitcher(
 
 export class TaskQueue {
   private activeTasks = 0;
-  private queue: (() => Promise<void>)[] = [];
+  private queue = new FifoQueue<() => Promise<void>>();
 
   /**
    * @param onChange Told whenever the number running or waiting moves, so
