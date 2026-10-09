@@ -77,7 +77,7 @@ import {
   closeAllSessions,
   setupSignalHandlers,
 } from "../index.js";
-import { lastModelsForSession, sendModelsNotification } from "../acpClient.js";
+import { AgentRQACPClient, lastModelsForSession, sendModelsNotification } from "../acpClient.js";
 import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
 
@@ -3539,7 +3539,7 @@ describe("index", () => {
       expect(workspace.agentrqConfig.name).toBe("agentrq-ws");
       expect(workspace.mcpBridge.getServerName()).toBeUndefined();
       await expect(
-        workspace.mcpBridge.sendNotification("notifications/claude/channel/models", {}),
+        workspace.mcpBridge.callTool("elicit", {}),
       ).rejects.toThrow("No agentrq workspace is configured");
     });
 
@@ -3583,19 +3583,33 @@ describe("index", () => {
   });
 
   describe("createDetachedBridge", () => {
-    it("should fail whatever is asked of the workspace, and close quietly", async () => {
+    it("should fail tool calls, drop notifications, and close quietly", async () => {
       const bridge = createDetachedBridge();
 
       await expect(bridge.callTool("elicit", {})).rejects.toThrow(
         "No agentrq workspace is configured",
       );
-      await expect(bridge.sendNotification("notifications/x", {})).rejects.toThrow(
-        "No agentrq workspace is configured",
-      );
+      await expect(bridge.sendNotification("notifications/x", {})).resolves.toBeUndefined();
       expect(bridge.getSessionId()).toBeUndefined();
       expect(bridge.getServerName()).toBeUndefined();
       expect(bridge.getAdvertisedTools()).toBeUndefined();
       await expect(bridge.close()).resolves.toBeUndefined();
+    });
+
+    it("should not print an error when the agent shares its slash commands", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const client = new AgentRQACPClient(createDetachedBridge());
+
+      await client.sessionUpdate({
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "available_commands_update",
+          availableCommands: [{ name: "init", description: "d" }],
+        },
+      } as acp.SessionNotification);
+
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
     });
   });
 
