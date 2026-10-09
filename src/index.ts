@@ -2302,14 +2302,19 @@ export interface Workspace {
  * the workspace being unreachable: a stray elicitation is cancelled rather than
  * left waiting on a panel nobody has. A url elicitation at a terminal still
  * reaches the person there, since that never goes near the workspace.
+ *
+ * Notifications are dropped instead. Nobody waits on them, and the agent sends
+ * some on its own — its slash commands, its models — so failing them would only
+ * print an error for something that was never going to arrive anywhere.
  */
 export function createDetachedBridge(): MCPBridge {
   const bridge: any = new EventEmitter();
-  const noWorkspace = async () => {
+  bridge.callTool = async () => {
     throw new Error("No agentrq workspace is configured");
   };
-  bridge.callTool = noWorkspace;
-  bridge.sendNotification = noWorkspace;
+  bridge.sendNotification = async (method: string) => {
+    debug(`[acp] No agentrq workspace is configured, dropping ${method}`);
+  };
   bridge.getSessionId = () => undefined;
   bridge.getServerName = () => undefined;
   bridge.getAdvertisedTools = () => undefined;
