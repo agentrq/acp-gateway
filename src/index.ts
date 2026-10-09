@@ -9,7 +9,8 @@
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { Writable, Readable } from "node:stream";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 const pkg = JSON.parse(
@@ -494,6 +495,8 @@ export interface OpenAgentConnectionOptions {
   env?: Record<string, string>;
   /** Used in log lines to say which agent process is being talked about. */
   label: string;
+  /** Where the agent process runs. Defaults to the gateway's own directory. */
+  cwd?: string;
   taskId?: string;
   /** Runs when the agent process dies or fails to start. */
   onExit?: () => void;
@@ -725,6 +728,7 @@ export async function openAgentConnection({
   mcpBridge,
   env,
   label,
+  cwd,
   taskId,
   onExit,
 }: OpenAgentConnectionOptions): Promise<AgentConnection> {
@@ -737,6 +741,7 @@ export async function openAgentConnection({
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, ...env },
     shell: needsShell(target),
+    ...(cwd === undefined ? {} : { cwd }),
   });
   const agentStderr = followAgentStderr(agentProcess.stderr);
 
@@ -2320,6 +2325,10 @@ export function createDetachedBridge(): MCPBridge {
  * missing, or broken, has nothing to do with which models the agent offers.
  * `--mcp-json` is still honoured there, since someone named it on purpose — to
  * have a login the agent asks for show up in that workspace, say.
+ *
+ * Except by `--list-models`, which never reaches the workspace at all: the
+ * workspace counts whatever connects to it as its agent, so a listing that did
+ * would get in the way of the agent about to be started for real.
  */
 export function loadWorkspace(
   command: GatewayCommand,
@@ -2335,7 +2344,32 @@ export function loadWorkspace(
   }
   const configs = loadMcpConfig(startDir, mcpJsonPath);
   const agentrqConfig = pickAgentrqServer(configs);
-  return { configs, agentrqConfig, mcpBridge: new MCPBridge(agentrqConfig) };
+  const mcpBridge =
+    command === "list-models" ? createDetachedBridge() : new MCPBridge(agentrqConfig);
+  return { configs, agentrqConfig, mcpBridge };
+}
+
+/**
+ * Makes an empty directory for `--list-models` to run the agent in.
+ *
+ * The gateway is usually run from a workspace's own directory, and agents look
+ * for MCP servers in the directory they run in — Claude reads its .mcp.json,
+ * Gemini its .gemini/settings.json. Run there, a listing agent would connect
+ * to the workspace on its own and be taken for the workspace's agent. Here it
+ * finds nothing to connect to.
+ */
+export function makeIsolatedDir(): { dir: string; remove: () => void } {
+  const dir = mkdtempSync(path.join(tmpdir(), "acp-gateway-list-models-"));
+  return {
+    dir,
+    remove: () => {
+      // On Windows a directory cannot go while the agent just killed is still
+      // in it. A stray empty directory in tmp is not worth failing over.
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    },
+  };
 }
 
 /**
@@ -2354,12 +2388,20 @@ export async function runAgentCommand(
   json = false,
 ): Promise<void> {
   const [cmd, ...cmdArgs] = acpCmdArgs;
-  const agent = await openAgentConnection({
-    acpCmdArgs,
-    mcpBridge,
-    env: agentrqConfig.env,
-    label: command,
-  });
+  const isolated = command === "list-models" ? makeIsolatedDir() : undefined;
+  let agent: AgentConnection;
+  try {
+    agent = await openAgentConnection({
+      acpCmdArgs,
+      mcpBridge,
+      env: agentrqConfig.env,
+      label: command,
+      cwd: isolated?.dir,
+    });
+  } catch (err) {
+    isolated?.remove();
+    throw err;
+  }
 
   try {
     const connection = agent.connection as unknown as AuthConnection;
@@ -2382,7 +2424,7 @@ export async function runAgentCommand(
 
     if (command === "list-models") {
       const newSessionParams: AcpNewSessionParams = {
-        cwd: process.cwd(),
+        cwd: isolated!.dir,
         mcpServers: mapMcpServers([], agentCapabilities),
       };
       const sessionResult = await createSessionWithAuth(
@@ -2470,6 +2512,7 @@ export async function runAgentCommand(
     });
   } finally {
     terminateAgentProcess(agent.process);
+    isolated?.remove();
   }
 }
 
