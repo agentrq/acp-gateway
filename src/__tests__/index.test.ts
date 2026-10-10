@@ -3494,13 +3494,13 @@ describe("index", () => {
       return file;
     }
 
-    it("should name the commands that only ask the agent about itself", () => {
+    it("should name the commands that only deal with the agent itself", () => {
       expect([...WORKSPACE_OPTIONAL_COMMANDS].sort()).toEqual(
-        ["agent-info", "list-auth-methods", "list-models"],
+        ["agent-info", "list-auth-methods", "list-models", "login", "logout"],
       );
     });
 
-    it.each(["list-models", "agent-info", "list-auth-methods"] as const)(
+    it.each(["list-models", "agent-info", "list-auth-methods", "login", "logout"] as const)(
       "should let --%s run without a .mcp.json",
       (command) => {
         const workspace = loadWorkspace(command, undefined, emptyWorkspaceDir());
@@ -3519,7 +3519,7 @@ describe("index", () => {
       expect(loadWorkspace("list-models", undefined, dir).configs).toEqual([]);
     });
 
-    it.each(["agent-info", "list-auth-methods"] as const)(
+    it.each(["agent-info", "list-auth-methods", "login", "logout"] as const)(
       "should still use a config named with --mcp-json for --%s",
       (command) => {
         const file = writeMcpJson(emptyWorkspaceDir(), "servers.json");
@@ -3549,14 +3549,11 @@ describe("index", () => {
       ).toThrow();
     });
 
-    it.each(["run", "login", "logout"] as const)(
-      "should still require a .mcp.json to %s",
-      (command) => {
-        expect(() => loadWorkspace(command, undefined, emptyWorkspaceDir())).toThrow(
-          "Could not find .mcp.json",
-        );
-      },
-    );
+    it("should still require a .mcp.json to run tasks", () => {
+      expect(() => loadWorkspace("run", undefined, emptyWorkspaceDir())).toThrow(
+        "Could not find .mcp.json",
+      );
+    });
 
     it("should connect running tasks to the workspace it finds", () => {
       const dir = emptyWorkspaceDir();

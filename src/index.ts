@@ -2276,15 +2276,17 @@ export function assertAgentRunnable(command: string, usedRegistryId: boolean): v
 }
 
 /**
- * Commands that only ask the agent about itself. None of them hands the agent
+ * Commands that only deal with the agent itself. None of them hands the agent
  * a workspace or reports to one, so none should refuse to run for want of a
- * .mcp.json — `--list-models` is how someone picks a model before they have
- * set a workspace up at all.
+ * .mcp.json — `--list-models` is how someone picks a model, and `--login` how
+ * someone signs the agent in, before they have set a workspace up at all.
  */
 export const WORKSPACE_OPTIONAL_COMMANDS: ReadonlySet<GatewayCommand> = new Set([
   "list-models",
   "agent-info",
   "list-auth-methods",
+  "login",
+  "logout",
 ]);
 
 /** The workspace a command runs against: its servers, and the one to report to. */
@@ -2325,8 +2327,9 @@ export function createDetachedBridge(): MCPBridge {
  * Finds the workspace a command needs.
  *
  * Anything that runs tasks needs one, and fails without it. A command that only
- * asks the agent about itself does not go looking for one: a .mcp.json that is
- * missing, or broken, has nothing to do with which models the agent offers.
+ * deals with the agent itself does not go looking for one: a .mcp.json that is
+ * missing, or broken, has nothing to do with which models the agent offers or
+ * whether it is logged in.
  * `--mcp-json` is still honoured there, since someone named it on purpose — to
  * have a login the agent asks for show up in that workspace, say.
  *
@@ -2600,8 +2603,9 @@ EXAMPLES
 
 The workspace comes from .mcp.json, searched for in the current directory and up
 to three directories above it. --mcp-json names one directly, wherever it lives
-and whatever it is called. --list-models, --agent-info and --list-auth-methods
-do not need a workspace, and only read one named with --mcp-json.`;
+and whatever it is called. --list-models, --agent-info, --list-auth-methods,
+--login and --logout do not need a workspace, and only read one named with
+--mcp-json.`;
 }
 
 export function printHelp(): void {
