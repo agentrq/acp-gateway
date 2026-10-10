@@ -11,6 +11,7 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import type * as acp from "@agentclientprotocol/sdk";
+import { showingAgentStderr } from "./log.js";
 
 /** JSON-RPC code ACP reserves for "the user must authenticate first". */
 export const AUTH_REQUIRED_CODE = -32000;
@@ -228,8 +229,9 @@ export async function runAuthMethod(
     await runTerminalAuth(method, launch);
   } else {
     // A `terminal` method must never reach `authenticate` — the agent does not
-    // implement one for it.
-    await connection.authenticate({ methodId: method.id });
+    // implement one for it. Whatever the agent says on stderr meanwhile may be
+    // the only place it says where to log in.
+    await showingAgentStderr(() => connection.authenticate({ methodId: method.id }));
   }
   console.error(`[auth] Logged in with "${method.name}" (${method.id}).`);
 }

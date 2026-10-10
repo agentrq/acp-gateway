@@ -9,6 +9,7 @@ import {
   followAgentStderr,
   isVerbose,
   setVerbose,
+  showingAgentStderr,
   TASK_PREVIEW_LENGTH,
 } from "../log.js";
 
@@ -125,6 +126,31 @@ describe("followAgentStderr", () => {
     stream.emit("data", "I1002 hello\n");
     expect(writeSpy).toHaveBeenCalledWith("I1002 hello\n");
     expect(tail()).toBe("");
+    writeSpy.mockRestore();
+  });
+
+  it("passes it straight through while a login is waiting on the agent", async () => {
+    const writeSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const stream = new PassThrough();
+    const tail = followAgentStderr(stream);
+    const result = await showingAgentStderr(async () => {
+      stream.emit("data", "Open the following link: https://example.test/auth\n");
+      return "logged in";
+    });
+    expect(result).toBe("logged in");
+    expect(writeSpy).toHaveBeenCalledWith("Open the following link: https://example.test/auth\n");
+    expect(tail()).toBe("");
+
+    // Back to keeping it quietly once the login is over, failed or not.
+    await expect(
+      showingAgentStderr(async () => {
+        throw new Error("refused");
+      }),
+    ).rejects.toThrow("refused");
+    writeSpy.mockClear();
+    stream.emit("data", "I1002 after\n");
+    expect(writeSpy).not.toHaveBeenCalled();
+    expect(tail()).toBe("I1002 after\n");
     writeSpy.mockRestore();
   });
 

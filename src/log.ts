@@ -55,10 +55,30 @@ export function announceFinished(taskId: string | undefined, stopReason: string)
 /** How much of an agent's stderr is kept to explain a failure, in characters. */
 export const AGENT_STDERR_TAIL_LENGTH = 8 * 1024;
 
+// How many logins are waiting on an agent right now; see showingAgentStderr.
+let loginsInFlight = 0;
+
 /**
- * Agents write a lot of their own logging to stderr. Under `--verbose` it is
- * passed straight through. Otherwise only the end of it is kept, so that when
- * the agent fails there is still something to show for it.
+ * Passes every agent's stderr straight through while `run` is in flight.
+ *
+ * A login is the one time the agent has something on stderr the human must
+ * read: an agent that cannot open a browser where it runs — antigravity on a
+ * headless machine, say — prints the URL to open there and nowhere else.
+ */
+export async function showingAgentStderr<T>(run: () => Promise<T>): Promise<T> {
+  loginsInFlight++;
+  try {
+    return await run();
+  } finally {
+    loginsInFlight--;
+  }
+}
+
+/**
+ * Agents write a lot of their own logging to stderr. Under `--verbose`, or
+ * while a login is waiting on the agent, it is passed straight through.
+ * Otherwise only the end of it is kept, so that when the agent fails there is
+ * still something to show for it.
  *
  * Returns a function that hands over what has been kept and forgets it, so
  * the same lines are never shown twice.
@@ -66,7 +86,7 @@ export const AGENT_STDERR_TAIL_LENGTH = 8 * 1024;
 export function followAgentStderr(stream: Readable | null | undefined): () => string {
   let tail = "";
   stream?.on("data", (chunk: Buffer | string) => {
-    if (verbose) {
+    if (verbose || loginsInFlight > 0) {
       process.stderr.write(chunk);
       return;
     }

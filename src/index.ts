@@ -2687,12 +2687,6 @@ async function main() {
     agentrqConfigOrAcpClient: agentrqConfig,
   };
 
-  // After the bridge, because the queue now reports itself to it — and fills
-  // itself from it: the answer to having room is to go and ask the workspace
-  // for more work, or a limit of three runs one task and waits with the other
-  // two still sitting in the workspace because nothing ever asked for them.
-  const taskQueue = createSelfFillingTaskQueue(maxConcurrency, mcpBridge, taskRunDeps);
-
   // Auth commands talk to the agent and exit; they never start bridging tasks.
   // They run before the bridge connects, so a first-time login still works when
   // the workspace is unreachable — `callTool` connects on demand if the login
@@ -2705,6 +2699,13 @@ async function main() {
     }
     process.exit(0);
   }
+
+  // After the auth commands, which must not go fetching tasks while someone
+  // logs in. After the bridge, because the queue now reports itself to it — and
+  // fills itself from it: the answer to having room is to go and ask the
+  // workspace for more work, or a limit of three runs one task and waits with
+  // the other two still sitting in the workspace because nothing ever asked.
+  const taskQueue = createSelfFillingTaskQueue(maxConcurrency, mcpBridge, taskRunDeps);
 
   let cleanupPromise: Promise<void> | null = null;
   const cleanup = async (signal?: string) => {
