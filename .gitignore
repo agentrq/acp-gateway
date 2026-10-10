@@ -13,4 +13,5 @@ npm-debug.log*
 .DS_Store
 .mcp.json
 .gemini
-.claude
+.claude/*
+!.claude/settings.json
