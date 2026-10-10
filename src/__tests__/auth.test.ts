@@ -2,18 +2,23 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { PassThrough } from "node:stream";
 import { followAgentStderr } from "../log.js";
 import {
   AUTH_REQUIRED_CODE,
   authMethodType,
   describeAuthMethods,
+  findLoopbackRedirect,
   isAuthRequiredError,
   login,
   logout,
   pickAuthMethod,
   promptForAuthMethod,
   promptUrlElicitationOnTerminal,
+  redirectToDeliver,
+  relayLoopbackRedirect,
   runAuthMethod,
   runTerminalAuth,
   supportsLogout,
@@ -339,6 +344,247 @@ describe("auth", () => {
 
       expect(connection.authenticate).not.toHaveBeenCalled();
       expect(spawnMock).toHaveBeenCalled();
+    });
+  });
+
+  describe("loopback redirects", () => {
+    // What antigravity prints on stderr for its Google sign-in.
+    const signInLine = (port: number) =>
+      "Open the following link to authenticate the ACP server: " +
+      "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id=abc" +
+      `&redirect_uri=http%3A%2F%2F127.0.0.1%3A${port}%2F&scope=email&state=xyz\n`;
+    const browserAddress = (port: number) =>
+      `http://127.0.0.1:${port}/?state=xyz&iss=https://accounts.google.com&code=4/0AX-yz&scope=email`;
+
+    /** A stand-in for the agent's one-shot redirect server. */
+    async function agentServer(): Promise<{
+      port: number;
+      received: Promise<string>;
+      close: () => Promise<void>;
+    }> {
+      let receive!: (url: string) => void;
+      const received = new Promise<string>((resolve) => (receive = resolve));
+      const server = createServer((req, res) => {
+        receive(req.url ?? "");
+        res.writeHead(302, { Location: "http://127.0.0.1:1/picker" }).end();
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const port = (server.address() as AddressInfo).port;
+      return {
+        port,
+        received,
+        close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+      };
+    }
+
+    describe("findLoopbackRedirect", () => {
+      it("finds the agent's redirect server in its sign-in URL", () => {
+        expect(findLoopbackRedirect(signInLine(37207))?.href).toBe("http://127.0.0.1:37207/");
+        expect(
+          findLoopbackRedirect("go to https://x.test/auth?redirect_uri=http://localhost:9/cb now")
+            ?.href,
+        ).toBe("http://localhost:9/cb");
+        expect(
+          findLoopbackRedirect("https://x.test/auth?redirect_uri=http%3A%2F%2F%5B%3A%3A1%5D%3A9%2F")
+            ?.host,
+        ).toBe("[::1]:9");
+      });
+
+      it("ignores URLs that do not come back to this machine", () => {
+        expect(findLoopbackRedirect("nothing to open here")).toBeUndefined();
+        expect(findLoopbackRedirect("https://x.test/device")).toBeUndefined();
+        expect(findLoopbackRedirect("https://x.test/a?redirect_uri=not%20a%20url")).toBeUndefined();
+        expect(
+          findLoopbackRedirect("https://x.test/a?redirect_uri=https%3A%2F%2Fapp.test%2Fcb"),
+        ).toBeUndefined();
+        expect(
+          findLoopbackRedirect("https://x.test/a?redirect_uri=https%3A%2F%2F127.0.0.1%3A9%2F"),
+        ).toBeUndefined();
+      });
+    });
+
+    describe("redirectToDeliver", () => {
+      const redirect = new URL("http://127.0.0.1:37207/");
+
+      it("takes the provider's answer from the pasted address", () => {
+        expect(redirectToDeliver(`  ${browserAddress(37207)}\n`, redirect)?.href).toBe(
+          browserAddress(37207),
+        );
+        expect(redirectToDeliver("?state=xyz&code=abc", redirect)?.href).toBe(
+          "http://127.0.0.1:37207/?state=xyz&code=abc",
+        );
+        expect(redirectToDeliver("http://127.0.0.1:37207?error=access_denied", redirect)?.href).toBe(
+          "http://127.0.0.1:37207/?error=access_denied",
+        );
+      });
+
+      it("turns away anything that is not the agent's redirect", () => {
+        expect(redirectToDeliver("", redirect)).toBeUndefined();
+        expect(redirectToDeliver("http://[", redirect)).toBeUndefined();
+        expect(redirectToDeliver(browserAddress(1234), redirect)).toBeUndefined();
+        expect(redirectToDeliver("http://127.0.0.1:37207/other?code=abc", redirect)).toBeUndefined();
+        expect(redirectToDeliver("http://evil.test:37207/?code=abc", redirect)).toBeUndefined();
+        expect(redirectToDeliver("http://127.0.0.1:37207/?state=xyz", redirect)).toBeUndefined();
+      });
+    });
+
+    describe("relayLoopbackRedirect", () => {
+      it("re-asks for a wrong address, then hands the right one to the agent", async () => {
+        const agent = await agentServer();
+        try {
+          const ask = vi
+            .fn()
+            .mockResolvedValueOnce(`http://127.0.0.1:${agent.port}/?state=xyz`)
+            .mockResolvedValueOnce(browserAddress(agent.port));
+          const signal = new AbortController().signal;
+          await relayLoopbackRedirect(new URL(`http://127.0.0.1:${agent.port}/`), signal, ask);
+
+          const pasted = new URL(browserAddress(agent.port));
+          expect(await agent.received).toBe(pasted.pathname + pasted.search);
+          expect(ask).toHaveBeenCalledTimes(2);
+          expect(ask).toHaveBeenCalledWith(expect.stringContaining("Address the browser"), signal);
+          expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("with a code in it"));
+          expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Handed the sign-in"));
+        } finally {
+          await agent.close();
+        }
+      });
+
+      it("says so when the agent is no longer listening", async () => {
+        const agent = await agentServer();
+        await agent.close();
+        await relayLoopbackRedirect(
+          new URL(`http://127.0.0.1:${agent.port}/`),
+          new AbortController().signal,
+          vi.fn().mockResolvedValue(browserAddress(agent.port)),
+        );
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Could not reach the agent"));
+      });
+
+      it("gives up after three wrong addresses", async () => {
+        const ask = vi.fn().mockResolvedValue("nonsense");
+        await relayLoopbackRedirect(
+          new URL("http://127.0.0.1:9/"),
+          new AbortController().signal,
+          ask,
+        );
+        expect(ask).toHaveBeenCalledTimes(3);
+      });
+
+      it("stops asking once the login finishes by itself", async () => {
+        const writeSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+        const done = new AbortController();
+        const ask = vi.fn((_q: string, signal: AbortSignal) => {
+          done.abort();
+          return Promise.reject(signal.reason);
+        });
+        await relayLoopbackRedirect(new URL("http://127.0.0.1:9/"), done.signal, ask);
+        expect(ask).toHaveBeenCalledTimes(1);
+        expect(writeSpy).toHaveBeenCalledWith("\n");
+
+        // stdin closing ends it too, without the line break.
+        writeSpy.mockClear();
+        await relayLoopbackRedirect(
+          new URL("http://127.0.0.1:9/"),
+          new AbortController().signal,
+          vi.fn().mockRejectedValue(new Error("closed")),
+        );
+        expect(writeSpy).not.toHaveBeenCalled();
+        writeSpy.mockRestore();
+      });
+
+      it("asks on the terminal by default", async () => {
+        const close = vi.fn();
+        const question = vi.fn().mockResolvedValue("nonsense");
+        createInterfaceMock.mockReturnValue({ question, close } as any);
+        const signal = new AbortController().signal;
+
+        await relayLoopbackRedirect(new URL("http://127.0.0.1:9/"), signal);
+        expect(createInterfaceMock).toHaveBeenCalledWith({
+          input: process.stdin,
+          output: process.stderr,
+        });
+        expect(question).toHaveBeenCalledWith(expect.stringContaining("Address the browser"), {
+          signal,
+        });
+        expect(close).toHaveBeenCalledTimes(3);
+      });
+    });
+
+    describe("runAuthMethod", () => {
+      let writeSpy: any;
+      beforeEach(() => {
+        writeSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      });
+      afterEach(() => writeSpy.mockRestore());
+
+      it("finishes a browser login from another computer with the pasted address", async () => {
+        const agent = await agentServer();
+        try {
+          const stderr = new PassThrough();
+          followAgentStderr(stderr);
+          const connection = {
+            authenticate: vi.fn(async () => {
+              // Split mid-URL, the way a pipe can deliver it.
+              const line = signInLine(agent.port);
+              stderr.emit("data", line.slice(0, 120));
+              stderr.emit("data", line.slice(120));
+              // The agent's login ends once its server has had the redirect.
+              await agent.received;
+              return {};
+            }),
+            logout: vi.fn(),
+          };
+          const askUntil = vi.fn().mockResolvedValue(browserAddress(agent.port));
+
+          await runAuthMethod(connection, agentMethod, launch, { interactive: true, askUntil });
+          expect(askUntil).toHaveBeenCalledTimes(1);
+          expect(await agent.received).toContain("code=4/0AX-yz");
+          expect(writeSpy).toHaveBeenCalledWith(signInLine(agent.port).slice(0, 120));
+        } finally {
+          await agent.close();
+        }
+      });
+
+      it("stops asking when the browser reached the agent by itself", async () => {
+        const stderr = new PassThrough();
+        followAgentStderr(stderr);
+        let markAsked!: () => void;
+        const asked = new Promise<void>((resolve) => (markAsked = resolve));
+        const askUntil = vi.fn(
+          (_q: string, signal: AbortSignal) =>
+            new Promise<string>((_resolve, reject) => {
+              markAsked();
+              signal.addEventListener("abort", () => reject(signal.reason));
+            }),
+        );
+        const connection = {
+          authenticate: vi.fn(async () => {
+            stderr.emit("data", signInLine(37207));
+            await asked;
+            return {};
+          }),
+          logout: vi.fn(),
+        };
+        await runAuthMethod(connection, agentMethod, launch, { interactive: true, askUntil });
+        expect(askUntil).toHaveBeenCalledTimes(1);
+      });
+
+      it("does not ask with nobody at the terminal", async () => {
+        const stderr = new PassThrough();
+        followAgentStderr(stderr);
+        const askUntil = vi.fn();
+        const connection = {
+          authenticate: vi.fn(async () => {
+            stderr.emit("data", signInLine(37207));
+            return {};
+          }),
+          logout: vi.fn(),
+        };
+        await runAuthMethod(connection, agentMethod, launch, { askUntil });
+        expect(askUntil).not.toHaveBeenCalled();
+        expect(writeSpy).toHaveBeenCalledWith(signInLine(37207));
+      });
     });
   });
 
