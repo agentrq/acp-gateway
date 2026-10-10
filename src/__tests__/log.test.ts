@@ -154,6 +154,26 @@ describe("followAgentStderr", () => {
     writeSpy.mockRestore();
   });
 
+  it("hands what the agent says during a login to whoever asked to read it", async () => {
+    const writeSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const stream = new PassThrough();
+    followAgentStderr(stream);
+    const read = vi.fn();
+    await showingAgentStderr(async () => {
+      stream.emit("data", Buffer.from("Open the following link: https://example.test/auth\n"));
+    }, read);
+    expect(read).toHaveBeenCalledWith("Open the following link: https://example.test/auth\n");
+
+    // Not after the login, and not for a login that did not ask.
+    read.mockClear();
+    stream.emit("data", "I1002 after\n");
+    await showingAgentStderr(async () => {
+      stream.emit("data", "I1002 another login\n");
+    });
+    expect(read).not.toHaveBeenCalled();
+    writeSpy.mockRestore();
+  });
+
   it("copes with an agent that has no stderr", () => {
     expect(followAgentStderr(undefined)()).toBe("");
     expect(followAgentStderr(null)()).toBe("");

@@ -55,8 +55,10 @@ export function announceFinished(taskId: string | undefined, stopReason: string)
 /** How much of an agent's stderr is kept to explain a failure, in characters. */
 export const AGENT_STDERR_TAIL_LENGTH = 8 * 1024;
 
-// How many logins are waiting on an agent right now; see showingAgentStderr.
+// How many logins are waiting on an agent right now, and who is reading what
+// the agents say meanwhile; see showingAgentStderr.
 let loginsInFlight = 0;
+const loginReaders = new Set<(text: string) => void>();
 
 /**
  * Passes every agent's stderr straight through while `run` is in flight.
@@ -64,13 +66,20 @@ let loginsInFlight = 0;
  * A login is the one time the agent has something on stderr the human must
  * read: an agent that cannot open a browser where it runs — antigravity on a
  * headless machine, say — prints the URL to open there and nowhere else.
+ * `onOutput`, when given, is handed the same text as it goes by, for a login
+ * that needs to act on what the agent said.
  */
-export async function showingAgentStderr<T>(run: () => Promise<T>): Promise<T> {
+export async function showingAgentStderr<T>(
+  run: () => Promise<T>,
+  onOutput?: (text: string) => void,
+): Promise<T> {
   loginsInFlight++;
+  if (onOutput) loginReaders.add(onOutput);
   try {
     return await run();
   } finally {
     loginsInFlight--;
+    if (onOutput) loginReaders.delete(onOutput);
   }
 }
 
@@ -88,6 +97,7 @@ export function followAgentStderr(stream: Readable | null | undefined): () => st
   stream?.on("data", (chunk: Buffer | string) => {
     if (verbose || loginsInFlight > 0) {
       process.stderr.write(chunk);
+      for (const read of loginReaders) read(chunk.toString());
       return;
     }
     tail = (tail + chunk.toString()).slice(-AGENT_STDERR_TAIL_LENGTH);

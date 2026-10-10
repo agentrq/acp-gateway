@@ -11,7 +11,7 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import type * as acp from "@agentclientprotocol/sdk";
-import { showingAgentStderr } from "./log.js";
+import { AGENT_STDERR_TAIL_LENGTH, showingAgentStderr } from "./log.js";
 
 /** JSON-RPC code ACP reserves for "the user must authenticate first". */
 export const AUTH_REQUIRED_CODE = -32000;
@@ -179,6 +179,145 @@ export async function promptUrlElicitationOnTerminal({
   }
 }
 
+/** Reads one answer, giving up when `signal` fires; replaceable in tests. */
+export type AbortableAsker = (question: string, signal: AbortSignal) => Promise<string>;
+
+async function askOnTerminalUntil(question: string, signal: AbortSignal): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return await rl.question(question, { signal });
+  } finally {
+    rl.close();
+  }
+}
+
+/** Hosts that only mean something on the machine the agent runs on. */
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
+ * Finds the loopback address an agent's browser login sends the browser back to.
+ *
+ * An OAuth login the agent runs itself — antigravity's Google sign-in, for one —
+ * prints a URL whose `redirect_uri` is a one-shot server on 127.0.0.1. A
+ * browser on another computer is sent back to its own 127.0.0.1, where nothing
+ * is listening, and the login waits until it times out.
+ */
+export function findLoopbackRedirect(text: string): URL | undefined {
+  for (const [candidate] of text.matchAll(/https?:\/\/[^\s"'<>]+/g)) {
+    let redirect: URL;
+    try {
+      redirect = new URL(new URL(candidate).searchParams.get("redirect_uri") ?? "");
+    } catch {
+      continue;
+    }
+    if (redirect.protocol === "http:" && LOOPBACK_HOSTS.has(redirect.hostname)) return redirect;
+  }
+  return undefined;
+}
+
+/**
+ * Turns the address the human pasted into the request to send the agent.
+ *
+ * It has to be the agent's redirect — same host, port and path — carrying the
+ * provider's answer (`code`, or `error` when consent was refused). The agent's
+ * server answers exactly one request, so anything else is turned away here
+ * rather than spending the login on it. Only the query is taken from what was
+ * pasted: the request never goes anywhere but the agent's own server.
+ */
+export function redirectToDeliver(answer: string, redirect: URL): URL | undefined {
+  let pasted: URL;
+  try {
+    pasted = new URL(answer.trim(), redirect);
+  } catch {
+    return undefined;
+  }
+  if (pasted.host !== redirect.host || pasted.pathname !== redirect.pathname) return undefined;
+  if (!pasted.searchParams.has("code") && !pasted.searchParams.has("error")) return undefined;
+  const delivered = new URL(redirect.href);
+  delivered.search = pasted.search;
+  return delivered;
+}
+
+/**
+ * Carries a browser's redirect back to the agent when the browser cannot.
+ *
+ * Asks for the address the browser ended up on and requests it on this
+ * machine, as the browser would have. Stops asking as soon as the login ends
+ * by itself (`signal`) — a browser on this machine reaches the agent directly.
+ */
+export async function relayLoopbackRedirect(
+  redirect: URL,
+  signal: AbortSignal,
+  ask: AbortableAsker = askOnTerminalUntil,
+): Promise<void> {
+  console.error(
+    `[auth] Signing in from a browser on another computer? Its last page, on ${redirect.host}, ` +
+      `will not load there. Copy that page's address from the address bar and paste it here.`,
+  );
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let answer: string;
+    try {
+      answer = await ask(`[auth] Address the browser ended up on: `, signal);
+    } catch {
+      // The login finished without us, or stdin closed; either way, stop asking.
+      if (signal.aborted) process.stderr.write("\n");
+      return;
+    }
+    const url = redirectToDeliver(answer, redirect);
+    if (!url) {
+      console.error(
+        `[auth] That is not an address on ${redirect.host}${redirect.pathname} with a code in it.`,
+      );
+      continue;
+    }
+    try {
+      // The agent answers with a landing page, or a redirect to another of its
+      // own; neither is for us to follow.
+      await fetch(url, { redirect: "manual" });
+      console.error("[auth] Handed the sign-in to the agent; waiting for it to finish.");
+    } catch (err) {
+      // fetch only ever fails with a TypeError; nothing listening is the usual one.
+      console.error(
+        `[auth] Could not reach the agent at ${redirect.host} (${(err as Error).message}); ` +
+          `its login may have timed out already.`,
+      );
+    }
+    return;
+  }
+}
+
+/**
+ * Asks the agent to log in, showing what it says meanwhile — which may be the
+ * only place it says where to log in — and, with someone at the terminal,
+ * offering to carry a loopback redirect back to it.
+ */
+async function authenticateAgent(
+  connection: AuthConnection,
+  method: acp.AuthMethod,
+  interactive: boolean,
+  ask?: AbortableAsker,
+): Promise<void> {
+  const done = new AbortController();
+  let said = "";
+  let relaying: Promise<void> | undefined;
+  const watch = (text: string) => {
+    if (relaying) return;
+    said = (said + text).slice(-AGENT_STDERR_TAIL_LENGTH);
+    // Only whole lines: a URL cut off mid-chunk could name the wrong port.
+    const redirect = findLoopbackRedirect(said.slice(0, said.lastIndexOf("\n") + 1));
+    if (redirect) relaying = relayLoopbackRedirect(redirect, done.signal, ask);
+  };
+  try {
+    await showingAgentStderr(
+      () => connection.authenticate({ methodId: method.id }),
+      interactive ? watch : undefined,
+    );
+  } finally {
+    done.abort();
+    await relaying;
+  }
+}
+
 /**
  * Runs a `terminal` login by re-launching the configured agent interactively.
  *
@@ -219,19 +358,25 @@ export async function runTerminalAuth(
   });
 }
 
+export interface RunAuthOptions {
+  /** Whether a human is at the terminal to paste a browser's redirect back. */
+  interactive?: boolean;
+  askUntil?: AbortableAsker;
+}
+
 /** Runs whichever kind of login the chosen method calls for. */
 export async function runAuthMethod(
   connection: AuthConnection,
   method: acp.AuthMethod,
   launch: AgentLaunch,
+  { interactive = false, askUntil }: RunAuthOptions = {},
 ): Promise<void> {
   if (authMethodType(method) === "terminal") {
     await runTerminalAuth(method, launch);
   } else {
     // A `terminal` method must never reach `authenticate` — the agent does not
-    // implement one for it. Whatever the agent says on stderr meanwhile may be
-    // the only place it says where to log in.
-    await showingAgentStderr(() => connection.authenticate({ methodId: method.id }));
+    // implement one for it.
+    await authenticateAgent(connection, method, interactive, askUntil);
   }
   console.error(`[auth] Logged in with "${method.name}" (${method.id}).`);
 }
@@ -282,7 +427,7 @@ export async function login({
     );
   }
 
-  await runAuthMethod(connection, method, launch);
+  await runAuthMethod(connection, method, launch, { interactive });
   return method;
 }
 
