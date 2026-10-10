@@ -24,6 +24,33 @@ describe("extractTaskIdFromMeta", () => {
 });
 
 describe("extractTaskIdFromText", () => {
+  it("extracts from AgentRQ task push envelope [Task <id>]", () => {
+    expect(extractTaskIdFromText("[Task 0k97F5bOQUb]\nDetails: do code review")).toBe("0k97F5bOQUb");
+    expect(extractTaskIdFromText("[Task 0k97F5bOQUb] Fix the flake\nDetails")).toBe("0k97F5bOQUb");
+  });
+
+  it("extracts from AgentRQ reply envelope [Reply to task <id>]", () => {
+    expect(extractTaskIdFromText("[Reply to task 0k97F5bOQUb] here is more info")).toBe("0k97F5bOQUb");
+  });
+
+  it("extracts from AgentRQ response envelope [Response to task <id>]", () => {
+    expect(
+      extractTaskIdFromText("[Response to task 0k97F5bOQUb] action=text: Please review again"),
+    ).toBe("0k97F5bOQUb");
+  });
+
+  it("extracts from AgentRQ reassigned task envelope [Task reassigned to agent]", () => {
+    expect(extractTaskIdFromText("[Task reassigned to agent] 0k97F5bOQUb")).toBe("0k97F5bOQUb");
+  });
+
+  it("extracts from AgentRQ hourly status check message", () => {
+    expect(
+      extractTaskIdFromText(
+        "Status Check: You are currently working on task 0k97F5bOQUb. Please provide a brief status update",
+      ),
+    ).toBe("0k97F5bOQUb");
+  });
+
   it("extracts from Task ID", () => {
     expect(extractTaskIdFromText("Task ID: 0amnlepEi1J")).toBe("0amnlepEi1J");
     expect(extractTaskIdFromText("task ID 0amnlepEi1J")).toBe("0amnlepEi1J");

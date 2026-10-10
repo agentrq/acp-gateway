@@ -22,7 +22,10 @@ function yesNo(value: unknown): string {
 }
 
 function section(title: string, rows: Array<[string, string]>): string {
-  const width = Math.max(...rows.map(([label]) => label.length));
+  let width = 0;
+  for (const [label] of rows) {
+    if (label.length > width) width = label.length;
+  }
   const body = rows.map(([label, value]) => `  ${label.padEnd(width)}  ${value}`);
   return [title, ...body].join("\n");
 }

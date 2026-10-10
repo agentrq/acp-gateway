@@ -21,11 +21,19 @@
  * count as use. Every operation stays O(1).
  */
 export class BoundedMap<K, V> extends Map<K, V> {
-  constructor(readonly capacity: number) {
+  constructor(
+    readonly capacity: number,
+    entries?: readonly (readonly [K, V])[] | null | Iterable<readonly [K, V]>,
+  ) {
     if (!Number.isInteger(capacity) || capacity < 1) {
       throw new RangeError(`BoundedMap capacity must be a positive integer, got ${capacity}`);
     }
     super();
+    if (entries) {
+      for (const [key, value] of entries) {
+        this.set(key, value);
+      }
+    }
   }
 
   override set(key: K, value: V): this {
@@ -55,8 +63,24 @@ export class FifoQueue<T> {
     return this.items.length - this.head;
   }
 
+  get isEmpty(): boolean {
+    return this.length === 0;
+  }
+
   push(item: T): void {
     this.items.push(item);
+  }
+
+  /** Returns the oldest item without removing it, or `undefined` when empty. */
+  peek(): T | undefined {
+    if (this.head === this.items.length) return undefined;
+    return this.items[this.head];
+  }
+
+  /** Removes all items from the queue. */
+  clear(): void {
+    this.items = [];
+    this.head = 0;
   }
 
   /** Removes and returns the oldest item, or `undefined` when empty. */
@@ -73,5 +97,16 @@ export class FifoQueue<T> {
       this.head = 0;
     }
     return item;
+  }
+
+  *[Symbol.iterator](): Iterator<T> {
+    for (let i = this.head; i < this.items.length; i++) {
+      const item = this.items[i];
+      if (item !== undefined) yield item;
+    }
+  }
+
+  toArray(): T[] {
+    return [...this];
   }
 }

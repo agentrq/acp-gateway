@@ -37,13 +37,57 @@ describe("BoundedMap", () => {
     expect(map.delete("a")).toBe(true);
     expect(map.size).toBe(0);
   });
+
+  it("accepts initial entries in constructor and enforces capacity", () => {
+    const map = new BoundedMap<string, number>(2, [
+      ["a", 1],
+      ["b", 2],
+      ["c", 3],
+    ]);
+    expect(map.size).toBe(2);
+    expect([...map.keys()]).toEqual(["b", "c"]);
+  });
 });
 
 describe("FifoQueue", () => {
   it("returns undefined when empty", () => {
     const queue = new FifoQueue<number>();
     expect(queue.length).toBe(0);
+    expect(queue.isEmpty).toBe(true);
+    expect(queue.peek()).toBeUndefined();
     expect(queue.shift()).toBeUndefined();
+  });
+
+  it("supports peek without removing the element", () => {
+    const queue = new FifoQueue<string>();
+    queue.push("first");
+    queue.push("second");
+    expect(queue.isEmpty).toBe(false);
+    expect(queue.peek()).toBe("first");
+    expect(queue.length).toBe(2);
+    expect(queue.shift()).toBe("first");
+    expect(queue.peek()).toBe("second");
+  });
+
+  it("supports clear to empty the queue", () => {
+    const queue = new FifoQueue<number>();
+    queue.push(1);
+    queue.push(2);
+    expect(queue.length).toBe(2);
+    queue.clear();
+    expect(queue.length).toBe(0);
+    expect(queue.isEmpty).toBe(true);
+    expect(queue.peek()).toBeUndefined();
+  });
+
+  it("supports iteration and toArray without consuming items", () => {
+    const queue = new FifoQueue<number>();
+    queue.push(10);
+    queue.push(20);
+    queue.push(30);
+    expect(queue.toArray()).toEqual([10, 20, 30]);
+    expect([...queue]).toEqual([10, 20, 30]);
+    expect(queue.length).toBe(3);
   });
 
   it("hands items back in the order they arrived, across compactions", () => {

@@ -440,6 +440,24 @@ describe("models", () => {
       expect(formatted).toContain("Supported models:");
       expect(formatted).toContain("[Anthropic] Claude 3.7 Sonnet");
     });
+
+    it("should safely format large lists of models without call stack overflow", () => {
+      const models = Array.from({ length: 5000 }, (_, i) => ({
+        id: `model-${i}`,
+        name: `Model ${i}`,
+        description: `Description for model ${i}`,
+        current: i === 0,
+      }));
+      const res: AgentModelsResult = {
+        configId: "model",
+        currentModelId: "model-0",
+        models,
+      };
+      const formatted = formatModelsText(res, "big-provider");
+      expect(formatted).toContain('Models supported by "big-provider":');
+      expect(formatted).toContain("* model-0 (current)");
+      expect(formatted).toContain("model-4999");
+    });
   });
 
   describe("setSessionModel", () => {

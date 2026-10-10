@@ -333,11 +333,7 @@ export class MCPBridge extends EventEmitter {
     }
 
     // Wait up to 10 seconds for connection
-    let waited = 0;
-    while (!this.isConnected && waited < 10000) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      waited += 500;
-    }
+    await this.waitUntilConnected(10_000);
 
     if (!this.isConnected) {
       throw new Error(`MCP not connected after 10s timeout`);

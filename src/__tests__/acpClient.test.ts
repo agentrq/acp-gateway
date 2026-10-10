@@ -2769,4 +2769,99 @@ describe("AgentRQACPClient", () => {
       consoleSpy.mockRestore();
     });
   });
+
+  describe("dispose and resource management", () => {
+    it("removes verdict and reconnected listeners from mcpBridge on dispose", () => {
+      const bridge = Object.assign(new EventEmitter(), {
+        getSessionId: vi.fn().mockReturnValue("test-session"),
+        sendNotification: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn(),
+      });
+      expect(bridge.listenerCount("verdict")).toBe(0);
+      expect(bridge.listenerCount("reconnected")).toBe(0);
+
+      const client = new AgentRQACPClient(bridge as unknown as MCPBridge);
+      expect(bridge.listenerCount("verdict")).toBe(1);
+      expect(bridge.listenerCount("reconnected")).toBe(1);
+
+      client.dispose();
+      expect(bridge.listenerCount("verdict")).toBe(0);
+      expect(bridge.listenerCount("reconnected")).toBe(0);
+    });
+
+    it("cancels pending permissions and aborts pending elicitations on dispose", async () => {
+      const bridge = Object.assign(new EventEmitter(), {
+        getSessionId: vi.fn().mockReturnValue("test-session"),
+        sendNotification: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn(),
+      });
+      let promptSignal: AbortSignal | undefined;
+      const client = new AgentRQACPClient(bridge as unknown as MCPBridge, () => undefined, {
+        promptUrlElicitation: ({ signal }) => {
+          promptSignal = signal;
+          return new Promise(() => {});
+        },
+      });
+
+      const permPromise = client.requestPermission({
+        sessionId: "sess-1",
+        toolCall: { toolCallId: "call-1" },
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow" },
+          { optionId: "reject", name: "Reject", kind: "reject" },
+        ],
+      } as any);
+
+      void client.createElicitation({
+        mode: "url",
+        url: "https://example.com/login",
+        elicitationId: "elicit-1",
+        message: "Sign in",
+      } as any);
+
+      await vi.waitFor(() => {
+        expect(client.pendingPermissionCount).toBe(1);
+        expect(promptSignal).toBeDefined();
+      });
+
+      expect(promptSignal?.aborted).toBe(false);
+
+      client.dispose();
+      expect(client.pendingPermissionCount).toBe(0);
+      expect(promptSignal?.aborted).toBe(true);
+
+      const result = await permPromise;
+      expect(result.outcome).toEqual({ outcome: "cancelled" });
+    });
+
+    it("bounds replyBuffers to prevent unbounded memory growth", async () => {
+      const bridge = Object.assign(new EventEmitter(), {
+        getSessionId: vi.fn().mockReturnValue("test-session"),
+        sendNotification: vi.fn().mockResolvedValue(undefined),
+        callTool: vi.fn(),
+      });
+      const client = new AgentRQACPClient(bridge as unknown as MCPBridge, (sid) => "task-" + sid);
+
+      for (let i = 0; i < 300; i++) {
+        await client.sessionUpdate({
+          sessionId: "sess-" + i,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "hello from " + i },
+          },
+        });
+      }
+
+      // sess-0 should have been evicted by BoundedMap(256)
+      await client.flushReply("sess-0");
+      expect(bridge.callTool).not.toHaveBeenCalledWith("reply", expect.objectContaining({ chatId: "task-sess-0" }));
+
+      // sess-299 should still be present
+      await client.flushReply("sess-299");
+      expect(bridge.callTool).toHaveBeenCalledWith("reply", expect.objectContaining({
+        chatId: "task-sess-299",
+        text: "hello from 299",
+      }));
+    });
+  });
 });

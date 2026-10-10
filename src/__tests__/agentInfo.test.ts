@@ -123,6 +123,19 @@ describe("describeAgentInfo", () => {
     expect(text).toContain("image             no");
     expect(text).toContain("http  no");
   });
+
+  it("should handle empty capability objects cleanly without throwing", () => {
+    const text = describeAgentInfo(
+      initResult({
+        agentCapabilities: {
+          promptCapabilities: {},
+          mcpCapabilities: {},
+        },
+      }),
+      "my-agent",
+    );
+    expect(text).toContain("my-agent");
+  });
 });
 
 describe('agentIdentity', () => {
