@@ -186,8 +186,12 @@ export function formatModelsText(
     return [idLabel, `${groupLabel}${nameLabel}`.trim(), descLabel];
   });
 
-  const idWidth = Math.max(...rows.map(([id]) => id.length));
-  const nameWidth = Math.max(...rows.map(([, name]) => name.length));
+  let idWidth = 0;
+  let nameWidth = 0;
+  for (const [id, name] of rows) {
+    if (id.length > idWidth) idWidth = id.length;
+    if (name.length > nameWidth) nameWidth = name.length;
+  }
 
   const body = rows
     .map(([id, name, desc]) => {

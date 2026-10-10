@@ -343,26 +343,26 @@ export function formatUrlElicitation(message: string, url: string): string {
 }
 
 export class AgentRQACPClient implements acp.Client {
-  private replyBuffers = new Map<string, string>();
+  private replyBuffers = new BoundedMap<string, string>(256);
   // sessionId → reasoning accumulated since the last boundary. Thought tokens
   // stream one at a time and are deliberately kept out of replyBuffers: they
   // are not the answer, and folding them in would both corrupt the reply and
   // break the dedup against the agent's own `reply` tool call.
-  private thoughtBuffers = new Map<string, string>();
+  private thoughtBuffers = new BoundedMap<string, string>(256);
   // sessionId → the most recent usage snapshot. Only the last one is worth
   // reporting: each supersedes the one before it.
-  private latestUsage = new Map<string, acp.UsageUpdate>();
+  private latestUsage = new BoundedMap<string, acp.UsageUpdate>(256);
   // Telemetry sends, run one after another so the workspace sees them in the
   // order the agent produced them, and off the ACP stream's critical path so a
   // slow or unreachable workspace never stalls the agent mid-turn.
   private telemetryChain: Promise<void> = Promise.resolve();
   // chatId → text sent by the agent via the reply MCP tool (for dedup in flushReply)
-  private agentReplies = new Map<string, string>();
+  private agentReplies = new BoundedMap<string, string>(200);
   // toolCallId → details seen on session updates. A `tool_call` update always
   // carries a title, but the permission request for that same call may omit it
   // (ACP marks it optional there, and codex-acp sends it bare), which would
   // otherwise leave us unable to tell an agentrq MCP call from anything else.
-  private toolCallDetails = new Map<string, { title?: string; rawInput?: unknown }>();
+  private toolCallDetails = new BoundedMap<string, { title?: string; rawInput?: unknown }>(512);
 
   // request_id → the tool call waiting on a human. One shared verdict listener
   // serves them all: a listener per request was only ever removed on a matching
@@ -406,6 +406,28 @@ export class AgentRQACPClient implements acp.Client {
    */
   setModeChangeHandler(handler: (sessionId: string, modeId: string) => unknown): void {
     this.onModeChanged = handler;
+  }
+
+  /**
+   * Cleans up event listeners registered on mcpBridge and aborts/cancels any
+   * pending elicitation or permission promises.
+   */
+  dispose(): void {
+    const bridge = this.mcpBridge as unknown as {
+      off?: (event: string, listener: (...args: any[]) => void) => void;
+    };
+    bridge.off?.("verdict", this.onVerdict);
+    bridge.off?.("reconnected", this.onWorkspaceReconnected);
+    this.cancelPendingPermissions("client disposed");
+    for (const controller of this.pendingUrlElicitations.values()) {
+      controller.abort();
+    }
+    this.pendingUrlElicitations.clear();
+    this.replyBuffers.clear();
+    this.thoughtBuffers.clear();
+    this.latestUsage.clear();
+    this.agentReplies.clear();
+    this.toolCallDetails.clear();
   }
 
   /** How many tool calls are waiting on a human right now. */

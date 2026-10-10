@@ -395,6 +395,8 @@ export async function closeSession(
     terminateAgentProcess(session.process);
   } catch (err) {
     // Process might already be dead or exited
+  } finally {
+    session.acpClient?.dispose?.();
   }
 }
 
@@ -764,7 +766,7 @@ export async function openAgentConnection({
     console.error(`[acp] Agent process error for ${label}:`, err.message);
     showAgentStderr(agentStderr());
     forgetAgentProcess(agentProcess);
-    acpClient.cancelPendingPermissions(`agent process for ${label} failed`);
+    acpClient.dispose();
     onExit?.();
   });
   agentProcess.on("exit", (code: number | null, signal: string | null) => {
@@ -778,7 +780,7 @@ export async function openAgentConnection({
     forgetAgentProcess(agentProcess);
     // Nothing will act on these answers now, but the tool calls waiting on them
     // are holding task-queue slots that would never be given back.
-    acpClient.cancelPendingPermissions(`agent process for ${label} exited`);
+    acpClient.dispose();
     onExit?.();
   });
   // stdin can emit EPIPE when the child dies mid-write; swallow it so it
@@ -1918,7 +1920,7 @@ export class TaskQueue {
    * includes everything this loop has started.
    */
   private next() {
-    while (this.queue.length > 0 && this.activeTasks < this.maxConcurrency) {
+    while (!this.queue.isEmpty && this.activeTasks < this.maxConcurrency) {
       // Non-null: the loop condition has just established the queue is not empty.
       const nextTask = this.queue.shift()!;
       this.execute(nextTask).catch((err) => {
