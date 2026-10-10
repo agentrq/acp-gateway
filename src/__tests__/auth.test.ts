@@ -529,6 +529,7 @@ describe("auth", () => {
               const line = signInLine(agent.port);
               stderr.emit("data", line.slice(0, 120));
               stderr.emit("data", line.slice(120));
+              stderr.emit("data", "I1010 still waiting for the browser\n");
               // The agent's login ends once its server has had the redirect.
               await agent.received;
               return {};

@@ -167,6 +167,12 @@ There are two kinds of method:
 - **Terminal** methods — the agent's own binary is re-run interactively so you can log in at a TUI.
   `acp-gateway` only offers to run these when it has a real terminal to hand over.
 
+Some agent methods sign in through a browser and send it back to a server the agent runs on `127.0.0.1`
+(antigravity's Google login does). If you open the link on another computer, its last page will not load,
+because `127.0.0.1` there is your own computer. When `acp-gateway` runs in a terminal, it notices that kind of
+link and asks for the address the browser ended up on. Paste it, and the gateway sends it to the agent on its
+own machine to finish the login.
+
 Credentials are never stored by the gateway; the agent keeps its own, exactly as it does under an editor.
 
 ### Configuration

@@ -276,8 +276,10 @@ export async function relayLoopbackRedirect(
       await fetch(url, { redirect: "manual" });
       console.error("[auth] Handed the sign-in to the agent; waiting for it to finish.");
     } catch (err) {
+      // fetch only ever fails with a TypeError; nothing listening is the usual one.
       console.error(
-        `[auth] Could not reach the agent at ${redirect.host}: ${err instanceof Error ? err.message : String(err)}`,
+        `[auth] Could not reach the agent at ${redirect.host} (${(err as Error).message}); ` +
+          `its login may have timed out already.`,
       );
     }
     return;
