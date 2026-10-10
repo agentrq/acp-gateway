@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
+import { PassThrough } from "node:stream";
+import { followAgentStderr } from "../log.js";
 import {
   AUTH_REQUIRED_CODE,
   authMethodType,
@@ -303,6 +305,27 @@ describe("auth", () => {
       const connection = { authenticate: vi.fn().mockResolvedValue({}), logout: vi.fn() };
       await runAuthMethod(connection, agentMethod, launch);
       expect(connection.authenticate).toHaveBeenCalledWith({ methodId: "agent-login" });
+    });
+
+    it("shows what the agent prints while it waits for the login", async () => {
+      // antigravity on a headless machine prints its login URL to stderr and
+      // nowhere else, then holds `authenticate` open until the browser is done.
+      const writeSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const stderr = new PassThrough();
+      const tail = followAgentStderr(stderr);
+      const connection = {
+        authenticate: vi.fn(async () => {
+          stderr.emit("data", "Open the following link to authenticate: https://example.test\n");
+          return {};
+        }),
+        logout: vi.fn(),
+      };
+      await runAuthMethod(connection, agentMethod, launch);
+      expect(writeSpy).toHaveBeenCalledWith(
+        "Open the following link to authenticate: https://example.test\n",
+      );
+      expect(tail()).toBe("");
+      writeSpy.mockRestore();
     });
 
     it("never sends a terminal method to authenticate", async () => {
