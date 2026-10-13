@@ -76,6 +76,8 @@ import {
   closeSession,
   closeAllSessions,
   setupSignalHandlers,
+  nativeOptionsFor,
+  startNativeMode,
 } from "../index.js";
 import { AgentRQACPClient, lastModelsForSession, sendModelsNotification } from "../acpClient.js";
 import { AUTH_REQUIRED_CODE } from "../auth.js";
@@ -3034,6 +3036,39 @@ describe("index", () => {
       errorSpy.mockRestore();
     });
 
+    it("leaves native mode off unless --acp-version is given", () => {
+      const options = parseGatewayArgs(["--agent", "gemini"]);
+      expect(options.acpVersion).toBeUndefined();
+      expect(options.acpUrl).toBeUndefined();
+    });
+
+    it.each([["1", 1], ["2", 2]])("reads --acp-version %s", (value, version) => {
+      expect(
+        parseGatewayArgs(["--acp-version", value, "--acp-url", "wss://x/api/acp/v1", "gemini"]),
+      ).toMatchObject({ acpVersion: version, acpUrl: "wss://x/api/acp/v1", rest: ["gemini"] });
+    });
+
+    it.each([["3"], ["v1"], [undefined]])("refuses --acp-version %s", (value) => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
+        throw new Error("exit");
+      }) as never);
+
+      expect(() => parseGatewayArgs(value ? ["--acp-version", value] : ["--acp-version"])).toThrow("exit");
+
+      expect(errorSpy).toHaveBeenCalledWith("[acp-gateway] --acp-version must be 1 or 2");
+      expect(exitSpy).toHaveBeenCalledWith(1);
+      errorSpy.mockRestore();
+      exitSpy.mockRestore();
+    });
+
+    it("says so when --acp-url is given no URL", () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      expect(parseGatewayArgs(["--acp-url"]).acpUrl).toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("--acp-url provided without a URL"));
+      errorSpy.mockRestore();
+    });
+
     it("should recognise model options", () => {
       expect(parseGatewayArgs(["--list-models"])).toMatchObject({ command: "list-models" });
       expect(parseGatewayArgs(["--model", "claude-3-7-sonnet"])).toMatchObject({
@@ -4022,6 +4057,86 @@ describe("index", () => {
     });
   });
 
+  describe("nativeOptionsFor", () => {
+    const agentrq: McpServerConfig = {
+      name: "agentrq",
+      type: "http",
+      url: "https://4hro0x9eslxd.mcp.agentrq.com/?token=t",
+      env: { A: "1" },
+    };
+
+    it("derives the endpoint and passes every option through as a header value", () => {
+      const options = parseGatewayArgs([
+        "--acp-version", "1", "--agent", "codex-acp", "--model", "m", "--max-concurrency", "4",
+        "--permission-timeout", "5", "--auth-method", "chatgpt",
+      ]);
+      expect(nativeOptionsFor(options, ["npx", "codex-acp"], agentrq, "/work")).toEqual({
+        version: 1,
+        acpCmdArgs: ["npx", "codex-acp"],
+        env: { A: "1" },
+        endpoint: "wss://4hro0x9eslxd.mcp.agentrq.com/api/acp/v1",
+        token: "t",
+        agentId: "codex-acp",
+        modelId: "m",
+        maxConcurrency: 4,
+        permissionTimeoutMinutes: 5,
+        authMethodId: "chatgpt",
+        cwd: "/work",
+      });
+    });
+
+    it("names a command-line agent by its basename and honours --acp-url", () => {
+      const options = parseGatewayArgs(["--acp-version", "2", "--acp-url", "ws://other/x"]);
+      const native = nativeOptionsFor(options, ["/opt/bin/gemini", "--acp"], agentrq);
+      expect(native).toMatchObject({ version: 2, agentId: "gemini", endpoint: "ws://other/x", cwd: process.cwd() });
+    });
+
+    it("needs the workspace token", () => {
+      const options = parseGatewayArgs(["--acp-version", "1"]);
+      expect(nativeOptionsFor(options, ["a"], { ...agentrq, url: "https://h/" })).toBe(
+        "native mode needs the workspace token from .mcp.json",
+      );
+    });
+
+    it("needs a URL, from .mcp.json or --acp-url", () => {
+      const options = parseGatewayArgs(["--acp-version", "1"]);
+      expect(
+        nativeOptionsFor(options, ["a"], { name: "x", type: "http", headers: { Authorization: "Bearer t" } }),
+      ).toMatch(/needs the AgentRQ URL/);
+    });
+
+    it("explains a URL it cannot read", () => {
+      const options = parseGatewayArgs(["--acp-version", "1"]);
+      expect(
+        nativeOptionsFor(options, ["a"], { name: "x", type: "http", url: "not a url", headers: { Authorization: "Bearer t" } }),
+      ).toMatch(/cannot work out the AgentRQ endpoint from "not a url"; pass --acp-url/);
+    });
+
+    it("starts native mode with those options", async () => {
+      const run = vi.fn(async () => {});
+      const exit = vi.fn();
+      await startNativeMode(parseGatewayArgs(["--acp-version", "1"]), ["a"], agentrq, run, exit);
+      expect(run).toHaveBeenCalledWith(expect.objectContaining({ endpoint: "wss://4hro0x9eslxd.mcp.agentrq.com/api/acp/v1", token: "t" }));
+      expect(exit).not.toHaveBeenCalled();
+    });
+
+    it("says why native mode cannot start and exits 1", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const run = vi.fn(async () => {});
+      const exit = vi.fn();
+      await startNativeMode(parseGatewayArgs(["--acp-version", "1"]), ["a"], { name: "x", type: "http", url: "https://h/" }, run, exit);
+      expect(errorSpy).toHaveBeenCalledWith("[acp-gateway] native mode needs the workspace token from .mcp.json");
+      expect(exit).toHaveBeenCalledWith(1);
+      expect(run).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it("defaults to version 1 when called without one", () => {
+      const options = parseGatewayArgs([]);
+      expect(nativeOptionsFor(options, [], agentrq)).toMatchObject({ version: 1, agentId: "" });
+    });
+  });
+
   describe("helpText", () => {
     it("should explain every option the parser accepts", () => {
       const text = helpText("9.9.9");
@@ -4046,6 +4161,8 @@ describe("index", () => {
           "--max-concurrency",
           "--permission-timeout",
           "--mcp-json",
+          "--acp-version",
+          "--acp-url",
           "--verbose",
           "--help",
         ]),
