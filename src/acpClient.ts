@@ -6,7 +6,7 @@
  */
 
 import * as acp from "@agentclientprotocol/sdk";
-import type { MCPBridge } from "./mcpClient.js";
+import { callTaskAction, type MCPBridge } from "./mcpClient.js";
 import {
   TELEMETRY_NOTIFICATION_METHOD,
   formatPlan,
@@ -60,13 +60,21 @@ const AGENTRQ_SERVER = /^agentrq(?:[.\-_][A-Za-z0-9.\-_]*)?$/i;
  * for the human.
  */
 const KNOWN_WORKSPACE_TOOLS: ReadonlySet<string> = new Set([
+  "task",
+  "memory",
+  "skills",
+  "workspace",
+  "siteTools",
+  "pano",
+  "help",
+  // What those replaced, still advertised by older servers.
   "reply",
   "createTask",
   "getTask",
   "updateTaskStatus",
   "getWorkspace",
   "publishEvent",
-  "downloadAttachment",
+  "getAttachment",
   "elicit",
   "loadMemory",
   "saveMemory",
@@ -91,6 +99,32 @@ function mcpCallFromTitle(title: string): { server: string; tool: string } | und
   const qualified = /^\s*mcp(__|[.\-])(.+?)\1([A-Za-z0-9_]+)\s*$/i.exec(title);
   if (qualified) return { server: qualified[2], tool: qualified[3] };
 
+  return undefined;
+}
+
+/**
+ * The task and text of a workspace reply the agent sent itself, if this
+ * workspace tool call was one.
+ *
+ * A reply comes in three shapes: the old `reply {chatId, text}`,
+ * `task {action: "reply", payload: {taskId, text}}`, and the flat
+ * `task {action: "reply", taskId, text}` the workspace also accepts.
+ */
+function agentReplyFromCall(
+  title: string,
+  rawInput: unknown,
+): { taskId: string; text: string } | undefined {
+  if (rawInput == null || typeof rawInput !== "object") return undefined;
+  const tool = mcpCallFromTitle(title)?.tool ?? title.trim().split(/[\s(]/)[0];
+  const input = rawInput as Record<string, any>;
+
+  if (/(^|[._-])reply$/.test(tool) && typeof input.chatId === "string") {
+    return { taskId: input.chatId, text: input.text ?? "" };
+  }
+  if (/(^|[._-])task$/.test(tool) && input.action === "reply") {
+    const args = input.payload != null && typeof input.payload === "object" ? input.payload : input;
+    if (typeof args.taskId === "string") return { taskId: args.taskId, text: args.text ?? "" };
+  }
   return undefined;
 }
 
@@ -356,7 +390,7 @@ export class AgentRQACPClient implements acp.Client {
   // order the agent produced them, and off the ACP stream's critical path so a
   // slow or unreachable workspace never stalls the agent mid-turn.
   private telemetryChain: Promise<void> = Promise.resolve();
-  // chatId → text sent by the agent via the reply MCP tool (for dedup in flushReply)
+  // taskId → text the agent replied to the workspace itself (for dedup in flushReply)
   private agentReplies = new BoundedMap<string, string>(200);
   // toolCallId → details seen on session updates. A `tool_call` update always
   // carries a title, but the permission request for that same call may omit it
@@ -678,7 +712,7 @@ export class AgentRQACPClient implements acp.Client {
     }
 
     try {
-      await this.mcpBridge.callTool("reply", { chatId: taskId, text });
+      await callTaskAction(this.mcpBridge, "reply", { taskId, text });
       debug(`[acp] Forwarded agent reply to task ${taskId}`);
     } catch (err) {
       console.error(`[acp] Failed to forward reply to task ${taskId}:`, err);
@@ -704,7 +738,7 @@ export class AgentRQACPClient implements acp.Client {
       `⚠️ The agent stopped for a reason this gateway does not recognise: ${stopReason}.`;
 
     try {
-      await this.mcpBridge.callTool("reply", { chatId: taskId, text });
+      await callTaskAction(this.mcpBridge, "reply", { taskId, text });
       debug(`[acp] Reported stop reason "${stopReason}" to task ${taskId}`);
     } catch (err) {
       console.error(`[acp] Failed to report stop reason to task ${taskId}:`, err);
@@ -1002,14 +1036,9 @@ export class AgentRQACPClient implements acp.Client {
         this.rememberToolCall(update);
         if (update.title && this.isWorkspaceToolCall(update.title)) {
           // Track completed reply calls so flushReply can skip exact duplicates
-          if (
-            update.status === "completed" &&
-            update.title.split(/[\s(]/)[0] === "reply" &&
-            update.rawInput != null &&
-            typeof (update.rawInput as any).chatId === "string"
-          ) {
-            const { chatId, text = "" } = update.rawInput as { chatId: string; text?: string };
-            this.agentReplies.set(chatId, text);
+          if (update.status === "completed") {
+            const reply = agentReplyFromCall(update.title, update.rawInput);
+            if (reply) this.agentReplies.set(reply.taskId, reply.text);
           }
           break;
         }
@@ -1145,7 +1174,7 @@ export class AgentRQACPClient implements acp.Client {
 
     if (!taskId) {
       // Request-scoped elicitations (e.g. during an auth/config phase before
-      // any session exists) have no task to attach to, but the elicit tool
+      // any session exists) have no task to attach to, but the workspace's elicit action
       // requires one — create one for the human to answer instead of
       // cancelling outright.
       taskId = await this.createTaskForElicitation(params.message);
@@ -1172,7 +1201,7 @@ export class AgentRQACPClient implements acp.Client {
     console.error(`[acp] Elicitation requested (mode=${params.mode}): ${params.message}`);
 
     try {
-      const result = await this.mcpBridge.callTool("elicit", toolArgs);
+      const result = await callTaskAction(this.mcpBridge, "elicit", toolArgs);
       const contentBlock = result.content as Array<{ type: string; text?: string }> | undefined;
       const text = contentBlock?.[0]?.text;
       if (!text) {
@@ -1200,13 +1229,13 @@ export class AgentRQACPClient implements acp.Client {
 
   /**
    * Creates a new AgentRQ task for a session-less elicitation and marks it
-   * ongoing, so the elicit tool call has somewhere to post the question and
+   * ongoing, so the elicit call has somewhere to post the question and
    * the human sees it show up as an active task rather than a stray message.
    * Returns the new task's base62 ID, or undefined if creation failed.
    */
   private async createTaskForElicitation(message: string): Promise<string | undefined> {
     try {
-      const created = await this.mcpBridge.callTool("createTask", {
+      const created = await callTaskAction(this.mcpBridge, "create", {
         title: message.length > 80 ? `${message.slice(0, 77)}...` : message,
         body: message,
         assignee: "human",
@@ -1218,7 +1247,7 @@ export class AgentRQACPClient implements acp.Client {
         return undefined;
       }
 
-      await this.mcpBridge.callTool("updateTaskStatus", { taskId, status: "ongoing" });
+      await callTaskAction(this.mcpBridge, "updateStatus", { taskId, status: "ongoing" });
       return taskId;
     } catch (err) {
       console.error(`[acp] Failed to create task for elicitation:`, err);
@@ -1228,7 +1257,7 @@ export class AgentRQACPClient implements acp.Client {
 
   /**
    * Called when the agent reports a url-mode elicitation as complete.
-   * AgentRQ's elicit tool already blocks until the human confirms, so our
+   * AgentRQ's elicit action already blocks until the human confirms, so our
    * createElicitation response has already reflected completion by the time
    * this notification (if any) arrives — matching the spec's requirement
    * that clients ignore completion notices for elicitations they don't

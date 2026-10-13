@@ -169,6 +169,13 @@ describe("AgentRQACPClient", () => {
         "mcp__agentrq-workspace__loadMemory",
         "mcp.agentrq-workspace.deleteMemory",
         "reply (agentrq-workspace MCP Server)",
+        "mcp__agentrq-workspace__task",
+        "mcp__agentrq-workspace__memory",
+        "mcp__agentrq-workspace__skills",
+        "mcp__agentrq-workspace__workspace",
+        "mcp__agentrq-workspace__siteTools",
+        "mcp__agentrq-workspace__pano",
+        "mcp__agentrq-workspace__help",
       ])("auto-allows %s", async (title) => {
         const { bridge, client: c } = clientFor("agentrq-workspace");
 
@@ -2862,6 +2869,156 @@ describe("AgentRQACPClient", () => {
         chatId: "task-sess-299",
         text: "hello from 299",
       }));
+    });
+  });
+
+  describe("the single task tool", () => {
+    const TASK_SERVER = new Set(["task", "pano", "getWorkspace"]);
+
+    beforeEach(() => {
+      (mcpBridge as any).getAdvertisedTools = vi.fn().mockReturnValue(TASK_SERVER);
+    });
+
+    function okResult(text = "ok") {
+      return { isError: false, content: [{ type: "text", text }] };
+    }
+
+    it("forwards the agent's reply through task", async () => {
+      mcpBridge.callTool.mockResolvedValue(okResult());
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      await c.sessionUpdate({ sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello" } } } as any);
+      await c.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("task", {
+        action: "reply",
+        payload: { taskId: "task-123", text: "Hello" },
+      });
+    });
+
+    it("reports a stop reason through task", async () => {
+      mcpBridge.callTool.mockResolvedValue(okResult());
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-1");
+
+      await c.reportStopReason("sess-1", "refusal");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("task", {
+        action: "reply",
+        payload: { taskId: "task-1", text: expect.any(String) },
+      });
+    });
+
+    it("creates, starts and asks through task when an elicitation has no task", async () => {
+      mcpBridge.callTool.mockImplementation(async (_name: string, args: any) => {
+        if (args.action === "create") return okResult("task created with id=T-new");
+        if (args.action === "elicit") return okResult(JSON.stringify({ action: "decline" }));
+        return okResult();
+      });
+      const params = {
+        mode: "form",
+        message: "Name?",
+        requestedSchema: { type: "object", properties: { name: { type: "string" } } },
+      } as any;
+
+      const response = await client.createElicitation(params);
+
+      expect(mcpBridge.callTool.mock.calls).toEqual([
+        ["task", { action: "create", payload: { title: "Name?", body: "Name?", assignee: "human" } }],
+        ["task", { action: "updateStatus", payload: { taskId: "T-new", status: "ongoing" } }],
+        ["task", {
+          action: "elicit",
+          payload: { taskId: "T-new", message: "Name?", mode: "form", requestedSchema: params.requestedSchema },
+        }],
+      ]);
+      expect(response).toEqual({ action: "decline" });
+    });
+
+    it.each([
+      ["task (agentrq-0an2BXTfpGj MCP Server)", { action: "reply", payload: { taskId: "task-123", text: "Hello world" } }],
+      ["mcp__agentrq-workspace__task", { action: "reply", payload: { taskId: "task-123", text: "Hello world" } }],
+      ["task (agentrq-0an2BXTfpGj MCP Server)", { action: "reply", taskId: "task-123", text: "Hello world" }],
+      ["mcp__agentrq-workspace__reply", { chatId: "task-123", text: "Hello world" }],
+      ["agentrq-workspace_task", { action: "reply", payload: { taskId: "task-123", text: "Hello world" } }],
+    ])("does not repeat a reply the agent already sent as %s %j", async (title, rawInput) => {
+      mcpBridge.callTool.mockResolvedValue(okResult());
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+      (mcpBridge as any).getAdvertisedTools.mockReturnValue(new Set([...TASK_SERVER, "reply"]));
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      await c.sessionUpdate({ sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello world" } } } as any);
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: { sessionUpdate: "tool_call", title, status: "completed", toolCallId: "tc-1", rawInput },
+      } as any);
+      await c.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["another action", { action: "get", payload: { taskId: "task-123" } }],
+      ["no task id", { action: "reply", payload: { text: "Hello world" } }],
+      ["a payload that is not an object", { action: "reply", payload: "Hello world" }],
+      ["no input", undefined],
+    ])("still replies when the agent's task call has %s", async (_case, rawInput) => {
+      mcpBridge.callTool.mockResolvedValue(okResult());
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      await c.sessionUpdate({ sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello world" } } } as any);
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: { sessionUpdate: "tool_call", title: "mcp__agentrq-workspace__task", status: "completed", toolCallId: "tc-1", rawInput },
+      } as any);
+      await c.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledWith("task", {
+        action: "reply",
+        payload: { taskId: "task-123", text: "Hello world" },
+      });
+    });
+
+    it.each([
+      ["mcp__agentrq-workspace__task", { action: "reply", payload: { taskId: "task-123" } }],
+      ["mcp__agentrq-workspace__reply", { chatId: "task-123" }],
+    ])("treats a %s reply with no text as empty, not as the agent's text", async (title, rawInput) => {
+      (mcpBridge as any).getAdvertisedTools.mockReturnValue(new Set([...TASK_SERVER, "reply"]));
+      mcpBridge.callTool.mockResolvedValue(okResult());
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      await c.sessionUpdate({ sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hello world" } } } as any);
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: { sessionUpdate: "tool_call", title, status: "completed", toolCallId: "tc-1", rawInput },
+      } as any);
+      await c.flushReply("sess-1");
+
+      expect(mcpBridge.callTool).toHaveBeenCalledTimes(1);
+    });
+
+    it("recognises task as the workspace's own when tools/list failed", async () => {
+      (mcpBridge as any).getAdvertisedTools.mockReturnValue(undefined);
+      mcpBridge.callTool.mockResolvedValue(okResult());
+      const c = new AgentRQACPClient(mcpBridge as unknown as MCPBridge, () => "task-123");
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+      await c.sessionUpdate({ sessionId: "sess-1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hi" } } } as any);
+      await c.sessionUpdate({
+        sessionId: "sess-1",
+        update: {
+          sessionUpdate: "tool_call",
+          title: "mcp__agentrq-workspace__task",
+          status: "completed",
+          toolCallId: "tc-1",
+          rawInput: { action: "reply", payload: { taskId: "task-123", text: "Hi" } },
+        },
+      } as any);
+      await c.flushReply("sess-1");
+
+      // Were task not on the known list, the call would go unrecognised and the reply repeat.
+      expect(mcpBridge.callTool).not.toHaveBeenCalled();
     });
   });
 });

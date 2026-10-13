@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { MCPBridge } from "../mcpClient.js";
+import { MCPBridge, callTaskAction } from "../mcpClient.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -637,4 +637,57 @@ describe("MCPBridge", () => {
     errorSpy.mockRestore();
   });
 
+});
+
+describe("callTaskAction", () => {
+  function bridgeWith(tools: string[] | undefined) {
+    return {
+      callTool: vi.fn().mockResolvedValue({ content: [] }),
+      getAdvertisedTools: vi.fn().mockReturnValue(tools && new Set(tools)),
+    };
+  }
+
+  it("calls task with the action and its payload when the workspace advertises task", async () => {
+    const bridge = bridgeWith(["task", "pano"]);
+    await callTaskAction(bridge, "reply", { taskId: "T1", text: "hi" });
+    expect(bridge.callTool).toHaveBeenCalledWith("task", {
+      action: "reply",
+      payload: { taskId: "T1", text: "hi" },
+    });
+  });
+
+  it("leaves the payload out when the action takes nothing", async () => {
+    const bridge = bridgeWith(["task"]);
+    await callTaskAction(bridge, "get");
+    expect(bridge.callTool).toHaveBeenCalledWith("task", { action: "get" });
+  });
+
+  it.each([
+    ["create", "createTask", { title: "t", body: "b" }],
+    ["updateStatus", "updateTaskStatus", { taskId: "T1", status: "ongoing" }],
+    ["elicit", "elicit", { taskId: "T1", message: "m", mode: "form" }],
+    ["getAttachment", "getAttachment", { taskId: "T1", attachmentId: "A1" }],
+  ] as const)("calls %s's old tool %s on a workspace without task", async (action, tool, payload) => {
+    const bridge = bridgeWith(["reply", "createTask"]);
+    await callTaskAction(bridge, action, payload);
+    expect(bridge.callTool).toHaveBeenCalledWith(tool, payload);
+  });
+
+  it("names reply's task chatId on a workspace without task", async () => {
+    const bridge = bridgeWith(["reply"]);
+    await callTaskAction(bridge, "reply", { taskId: "T1", text: "hi" });
+    expect(bridge.callTool).toHaveBeenCalledWith("reply", { chatId: "T1", text: "hi" });
+  });
+
+  it("calls the old tool with no arguments when the action takes nothing", async () => {
+    const bridge = bridgeWith(undefined);
+    await callTaskAction(bridge, "get");
+    expect(bridge.callTool).toHaveBeenCalledWith("getTask");
+  });
+
+  it("falls back to the old tools for a bridge that cannot say what it advertises", async () => {
+    const bridge = { callTool: vi.fn().mockResolvedValue({ content: [] }) };
+    await callTaskAction(bridge, "updateStatus", { taskId: "T1", status: "ongoing" });
+    expect(bridge.callTool).toHaveBeenCalledWith("updateTaskStatus", { taskId: "T1", status: "ongoing" });
+  });
 });

@@ -14,6 +14,50 @@ import { extractTaskIdFromMeta } from "./taskIdentity.js";
 import { SET_CONCURRENCY_NOTIFICATION_METHOD } from "./concurrency.js";
 import { debug } from "./log.js";
 
+/** The actions of the workspace's `task` tool that the gateway calls. */
+export type TaskAction =
+  | "create"
+  | "get"
+  | "updateStatus"
+  | "reply"
+  | "elicit"
+  | "getAttachment";
+
+/** The tool each action was before the workspace folded them into `task`. */
+const LEGACY_TASK_TOOLS: Record<TaskAction, string> = {
+  create: "createTask",
+  get: "getTask",
+  updateStatus: "updateTaskStatus",
+  reply: "reply",
+  elicit: "elicit",
+  getAttachment: "getAttachment",
+};
+
+/**
+ * Calls one action of the workspace's task tool, in whichever shape the
+ * workspace speaks.
+ *
+ * A workspace that advertises `task` gets `task {action, payload}`. Any other
+ * — an older server, or one not asked yet — gets the action's old tool with
+ * the payload as its arguments, `reply` naming its task `chatId` as it used to.
+ * Newer servers still answer the old names, so guessing old is the safe miss.
+ */
+export async function callTaskAction(
+  bridge: Pick<MCPBridge, "callTool"> & Partial<Pick<MCPBridge, "getAdvertisedTools">>,
+  action: TaskAction,
+  payload?: Record<string, unknown>,
+) {
+  if (bridge.getAdvertisedTools?.()?.has("task")) {
+    return bridge.callTool("task", payload ? { action, payload } : { action });
+  }
+  if (action === "reply" && payload) {
+    const { taskId, ...rest } = payload;
+    return bridge.callTool("reply", { chatId: taskId, ...rest });
+  }
+  const tool = LEGACY_TASK_TOOLS[action];
+  return payload ? bridge.callTool(tool, payload) : bridge.callTool(tool);
+}
+
 export class MCPBridge extends EventEmitter {
   private client: Client | null = null;
   private transport: StreamableHTTPClientTransport | null = null;
