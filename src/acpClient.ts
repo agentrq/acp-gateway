@@ -61,8 +61,13 @@ const AGENTRQ_SERVER = /^agentrq(?:[.\-_][A-Za-z0-9.\-_]*)?$/i;
  */
 const KNOWN_WORKSPACE_TOOLS: ReadonlySet<string> = new Set([
   "task",
+  "memory",
+  "skills",
+  "workspace",
+  "siteTools",
   "pano",
-  // What `task` replaced, still advertised by older servers.
+  "help",
+  // What those replaced, still advertised by older servers.
   "reply",
   "createTask",
   "getTask",

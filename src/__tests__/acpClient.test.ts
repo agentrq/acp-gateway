@@ -169,6 +169,13 @@ describe("AgentRQACPClient", () => {
         "mcp__agentrq-workspace__loadMemory",
         "mcp.agentrq-workspace.deleteMemory",
         "reply (agentrq-workspace MCP Server)",
+        "mcp__agentrq-workspace__task",
+        "mcp__agentrq-workspace__memory",
+        "mcp__agentrq-workspace__skills",
+        "mcp__agentrq-workspace__workspace",
+        "mcp__agentrq-workspace__siteTools",
+        "mcp__agentrq-workspace__pano",
+        "mcp__agentrq-workspace__help",
       ])("auto-allows %s", async (title) => {
         const { bridge, client: c } = clientFor("agentrq-workspace");
 
