@@ -23,7 +23,7 @@ import {
   type McpServerConfig,
   type McpTransport,
 } from "./config.js";
-import { MCPBridge } from "./mcpClient.js";
+import { MCPBridge, callTaskAction } from "./mcpClient.js";
 import { BoundedMap, FifoQueue } from "./collections.js";
 
 /**
@@ -2946,7 +2946,7 @@ export async function fetchNextTask(
   // flight (or while the session is being opened) still stops the task.
   const queuedSeq = nextTaskSeq();
   try {
-    const result = await mcpBridge.callTool("getTask");
+    const result = await callTaskAction(mcpBridge, "get");
 
     if (result.isError) {
       console.error("[mcp] Error getting next task:", result.content);
