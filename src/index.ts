@@ -117,6 +117,8 @@ import {
   fetchRegistry,
   findAgent,
   hostPlatformTarget,
+  isAgentUnverified,
+  type PlatformTarget,
 } from "./registry.js";
 import {
   extractTaskIdFromMeta,
@@ -2177,26 +2179,33 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
 /**
  * Prints every agent the registry publishes, and how each one can be run here.
  *
- * `json` prints `{ agents: [{ id, name, runtimes }] }` instead — one array
+ * `json` prints `{ agents: [{ id, name, runtimes, unverified? }] }` instead — one array
  * entry per agent, `runtimes` being what [availableKinds] says this machine
  * can actually run it as, which is empty rather than omitted for an agent
- * with no build for this platform.
+ * with no build for this platform. `unverified` is true when the agent would
+ * install a binary lacking a SHA-256 and is omitted otherwise.
  */
 export async function runListAgents(
   registryUrl?: string,
   fetchImpl: typeof fetch = fetch,
   json = false,
+  platformTarget: PlatformTarget | undefined = hostPlatformTarget(),
 ): Promise<void> {
   const registry = await fetchRegistry(registryUrl, fetchImpl);
-  const target = hostPlatformTarget();
+  const target = platformTarget;
   if (json) {
     console.log(
       JSON.stringify({
-        agents: registry.agents.map((agent) => ({
-          id: agent.id,
-          name: agent.name,
-          runtimes: availableKinds(agent, target),
-        })),
+        agents: registry.agents.map((agent) => {
+          const runtimes = availableKinds(agent, target);
+          const unverified = isAgentUnverified(agent, target);
+          return {
+            id: agent.id,
+            name: agent.name,
+            runtimes,
+            ...(unverified ? { unverified: true } : {}),
+          };
+        }),
       }),
     );
     return;

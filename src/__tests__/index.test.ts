@@ -3361,6 +3361,113 @@ describe("index", () => {
         agents: [{ id: "gemini", name: "Gemini CLI", runtimes: ["npx"] }],
       });
     });
+
+    it("marks agents installing without a checksum with unverified: true in JSON output and omits the field otherwise", async () => {
+      const fullRegistry = {
+        version: "1.0.0",
+        agents: [
+          {
+            id: "crow-cli",
+            name: "crow-cli",
+            version: "1.0.0",
+            description: "Binary agent without checksum",
+            distribution: {
+              binary: {
+                "darwin-aarch64": {
+                  archive: "https://example.com/crow.tar.gz",
+                  cmd: "./crow",
+                },
+              },
+            },
+          },
+          {
+            id: "opencode",
+            name: "OpenCode",
+            version: "1.0.0",
+            description: "Binary agent with checksum",
+            distribution: {
+              binary: {
+                "darwin-aarch64": {
+                  archive: "https://example.com/opencode.tar.gz",
+                  sha256: "a".repeat(64),
+                  cmd: "./opencode",
+                },
+              },
+            },
+          },
+          {
+            id: "gemini",
+            name: "Gemini CLI",
+            version: "0.58.0",
+            description: "npx agent",
+            distribution: { npx: { package: "@google/gemini-cli" } },
+          },
+          {
+            id: "fast-agent",
+            name: "fast-agent",
+            version: "1.0.0",
+            description: "uvx agent",
+            distribution: { uvx: { package: "fast-agent" } },
+          },
+          {
+            id: "hybrid",
+            name: "Hybrid",
+            version: "1.0.0",
+            description: "npx and binary agent without checksum",
+            distribution: {
+              npx: { package: "hybrid-cli" },
+              binary: {
+                "darwin-aarch64": {
+                  archive: "https://example.com/hybrid.tar.gz",
+                  cmd: "./hybrid",
+                },
+              },
+            },
+          },
+          {
+            id: "linux-only",
+            name: "Linux Only",
+            version: "1.0.0",
+            description: "no build for darwin",
+            distribution: {
+              binary: {
+                "linux-x86_64": {
+                  archive: "https://example.com/linux.tar.gz",
+                  cmd: "./linux",
+                },
+              },
+            },
+          },
+        ],
+      };
+
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      const fetchImpl = vi.fn().mockResolvedValue({ ok: true, json: async () => fullRegistry });
+
+      await runListAgents(undefined, fetchImpl as any, true, "darwin-aarch64");
+
+      const calls = logSpy.mock.calls;
+      logSpy.mockRestore();
+      expect(calls).toHaveLength(1);
+      const parsed = JSON.parse(calls[0][0]);
+      expect(parsed).toEqual({
+        agents: [
+          { id: "crow-cli", name: "crow-cli", runtimes: ["binary"], unverified: true },
+          { id: "opencode", name: "OpenCode", runtimes: ["binary"] },
+          { id: "gemini", name: "Gemini CLI", runtimes: ["npx"] },
+          { id: "fast-agent", name: "fast-agent", runtimes: ["uvx"] },
+          { id: "hybrid", name: "Hybrid", runtimes: ["npx", "binary"] },
+          { id: "linux-only", name: "Linux Only", runtimes: [] },
+        ],
+      });
+
+      expect(parsed.agents[0]).toHaveProperty("unverified", true);
+      expect(parsed.agents[1]).not.toHaveProperty("unverified");
+      expect(parsed.agents[2]).not.toHaveProperty("unverified");
+      expect(parsed.agents[3]).not.toHaveProperty("unverified");
+      expect(parsed.agents[4]).not.toHaveProperty("unverified");
+      expect(parsed.agents[5]).not.toHaveProperty("unverified");
+    });
   });
 
   describe("resolveAgentCommand", () => {

@@ -135,7 +135,10 @@ export function describeAgents(
 ): string {
   const rows = registry.agents.map((agent) => {
     const kinds = availableKinds(agent, target);
-    const support = kinds.length ? kinds.join(", ") : "unavailable on this platform";
+    let support = kinds.length ? kinds.join(", ") : "unavailable on this platform";
+    if (isAgentUnverified(agent, target)) {
+      support += ", unverified";
+    }
     return `  ${agent.id.padEnd(22)} ${agent.name} — ${support}`;
   });
   return rows.join("\n");
@@ -151,6 +154,22 @@ export function availableKinds(
   if (agent.distribution.uvx) kinds.push("uvx");
   if (target && agent.distribution.binary?.[target]) kinds.push("binary");
   return kinds;
+}
+
+/**
+ * Whether launching this agent on `target` would install a binary that publishes no SHA-256.
+ *
+ * An unverified binary requires `--allow-unverified-agent` at launch time.
+ */
+export function isAgentUnverified(
+  agent: RegistryAgent,
+  target: PlatformTarget | undefined,
+): boolean {
+  const kinds = availableKinds(agent, target);
+  if (kinds.includes("npx") || kinds.includes("uvx") || !kinds.includes("binary")) {
+    return false;
+  }
+  return !selectBinaryTarget(agent, target).sha256;
 }
 
 /**
