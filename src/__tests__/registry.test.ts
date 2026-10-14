@@ -6,6 +6,7 @@ import {
   fetchRegistry,
   findAgent,
   hostPlatformTarget,
+  isAgentUnverified,
   packageLaunchSpec,
   selectBinaryTarget,
   type Registry,
@@ -154,12 +155,53 @@ describe("registry", () => {
     });
   });
 
+  describe("isAgentUnverified", () => {
+    it("returns true for a binary-only agent that publishes no sha256 for this platform", () => {
+      expect(isAgentUnverified(antigravity, "darwin-aarch64")).toBe(true);
+    });
+
+    it("returns false when the binary publishes a sha256", () => {
+      expect(isAgentUnverified(antigravity, "linux-x86_64")).toBe(false);
+    });
+
+    it("returns false for package distributions", () => {
+      expect(isAgentUnverified(gemini, "darwin-aarch64")).toBe(false);
+      expect(isAgentUnverified(fastAgent, "darwin-aarch64")).toBe(false);
+    });
+
+    it("returns false when an agent publishes both a package and an unverified binary", () => {
+      const npxAndBinary: RegistryAgent = {
+        ...gemini,
+        distribution: { ...gemini.distribution, binary: antigravity.distribution.binary },
+      };
+      expect(isAgentUnverified(npxAndBinary, "darwin-aarch64")).toBe(false);
+
+      const uvxAndBinary: RegistryAgent = {
+        ...fastAgent,
+        distribution: { ...fastAgent.distribution, binary: antigravity.distribution.binary },
+      };
+      expect(isAgentUnverified(uvxAndBinary, "darwin-aarch64")).toBe(false);
+    });
+
+    it("returns false when there is no build for this platform", () => {
+      expect(isAgentUnverified(antigravity, "windows-aarch64")).toBe(false);
+      expect(isAgentUnverified(antigravity, undefined)).toBe(false);
+    });
+  });
+
   describe("describeAgents", () => {
     it("lists every agent with how it can be run here", () => {
       const text = describeAgents(registry, "darwin-aarch64");
       expect(text).toContain("gemini");
       expect(text).toContain("Gemini CLI — npx");
       expect(text).toContain("fast-agent");
+      expect(text).toContain("Google Antigravity — binary, unverified");
+    });
+
+    it("does not mark verified binary agents as unverified", () => {
+      const text = describeAgents(registry, "linux-x86_64");
+      expect(text).toContain("Google Antigravity — binary");
+      expect(text).not.toContain("unverified");
     });
 
     it("says when an agent cannot run on this machine", () => {
