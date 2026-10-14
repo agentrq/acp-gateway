@@ -13,6 +13,7 @@ import type { McpServerConfig } from "./config.js";
 import { extractTaskIdFromMeta } from "./taskIdentity.js";
 import { SET_CONCURRENCY_NOTIFICATION_METHOD } from "./concurrency.js";
 import { debug } from "./log.js";
+import { pkg } from "./version.js";
 
 /** The actions of the workspace's `task` tool that the gateway calls. */
 export type TaskAction =
@@ -197,7 +198,7 @@ export class MCPBridge extends EventEmitter {
     this.client = new Client(
       {
         name: "acp-gateway",
-        version: "0.2.35",
+        version: pkg.version,
       },
       {
         capabilities: {},

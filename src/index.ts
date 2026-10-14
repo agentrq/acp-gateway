@@ -25,6 +25,8 @@ import {
 } from "./config.js";
 import { MCPBridge, callTaskAction } from "./mcpClient.js";
 import { BoundedMap, FifoQueue } from "./collections.js";
+import { runNative, type NativeOptions } from "./native.js";
+import { nativeEndpoint, tokenFrom } from "./nativeFrames.js";
 
 /**
  * What the agent said about a transport, if anything.
@@ -2015,6 +2017,13 @@ export interface GatewayOptions {
    * for a gateway run from somewhere other than the workspace it belongs to.
    */
   mcpJsonPath?: string;
+  /**
+   * Native mode: AgentRQ speaks this ACP version itself, and the gateway only
+   * pipes the agent's stdio to it. Unset is classic mode.
+   */
+  acpVersion?: 1 | 2;
+  /** The native endpoint, when it cannot be worked out from .mcp.json. */
+  acpUrl?: string;
   /** Tokens that are not gateway options — the agent command, when no `--` was used. */
   rest: string[];
 }
@@ -2160,6 +2169,22 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
           console.error(
             "[acp-gateway] Warning: --mcp-json provided without a path; ignoring.",
           );
+        }
+        break;
+      case "--acp-version":
+        if (value !== "1" && value !== "2") {
+          console.error("[acp-gateway] --acp-version must be 1 or 2");
+          process.exit(1);
+        }
+        options.acpVersion = Number(value) as 1 | 2;
+        i++;
+        break;
+      case "--acp-url":
+        if (value) {
+          options.acpUrl = value;
+          i++;
+        } else {
+          console.error("[acp-gateway] Warning: --acp-url provided without a URL; ignoring.");
         }
         break;
       case "--help":
@@ -2535,6 +2560,58 @@ export async function runAgentCommand(
 }
 
 /**
+ * What native mode runs with, from the gateway's own options and the
+ * workspace's AgentRQ entry. A string is the reason it cannot run.
+ */
+export function nativeOptionsFor(
+  options: GatewayOptions,
+  acpCmdArgs: string[],
+  agentrqConfig: McpServerConfig,
+  cwd: string = process.cwd(),
+): NativeOptions | string {
+  const token = tokenFrom(agentrqConfig);
+  if (!token) return "native mode needs the workspace token from .mcp.json";
+  if (!agentrqConfig.url && !options.acpUrl) {
+    return "native mode needs the AgentRQ URL from .mcp.json, or --acp-url";
+  }
+  let endpoint: string;
+  try {
+    endpoint = nativeEndpoint(agentrqConfig.url ?? "", options.acpVersion ?? 1, options.acpUrl);
+  } catch {
+    return `native mode cannot work out the AgentRQ endpoint from "${agentrqConfig.url}"; pass --acp-url`;
+  }
+  return {
+    version: options.acpVersion ?? 1,
+    acpCmdArgs,
+    env: agentrqConfig.env,
+    endpoint,
+    token,
+    agentId: options.agentId ?? path.basename(acpCmdArgs[0] ?? ""),
+    modelId: options.modelId,
+    maxConcurrency: options.maxConcurrency,
+    permissionTimeoutMinutes: Math.round(options.permissionTimeoutMs / 60_000),
+    authMethodId: options.authMethodId,
+    cwd: path.resolve(cwd),
+  };
+}
+
+/** Runs native mode in place of the MCP bridge, or says why it cannot and exits 1. */
+export async function startNativeMode(
+  options: GatewayOptions,
+  acpCmdArgs: string[],
+  agentrqConfig: McpServerConfig,
+  run: (o: NativeOptions) => Promise<void> = runNative,
+  exit: (code: number) => void = process.exit.bind(process),
+): Promise<void> {
+  const native = nativeOptionsFor(options, acpCmdArgs, agentrqConfig);
+  if (typeof native === "string") {
+    console.error(`[acp-gateway] ${native}`);
+    return exit(1);
+  }
+  await run(native);
+}
+
+/**
  * The full help text.
  *
  * Shown for `--help`, and when the gateway is run with nothing to do — at
@@ -2590,6 +2667,12 @@ BRIDGE
                               gateway from outside its workspace. Any filename;
                               a directory means the .mcp.json inside it. Its
                               servers win where the names collide.
+  --acp-version <1|2>         Native mode: pipe the agent's ACP stream to AgentRQ,
+                              which speaks ACP version 1 or 2 itself
+                              (/api/acp/v1 or /api/acp/v2), instead of
+                              translating it here. Needs Node 22 or newer.
+  --acp-url <url>             The native endpoint, when it cannot be worked out
+                              from .mcp.json.
 
 OTHER
   --verbose                   Print everything: connections, notifications,
@@ -2611,6 +2694,7 @@ EXAMPLES
   acp-gateway --login -- gemini --acp            Log in before running anything
   acp-gateway --max-concurrency 4 -- gemini --acp
   acp-gateway --mcp-json ~/work/.mcp.json -- gemini --acp
+  acp-gateway --acp-version 1 --agent codex-acp  Let AgentRQ speak ACP itself
 
 The workspace comes from .mcp.json, searched for in the current directory and up
 to three directories above it. --mcp-json names one directly, wherever it lives
@@ -2710,6 +2794,10 @@ async function main() {
     }
     process.exit(0);
   }
+
+  // Native mode: AgentRQ is the ACP client, and this process only pipes bytes.
+  // None of the MCP bridge below is used.
+  if (options.acpVersion) return startNativeMode(options, acpCmdArgs, agentrqConfig);
 
   // After the auth commands, which must not go fetching tasks while someone
   // logs in. After the bridge, because the queue now reports itself to it — and

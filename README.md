@@ -37,7 +37,7 @@ npm install -g @agentrq/acp-gateway
 
 ## Current Version
 
-`0.2.35`
+`0.3.0`
 
 ## Usage
 
@@ -74,6 +74,8 @@ You can specify gateway options before the `--` separator:
 - `--list-auth-methods`: Prints the login methods the agent advertises, then exits.
 - `--login [method-id]`: Logs in to the agent, then exits.
 - `--logout`: Ends the agent's authenticated state, then exits (only for agents that support logout).
+- `--acp-version <1|2>`: Native mode. AgentRQ speaks ACP itself, and the gateway only pipes the agent's stdio to it (see [Native Mode](#native-mode-agentrq-speaks-acp)).
+- `--acp-url <url>`: The native endpoint, for a deployment where it cannot be worked out from `.mcp.json`.
 
 Example:
 ```bash
@@ -256,6 +258,39 @@ The limit lives in memory. It survives MCP reconnects but not a gateway restart,
 number means. Nothing reports a flag back to the person who typed it, so unlike the workspace's path the
 gateway says out loud on startup when a flag value was capped or could not be read.
 
+### Native Mode (AgentRQ Speaks ACP)
+
+```bash
+acp-gateway --acp-version 1 --agent codex-acp
+acp-gateway --acp-version 1 -- your-acp-agent --flag1
+```
+
+With `--acp-version`, AgentRQ is the ACP client and the gateway no longer translates anything. It starts the
+agent exactly as it would otherwise (a registry id or the command after `--`) and moves bytes: each line the
+agent writes becomes one WebSocket text frame to AgentRQ, and each frame AgentRQ sends becomes one line on the
+agent's stdin. It never parses the ACP messages in between.
+
+- **Where it connects.** `.mcp.json` is still where the workspace comes from. The endpoint is the AgentRQ
+  server's own origin with the path `/api/acp/v1` (or `/api/acp/v2`), over `wss://` for an `https://` server
+  and `ws://` for `http://`. The workspace token is the URL's `?token=` or the entry's `Authorization: Bearer`
+  header. `--acp-url` names the endpoint outright.
+- **Before connecting** it sends a plain `GET` with the token, so a problem is named rather than retried for ever:
+  an old server without the endpoint (404), a bad token (401/403, with the server's reason), or a proxy that does
+  not pass `Upgrade` for `/api/acp/`. Each of these exits 1.
+- **Options travel as headers.** `--agent`, `--model`, `--max-concurrency`, `--permission-timeout` and
+  `--auth-method` reach AgentRQ in the WebSocket handshake, along with the working directory every session runs in.
+- **Dropped connections resume.** The gateway reconnects with backoff (1 s doubling to 60 s), and AgentRQ keeps
+  the connection for two minutes. Within that time nothing is lost or repeated: each side replays what the other
+  had not acknowledged, up to 1,024 frames or 8 MiB. Past it, the agent is restarted and starts over.
+- **A dead agent is restarted** after 2 s, doubling to a minute. After five exits within five minutes the gateway
+  gives up and exits 1 with the agent's last output.
+- **Errors that a retry cannot fix** (an agent that speaks a different ACP version, a login that needs a terminal)
+  are printed and exit 1.
+- `--login`, `--logout`, `--list-models`, `--list-auth-methods` and `--agent-info` ignore the flag: they still talk
+  to the agent locally, as before.
+- Native mode needs **Node 22 or newer**. Without `--acp-version`, the gateway behaves exactly as before, on Node 20
+  too.
+
 ## How It Works
 
 ```
@@ -306,6 +341,8 @@ gateway says out loud on startup when a flag value was capped or could not be re
 | `src/registry.ts` | Reads the ACP registry index — agent lookup, host platform matching, and package launch commands. |
 | `src/agentInstall.ts` | Downloads, verifies, unpacks and caches a registry agent's binary distribution. |
 | `src/progress.ts` | Draws the single-line download progress bar, on a terminal and nowhere else. |
+| `src/native.ts` | Native mode: runs the agent and pipes its stdio to AgentRQ's WebSocket, with resume, reconnect and respawn. |
+| `src/nativeFrames.ts` | Native mode's pure parts: line splitting, control frames, the replay ring, the endpoint and headers. |
 
 ## Development
 
@@ -333,6 +370,8 @@ acp-gateway/
 │   ├── config.ts          # .mcp.json loader
 │   ├── index.ts           # Entry point & orchestrator
 │   ├── mcpClient.ts       # MCP Bridge with auto-reconnect
+│   ├── native.ts          # Native mode byte bridge (--acp-version)
+│   ├── nativeFrames.ts    # Native mode frames, replay ring, headers
 │   ├── progress.ts        # Download progress bar
 │   ├── registry.ts        # ACP registry index client
 │   ├── telemetry.ts       # Thought / plan / usage rendering
