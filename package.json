@@ -1,6 +1,6 @@
 {
   "name": "@agentrq/acp-gateway",
-  "version": "0.2.34",
+  "version": "0.2.35",
   "description": "ACP+MCP bridge CLI for agentrq workspaces",
   "type": "module",
   "publishConfig": {
