@@ -73,6 +73,7 @@ export interface NativeOptions {
   token: string;
   agentId?: string;
   modelId?: string;
+  effort?: string;
   maxConcurrency?: number;
   permissionTimeoutMinutes?: number;
   authMethodId?: string;
@@ -374,6 +375,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
       platform: `${process.platform}/${process.arch}`,
       agentId: o.agentId,
       modelId: o.modelId,
+      effort: o.effort,
       maxConcurrency: o.maxConcurrency,
       permissionTimeoutMinutes: o.permissionTimeoutMinutes,
       authMethodId: o.authMethodId,

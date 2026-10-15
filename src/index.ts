@@ -1991,6 +1991,7 @@ export interface GatewayOptions {
   permissionTimeoutMs: number;
   authMethodId?: string;
   modelId?: string;
+  effort?: string;
   command: GatewayCommand;
   /** Registry id of the agent to run, instead of a command given after `--`. */
   agentId?: string;
@@ -2113,6 +2114,14 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
           i++;
         } else {
           console.error("[acp] Warning: --model provided without a valid model identifier; ignoring.");
+        }
+        break;
+      case "--effort":
+        if (value) {
+          options.effort = value;
+          i++;
+        } else {
+          console.error("[acp] Warning: --effort provided without a level; ignoring.");
         }
         break;
       case "--login":
@@ -2588,6 +2597,7 @@ export function nativeOptionsFor(
     token,
     agentId: options.agentId ?? path.basename(acpCmdArgs[0] ?? ""),
     modelId: options.modelId,
+    effort: options.effort,
     maxConcurrency: options.maxConcurrency,
     permissionTimeoutMinutes: Math.round(options.permissionTimeoutMs / 60_000),
     authMethodId: options.authMethodId,
@@ -2637,6 +2647,7 @@ AGENT
   --json                      With --list-agents or --list-models, print
                               machine-readable JSON instead of a table.
   --model <model-id>          Select a specific model for the session.
+  --effort <level>            Select a reasoning effort level (e.g. low, medium, high).
   --agent-info                What the agent says it supports — session
                               lifecycle, prompt content, MCP transports and
                               logins. Only a live handshake can tell you. Exits.

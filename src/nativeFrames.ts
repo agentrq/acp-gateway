@@ -180,6 +180,7 @@ export interface NativeHeaderOptions {
   platform: string;
   agentId?: string;
   modelId?: string;
+  effort?: string;
   maxConcurrency?: number;
   permissionTimeoutMinutes?: number;
   authMethodId?: string;
@@ -195,6 +196,7 @@ export function upgradeHeaders(o: NativeHeaderOptions): Record<string, string> {
   };
   if (o.agentId) h["X-AgentRQ-Agent"] = o.agentId;
   if (o.modelId) h["X-AgentRQ-Agent-Model"] = o.modelId;
+  if (o.effort) h["X-AgentRQ-Agent-Effort"] = o.effort;
   if (o.maxConcurrency !== undefined) h["X-AgentRQ-Max-Concurrency"] = String(o.maxConcurrency);
   if (o.permissionTimeoutMinutes !== undefined) h["X-AgentRQ-Permission-Timeout"] = String(o.permissionTimeoutMinutes);
   if (o.authMethodId) h["X-AgentRQ-Auth-Method"] = o.authMethodId;
