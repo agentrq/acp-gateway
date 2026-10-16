@@ -41,6 +41,19 @@ describe("LineSplitter", () => {
     expect(s.push("jkl\nnext\n")).toEqual(["next"]);
     expect(s.push("more\n")).toEqual(["more"]);
   });
+
+  it("does not call onOversize multiple times across multiple oversized chunks without newlines", () => {
+    const onOversize = vi.fn();
+    const s = new LineSplitter(4, onOversize);
+    expect(s.push("abcdef")).toEqual([]);
+    expect(onOversize).toHaveBeenCalledTimes(1);
+    expect(s.push("ghijkl")).toEqual([]);
+    expect(onOversize).toHaveBeenCalledTimes(1);
+    expect(s.push("mnopqr")).toEqual([]);
+    expect(onOversize).toHaveBeenCalledTimes(1);
+    expect(s.push("st\nnext\n")).toEqual(["next"]);
+    expect(onOversize).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("control frames", () => {
@@ -227,5 +240,14 @@ describe("stderrTail", () => {
   it("keeps within 8 KiB, dropping the oldest", () => {
     const big = "x".repeat(3000);
     expect(stderrTail([big, big, big, "end"])).toEqual([big, big, "end"]);
+  });
+
+  it("handles empty lines without error", () => {
+    expect(stderrTail([])).toEqual([]);
+  });
+
+  it("preserves lines when within line count and byte size limits", () => {
+    const lines = ["line 1", "line 2", "line 3"];
+    expect(stderrTail(lines)).toEqual(["line 1", "line 2", "line 3"]);
   });
 });

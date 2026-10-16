@@ -145,7 +145,9 @@ afterEach(async () => {
 describe("nativeSupported", () => {
   it("needs a WebSocket and Node 22", () => {
     expect(nativeSupported(FakeSocket, "22.4.0")).toBe(true);
+    expect(nativeSupported(FakeSocket, "v22.4.0")).toBe(true);
     expect(nativeSupported(FakeSocket, "20.11.0")).toBe(false);
+    expect(nativeSupported(FakeSocket, "v20.11.0")).toBe(false);
     expect(nativeSupported(undefined, "26.0.0")).toBe(false);
     expect(nativeSupported(FakeSocket)).toBe(Number(process.versions.node.split(".")[0]) >= 22);
   });
@@ -779,5 +781,37 @@ describe("runNative", () => {
     expect(t.children[0].written).toEqual([]);
     vi.advanceTimersByTime(1000);
     expect(FakeSocket.instances).toHaveLength(2);
+  });
+
+  it("a signal during initial preflight stops cleanly without spawning agent", async () => {
+    let answer!: (r: Response) => void;
+    const fetchImpl = vi.fn(() => new Promise<Response>((r) => (answer = r)));
+    const t = await start({ fetchImpl: fetchImpl as any });
+    process.emit("SIGTERM");
+    answer(new Response(null, { status: 426 }));
+    await t.done;
+    expect(t.exit).toHaveBeenCalledWith(0);
+    expect(t.spawnImpl).not.toHaveBeenCalled();
+    expect(FakeSocket.instances).toHaveLength(0);
+  });
+
+  it("survives unexpected socket send failure without crashing", async () => {
+    const t = await connected();
+    t.ws().send = vi.fn(() => {
+      throw new Error("WebSocket closed");
+    });
+    t.children[0].stdout.write("line\n");
+    await flush();
+    expect(t.exit).not.toHaveBeenCalled();
+  });
+
+  it("survives unexpected socket send failure in sendControl without crashing", async () => {
+    const t = await connected();
+    t.ws().send = vi.fn(() => {
+      throw new Error("Socket error");
+    });
+    t.children[0].stdout.write("x".repeat(17 * 1024 * 1024) + "\n");
+    await flush();
+    expect(t.exit).not.toHaveBeenCalled();
   });
 });
