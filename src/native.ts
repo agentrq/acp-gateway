@@ -101,7 +101,7 @@ export function nativeSupported(
   WS: unknown,
   nodeVersion: string = process.versions.node,
 ): boolean {
-  return typeof WS === "function" && Number(nodeVersion.split(".")[0]) >= 22;
+  return typeof WS === "function" && Number(nodeVersion.replace(/^v/, "").split(".")[0]) >= 22;
 }
 
 /**
@@ -149,6 +149,13 @@ export async function runNative(o: NativeOptions): Promise<void> {
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let drainPoll: ReturnType<typeof setInterval> | undefined;
 
+  const clearDrainPoll = () => {
+    if (drainPoll !== undefined) {
+      clearInterval(drainPoll);
+      drainPoll = undefined;
+    }
+  };
+
   const later = (fn: () => void, ms: number) => {
     const t = setTimeout(() => {
       timers.delete(t);
@@ -163,13 +170,23 @@ export async function runNative(o: NativeOptions): Promise<void> {
     for (const t of timers) clearTimeout(t);
     timers.clear();
     clearInterval(ackTimer);
-    clearInterval(drainPoll);
+    clearDrainPoll();
     for (const [signal, handler] of signalHandlers) process.off(signal, handler);
     const s = socket;
     socket = undefined;
     if (s && s.readyState === WS_OPEN) {
-      if (code === 0) s.send(encodeControl({ agentrqBridge: "bye" }));
-      s.close(1000);
+      if (code === 0) {
+        try {
+          s.send(encodeControl({ agentrqBridge: "bye" }));
+        } catch {
+          // Socket might have closed concurrently
+        }
+      }
+      try {
+        s.close(1000);
+      } catch {
+        // Ignore close error on terminating socket
+      }
     }
     if (agent) {
       agent.replaced = true;
@@ -266,13 +283,20 @@ export async function runNative(o: NativeOptions): Promise<void> {
 
   const restartAgent = (reason: string) => {
     console.error(`[acp-gateway] Restarting the agent: ${reason}`);
+    clearDrainPoll();
     agent.replaced = true;
     if (!agent.ended) terminateAgentProcess(agent.child);
     agent = startAgent();
   };
 
   const sendControl = (c: Control) => {
-    if (socket?.readyState === WS_OPEN) socket.send(encodeControl(c));
+    if (socket?.readyState === WS_OPEN) {
+      try {
+        socket.send(encodeControl(c));
+      } catch (err) {
+        debug(`[native] Socket sendControl error: ${err instanceof Error ? err.message : err}`);
+      }
+    }
   };
 
   const dropLine = (what: string, report = false) => {
@@ -282,13 +306,17 @@ export async function runNative(o: NativeOptions): Promise<void> {
 
   const send = (frame: string) => {
     const s = socket!;
-    s.send(frame);
+    try {
+      s.send(frame);
+    } catch (err) {
+      debug(`[native] Socket send error: ${err instanceof Error ? err.message : err}`);
+      return;
+    }
     if (s.bufferedAmount > HIGH_WATER && drainPoll === undefined) {
       agent.child.stdout?.pause();
       drainPoll = setInterval(() => {
         if ((socket?.bufferedAmount ?? 0) >= LOW_WATER) return;
-        clearInterval(drainPoll);
-        drainPoll = undefined;
+        clearDrainPoll();
         agent.child.stdout?.resume();
       }, DRAIN_POLL_MS);
     }
@@ -402,6 +430,8 @@ export async function runNative(o: NativeOptions): Promise<void> {
     };
     s.onclose = (e) => {
       if (s !== socket || stopped) return;
+      clearDrainPoll();
+      agent.child.stdout?.resume();
       socket = undefined;
       ready = false;
       if (!welcomed) closesWithoutWelcome++;
@@ -451,13 +481,18 @@ export async function runNative(o: NativeOptions): Promise<void> {
   // Never after stop: stop marks the agent replaced, so its exit is not reported.
   const onAgentExit = (a: Agent, code: number | null, signal: string | null) => {
     generation++;
+    clearDrainPoll();
     console.error(`[acp-gateway] The agent exited (code=${code}, signal=${signal}).`);
     sendControl({ agentrqBridge: "stderr", lines: stderrTail(a.stderr) });
     sendControl({ agentrqBridge: "exit", code, signal });
     const s = socket;
     socket = undefined;
     ready = false;
-    s?.close(1000);
+    try {
+      s?.close(1000);
+    } catch {
+      // Ignore close error on exit
+    }
     for (const t of timers) clearTimeout(t);
     timers.clear();
 
@@ -490,7 +525,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
     return [signal, handler] as const;
   });
 
-  if (!(await preflight())) return done;
+  if (!(await preflight()) || stopped) return done;
   agent = startAgent();
   connect(true);
   return done;

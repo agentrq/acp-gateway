@@ -65,6 +65,7 @@ You can specify gateway options before the `--` separator:
 - `--list-agents`: Prints every agent in the registry and how each one can run on this machine, then exits.
 - `--list-models`: Prints the models supported by the agent, then exits.
 - `--model <model-id>`: Selects the model a session starts on. It can be changed while running from the agentrq interface.
+- `--effort <level>`: Selects a reasoning effort level (e.g. `low`, `medium`, `high`). In native mode, sets the agent's initial reasoning effort.
 - `--allow-unverified-agent`: Installs a registry binary that publishes no checksum. Off by default.
 - `--registry-url <url>`: Reads a different registry index (for pinning, or for testing).
 - `--mcp-json <path>`: Reads an MCP config in addition to the one found near the working directory, so the gateway can run from outside its workspace. The path is to the file itself and the filename need not be `.mcp.json`; a directory is taken to mean the `.mcp.json` inside it. Where both files define a server under the same name, the one named here wins. A path that cannot be read is an error rather than a quiet fall back to the directory.
@@ -277,7 +278,7 @@ agent's stdin. It never parses the ACP messages in between.
 - **Before connecting** it sends a plain `GET` with the token, so a problem is named rather than retried for ever:
   an old server without the endpoint (404), a bad token (401/403, with the server's reason), or a proxy that does
   not pass `Upgrade` for `/api/acp/`. Each of these exits 1.
-- **Options travel as headers.** `--agent`, `--model`, `--max-concurrency`, `--permission-timeout` and
+- **Options travel as headers.** `--agent`, `--model`, `--effort`, `--max-concurrency`, `--permission-timeout` and
   `--auth-method` reach AgentRQ in the WebSocket handshake, along with the working directory every session runs in.
 - **Dropped connections resume.** The gateway reconnects with backoff (1 s doubling to 60 s), and AgentRQ keeps
   the connection for two minutes. Within that time nothing is lost or repeated: each side replays what the other

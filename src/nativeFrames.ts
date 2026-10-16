@@ -65,13 +65,17 @@ export class LineSplitter {
   ) {}
 
   push(chunk: string): string[] {
+    if (this.skipping) {
+      const nl = chunk.indexOf("\n");
+      if (nl === -1) {
+        return [];
+      }
+      this.skipping = false;
+      chunk = chunk.slice(nl + 1);
+      this.rest = "";
+    }
     const parts = (this.rest + chunk).split("\n");
     this.rest = parts.pop() ?? "";
-    if (this.skipping && parts.length > 0) {
-      // The tail end of the line that was already dropped.
-      parts.shift();
-      this.skipping = false;
-    }
     if (this.rest.length > this.maxLength) {
       this.rest = "";
       this.skipping = true;
@@ -219,8 +223,9 @@ export function respawnDelayMs(exitsInWindow: number): number {
 export function stderrTail(lines: string[]): string[] {
   const kept = lines.slice(-STDERR_TAIL_LINES);
   let bytes = kept.reduce((n, l) => n + Buffer.byteLength(l), 0);
-  while (kept.length > 0 && bytes > STDERR_TAIL_BYTES) {
-    bytes -= Buffer.byteLength(kept.shift()!);
+  let start = 0;
+  while (start < kept.length && bytes > STDERR_TAIL_BYTES) {
+    bytes -= Buffer.byteLength(kept[start++]);
   }
-  return kept;
+  return start > 0 ? kept.slice(start) : kept;
 }
