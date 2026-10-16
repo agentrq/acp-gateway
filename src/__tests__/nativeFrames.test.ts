@@ -181,6 +181,7 @@ describe("upgradeHeaders", () => {
         ...base,
         agentId: "codex-acp",
         modelId: "m",
+        effort: "high",
         maxConcurrency: 4,
         permissionTimeoutMinutes: 0,
         authMethodId: "chatgpt",
@@ -189,6 +190,7 @@ describe("upgradeHeaders", () => {
     ).toMatchObject({
       "X-AgentRQ-Agent": "codex-acp",
       "X-AgentRQ-Agent-Model": "m",
+      "X-AgentRQ-Agent-Effort": "high",
       "X-AgentRQ-Max-Concurrency": "4",
       "X-AgentRQ-Permission-Timeout": "0",
       "X-AgentRQ-Auth-Method": "chatgpt",

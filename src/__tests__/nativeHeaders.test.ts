@@ -24,6 +24,7 @@ describe.runIf(typeof WebSocket === "function")("the built-in WebSocket", () => 
             bridgeVersion: "0.3.0",
             cwd: "/work",
             platform: "linux/arm64",
+            effort: "high",
             resume: { connectionId: "AB", received: 2 },
           }),
         } as unknown as string[]);
@@ -36,6 +37,7 @@ describe.runIf(typeof WebSocket === "function")("the built-in WebSocket", () => 
     expect(headers["sec-websocket-protocol"]).toBe("agentrq.bridge.1");
     expect(headers["x-agentrq-cwd"]).toBe("/work");
     expect(headers["x-agentrq-bridge-version"]).toBe("0.3.0");
+    expect(headers["x-agentrq-agent-effort"]).toBe("high");
     expect(headers["x-agentrq-resume"]).toBe("AB:2");
   });
 });

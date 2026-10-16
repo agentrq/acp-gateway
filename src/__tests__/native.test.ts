@@ -153,7 +153,7 @@ describe("nativeSupported", () => {
 
 describe("runNative", () => {
   it("connects with the subprotocol and headers, and no resume the first time", async () => {
-    const t = await start({ agentId: "codex-acp", modelId: "m", maxConcurrency: 2 });
+    const t = await start({ agentId: "codex-acp", modelId: "m", effort: "high", maxConcurrency: 2 });
     expect(t.ws().url).toBe("wss://h/api/acp/v1");
     expect(t.ws().init.protocols).toEqual(["agentrq.bridge.1"]);
     expect(t.ws().init.headers).toMatchObject({
@@ -161,6 +161,7 @@ describe("runNative", () => {
       "X-AgentRQ-Cwd": "/work",
       "X-AgentRQ-Agent": "codex-acp",
       "X-AgentRQ-Agent-Model": "m",
+      "X-AgentRQ-Agent-Effort": "high",
       "X-AgentRQ-Max-Concurrency": "2",
       "X-AgentRQ-Bridge-Version": pkg.version,
       "X-AgentRQ-Platform": `${process.platform}/${process.arch}`,

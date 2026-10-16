@@ -4067,7 +4067,7 @@ describe("index", () => {
 
     it("derives the endpoint and passes every option through as a header value", () => {
       const options = parseGatewayArgs([
-        "--acp-version", "1", "--agent", "codex-acp", "--model", "m", "--max-concurrency", "4",
+        "--acp-version", "1", "--agent", "codex-acp", "--model", "m", "--effort", "high", "--max-concurrency", "4",
         "--permission-timeout", "5", "--auth-method", "chatgpt",
       ]);
       expect(nativeOptionsFor(options, ["npx", "codex-acp"], agentrq, "/work")).toEqual({
@@ -4078,11 +4078,25 @@ describe("index", () => {
         token: "t",
         agentId: "codex-acp",
         modelId: "m",
+        effort: "high",
         maxConcurrency: 4,
         permissionTimeoutMinutes: 5,
         authMethodId: "chatgpt",
         cwd: "/work",
       });
+    });
+
+    it("parses --effort and warns when missing a value", () => {
+      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const optsWithVal = parseGatewayArgs(["--effort", "medium"]);
+      expect(optsWithVal.effort).toBe("medium");
+
+      const optsNoVal = parseGatewayArgs(["--effort", "--verbose"]);
+      expect(optsNoVal.effort).toBeUndefined();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        "[acp] Warning: --effort provided without a level; ignoring.",
+      );
+      consoleSpy.mockRestore();
     });
 
     it("names a command-line agent by its basename and honours --acp-url", () => {
@@ -4154,6 +4168,7 @@ describe("index", () => {
           "--list-models",
           "--json",
           "--model",
+          "--effort",
           "--list-auth-methods",
           "--login",
           "--logout",
