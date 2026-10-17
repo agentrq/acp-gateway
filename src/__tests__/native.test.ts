@@ -436,6 +436,29 @@ describe("runNative", () => {
     expect(t.children[0].written.map((l) => JSON.parse(l).method)).toEqual(["session/cancel"]);
   });
 
+  // #130: an automatic approval can come back before the request has finished
+  // going out. The verdict is the answer to the agent's own request, so it has
+  // nothing to wait for here, and no timer of ours can cancel the turn later.
+  it("hands the agent a verdict that arrives before the request has finished sending", async () => {
+    const t = await initialized();
+    const ws = t.ws();
+    const sendFrame = ws.send.bind(ws);
+    ws.send = (data: string) => {
+      sendFrame(data);
+      const m = JSON.parse(data);
+      if (m.method === "session/request_permission") {
+        ws.receive(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { outcome: { outcome: "selected", optionId: "allow" } } }));
+      }
+    };
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":{"sessionId":"S1"}}\n');
+    await flush();
+    vi.advanceTimersByTime(31 * 60_000);
+    await flush();
+    expect(t.children[0].written.map((l) => JSON.parse(l))).toEqual([
+      { jsonrpc: "2.0", id: 10, result: { outcome: { outcome: "selected", optionId: "allow" } } },
+    ]);
+  });
+
   it("gives the agent this process's own directory, whatever AgentRQ sends", async () => {
     const t = await connected({ cwd: "/home/文档 é" });
     t.ws().receive('{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/home/%E6%96%87%E6%A1%A3%20%C3%A9","mcpServers":[]}}');
