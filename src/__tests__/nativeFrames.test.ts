@@ -17,7 +17,7 @@ import {
   upgradeHeaders,
   headerSafeCwd,
   rpcShape,
-  rewriteCwd,
+  prepareSessionRequest,
   abandonedAnswer,
   taskIdOf,
   withSessionId,
@@ -253,24 +253,53 @@ describe("rpcShape", () => {
   });
 });
 
-describe("rewriteCwd", () => {
-  it("puts the given directory into requests that open a session", () => {
+describe("prepareSessionRequest", () => {
+  it("puts the given directory into requests that open a session, even when none was sent", () => {
     for (const method of ["session/new", "session/load", "session/resume"]) {
-      const out = rewriteCwd(JSON.stringify({ id: 1, method, params: { cwd: "/srv", mcpServers: [] } }), "/mine");
+      const out = prepareSessionRequest(JSON.stringify({ id: 1, method, params: { cwd: "/srv", mcpServers: [] } }), "/mine");
       expect(JSON.parse(out).params).toEqual({ cwd: "/mine", mcpServers: [] });
     }
+    const out = prepareSessionRequest('{"id":1,"method":"session/new","params":{"mcpServers":[]}}', "/mine");
+    expect(JSON.parse(out).params).toEqual({ mcpServers: [], cwd: "/mine" });
+  });
+
+  it("hands over .mcp.json's servers first, leaving out AgentRQ's of the same name", () => {
+    const ours = [
+      { type: "http", name: "agentrq-workspace", url: "https://w/mcp?token=t", headers: [] },
+      { name: "files", command: "npx", args: [], env: [] },
+    ];
+    const frame = JSON.stringify({
+      id: 1,
+      method: "session/new",
+      params: {
+        mcpServers: [
+          { type: "http", name: "agentrq-workspace", url: "https://w/mcp", headers: [{ name: "Authorization", value: "Bearer t" }] },
+          { type: "http", name: "extra", url: "https://x", headers: [] },
+        ],
+      },
+    });
+    expect(JSON.parse(prepareSessionRequest(frame, "/mine", ours)).params.mcpServers.map((s: any) => s.name)).toEqual([
+      "agentrq-workspace",
+      "files",
+      "extra",
+    ]);
+    expect(JSON.parse(prepareSessionRequest(frame, "/mine", ours)).params.mcpServers[0].url).toBe("https://w/mcp?token=t");
+  });
+
+  it("gives the servers to a request that names none", () => {
+    const out = prepareSessionRequest('{"id":1,"method":"session/new","params":{}}', "/mine", [{ name: "a" }]);
+    expect(JSON.parse(out).params).toEqual({ cwd: "/mine", mcpServers: [{ name: "a" }] });
   });
 
   it("leaves everything else exactly as it was", () => {
     const frames = [
-      '{"id":1,"method":"session/new","params":{"cwd":"/mine"}}',
       '{"id":1,"method":"session/prompt","params":{"cwd":"/srv"}}',
       '{"id":1,"method":"session/new"}',
       '{"id":1,"result":{"cwd":"/srv"}}',
-      '{"id":1,"method":"session/new","params":{}}',
-      'not json "cwd"',
+      'not json "session/new"',
+      '{"id":1,"method":"initialize","params":{}}',
     ];
-    for (const f of frames) expect(rewriteCwd(f, "/mine")).toBe(f);
+    for (const f of frames) expect(prepareSessionRequest(f, "/mine", [{ name: "a" }])).toBe(f);
   });
 });
 

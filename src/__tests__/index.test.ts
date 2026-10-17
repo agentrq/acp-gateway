@@ -1208,9 +1208,9 @@ describe("index", () => {
     it.each(["list-models", "agent-info", "list-auth-methods", "login", "logout"] as const)(
       "should let --%s run without a .mcp.json",
       (command) => {
-        const config = loadWorkspace(command, undefined, emptyWorkspaceDir());
+        const workspace = loadWorkspace(command, undefined, emptyWorkspaceDir());
 
-        expect(config).toEqual({ name: "none", type: "http", env: {} });
+        expect(workspace).toEqual({ configs: [], agentrqConfig: { name: "none", type: "http", env: {} } });
       },
     );
 
@@ -1219,11 +1219,11 @@ describe("index", () => {
       // Broken on purpose: had it been read, this would throw.
       writeFileSync(join(dir, ".mcp.json"), "{ not json");
 
-      expect(loadWorkspace("list-models", undefined, dir).name).toBe("none");
+      expect(loadWorkspace("list-models", undefined, dir).agentrqConfig.name).toBe("none");
     });
 
     it("should not read a config named with --mcp-json for a one-shot command either", () => {
-      expect(loadWorkspace("login", "/nowhere/servers.json", emptyWorkspaceDir()).name).toBe("none");
+      expect(loadWorkspace("login", "/nowhere/servers.json", emptyWorkspaceDir()).agentrqConfig.name).toBe("none");
     });
 
     it("should still require a .mcp.json to run the bridge", () => {
@@ -1242,13 +1242,15 @@ describe("index", () => {
       const dir = emptyWorkspaceDir();
       writeMcpJson(dir);
 
-      expect(loadWorkspace("run", undefined, dir).name).toBe("agentrq-ws");
+      const workspace = loadWorkspace("run", undefined, dir);
+      expect(workspace.agentrqConfig.name).toBe("agentrq-ws");
+      expect(workspace.configs.map((c) => c.name)).toEqual(["agentrq-ws"]);
     });
 
     it("should read a config named with --mcp-json", () => {
       const file = writeMcpJson(emptyWorkspaceDir(), "servers.json");
 
-      expect(loadWorkspace("run", file, emptyWorkspaceDir()).url).toBe("http://localhost:1/mcp");
+      expect(loadWorkspace("run", file, emptyWorkspaceDir()).agentrqConfig.url).toBe("http://localhost:1/mcp");
     });
   });
 
@@ -1568,6 +1570,7 @@ describe("index", () => {
   });
 
   describe("nativeOptionsFor", () => {
+    const ws = (agentrqConfig: McpServerConfig) => ({ configs: [agentrqConfig], agentrqConfig });
     const agentrq: McpServerConfig = {
       name: "agentrq",
       type: "http",
@@ -1580,7 +1583,7 @@ describe("index", () => {
         "--acp-version", "1", "--agent", "codex-acp", "--model", "m", "--effort", "high", "--max-concurrency", "4",
         "--permission-timeout", "5", "--auth-method", "chatgpt",
       ]);
-      expect(nativeOptionsFor(options, ["npx", "codex-acp"], agentrq, "/work")).toEqual({
+      expect(nativeOptionsFor(options, ["npx", "codex-acp"], ws(agentrq), "/work")).toEqual({
         acpCmdArgs: ["npx", "codex-acp"],
         env: { A: "1" },
         endpoint: "wss://4hro0x9eslxd.mcp.agentrq.com/api/acp/v1",
@@ -1592,6 +1595,7 @@ describe("index", () => {
         permissionTimeoutMinutes: 5,
         authMethodId: "chatgpt",
         cwd: "/work",
+        mcpServers: [agentrq],
       });
     });
 
@@ -1610,13 +1614,13 @@ describe("index", () => {
 
     it("names a command-line agent by its basename and honours --acp-url", () => {
       const options = parseGatewayArgs(["--acp-url", "ws://other/x"]);
-      const native = nativeOptionsFor(options, ["/opt/bin/gemini", "--acp"], agentrq);
+      const native = nativeOptionsFor(options, ["/opt/bin/gemini", "--acp"], ws(agentrq));
       expect(native).toMatchObject({ agentId: "gemini", endpoint: "ws://other/x", cwd: process.cwd() });
     });
 
     it("needs the workspace token", () => {
       const options = parseGatewayArgs(["--acp-version", "1"]);
-      expect(nativeOptionsFor(options, ["a"], { ...agentrq, url: "https://h/" })).toBe(
+      expect(nativeOptionsFor(options, ["a"], ws({ ...agentrq, url: "https://h/" }))).toBe(
         "acp-gateway needs the workspace token from .mcp.json",
       );
     });
@@ -1624,28 +1628,28 @@ describe("index", () => {
     it("needs no URL in .mcp.json when --acp-url names the endpoint", () => {
       const options = parseGatewayArgs(["--acp-url", "wss://x/acp"]);
       expect(
-        nativeOptionsFor(options, ["a"], { name: "x", type: "http", headers: { Authorization: "Bearer t" } }),
+        nativeOptionsFor(options, ["a"], ws({ name: "x", type: "http", headers: { Authorization: "Bearer t" } })),
       ).toMatchObject({ endpoint: "wss://x/acp", token: "t" });
     });
 
     it("needs a URL, from .mcp.json or --acp-url", () => {
       const options = parseGatewayArgs(["--acp-version", "1"]);
       expect(
-        nativeOptionsFor(options, ["a"], { name: "x", type: "http", headers: { Authorization: "Bearer t" } }),
+        nativeOptionsFor(options, ["a"], ws({ name: "x", type: "http", headers: { Authorization: "Bearer t" } })),
       ).toMatch(/needs the AgentRQ URL/);
     });
 
     it("explains a URL it cannot read", () => {
       const options = parseGatewayArgs(["--acp-version", "1"]);
       expect(
-        nativeOptionsFor(options, ["a"], { name: "x", type: "http", url: "not a url", headers: { Authorization: "Bearer t" } }),
+        nativeOptionsFor(options, ["a"], ws({ name: "x", type: "http", url: "not a url", headers: { Authorization: "Bearer t" } })),
       ).toMatch(/cannot work out the AgentRQ endpoint from "not a url"; pass --acp-url/);
     });
 
     it("starts native mode with those options", async () => {
       const run = vi.fn(async () => {});
       const exit = vi.fn();
-      await startNativeMode(parseGatewayArgs(["--acp-version", "1"]), ["a"], agentrq, run, exit);
+      await startNativeMode(parseGatewayArgs(["--acp-version", "1"]), ["a"], ws(agentrq), run, exit);
       expect(run).toHaveBeenCalledWith(expect.objectContaining({ endpoint: "wss://4hro0x9eslxd.mcp.agentrq.com/api/acp/v1", token: "t" }));
       expect(exit).not.toHaveBeenCalled();
     });
@@ -1654,7 +1658,7 @@ describe("index", () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const run = vi.fn(async () => {});
       const exit = vi.fn();
-      await startNativeMode(parseGatewayArgs(["--acp-version", "1"]), ["a"], { name: "x", type: "http", url: "https://h/" }, run, exit);
+      await startNativeMode(parseGatewayArgs(["--acp-version", "1"]), ["a"], ws({ name: "x", type: "http", url: "https://h/" }), run, exit);
       expect(errorSpy).toHaveBeenCalledWith("[acp-gateway] acp-gateway needs the workspace token from .mcp.json");
       expect(exit).toHaveBeenCalledWith(1);
       expect(run).not.toHaveBeenCalled();
@@ -1664,9 +1668,9 @@ describe("index", () => {
     it("logs the agent in at this terminal only when there is one", async () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const options = parseGatewayArgs(["--auth-method", "oauth"]);
-      expect((nativeOptionsFor(options, ["gemini"], agentrq, "/w", false) as any).login).toBeUndefined();
+      expect((nativeOptionsFor(options, ["gemini"], ws(agentrq), "/w", false) as any).login).toBeUndefined();
 
-      const native = nativeOptionsFor(options, [process.execPath, "agent.js"], agentrq, "/w", true) as any;
+      const native = nativeOptionsFor(options, [process.execPath, "agent.js"], ws(agentrq), "/w", true) as any;
       // The mocked agent offers no login methods, so the login has nothing to do.
       await expect(native.login()).resolves.toBeUndefined();
       expect(errorSpy.mock.calls.flat().join("\n")).toContain("advertises no authentication methods");
@@ -1675,7 +1679,7 @@ describe("index", () => {
 
     it("always connects to the ACP v1 endpoint", () => {
       const options = parseGatewayArgs([]);
-      expect(nativeOptionsFor(options, [], agentrq)).toMatchObject({
+      expect(nativeOptionsFor(options, [], ws(agentrq))).toMatchObject({
         endpoint: "wss://4hro0x9eslxd.mcp.agentrq.com/api/acp/v1",
         agentId: "",
       });
@@ -1727,7 +1731,10 @@ describe("index", () => {
       expect(d.bridge).toHaveBeenCalledWith(
         options,
         [process.execPath, "agent.js"],
-        expect.objectContaining({ name: "agentrq", env: { A: "1" } }),
+        {
+          agentrqConfig: expect.objectContaining({ name: "agentrq", env: { A: "1" } }),
+          configs: [expect.objectContaining({ name: "agentrq" })],
+        },
       );
       expect(d.agentCommand).not.toHaveBeenCalled();
       expect(d.exit).not.toHaveBeenCalled();
@@ -1740,7 +1747,7 @@ describe("index", () => {
 
       await runGateway(parseGatewayArgs(["--agent", "x"]), [], d);
 
-      expect((d.bridge.mock.calls[0] as any[])[2].env).toEqual({ A: "1", B: "2" });
+      expect((d.bridge.mock.calls[0] as any[])[2].agentrqConfig.env).toEqual({ A: "1", B: "2" });
     });
 
     it("runs a one-shot command without a workspace and exits 0", async () => {

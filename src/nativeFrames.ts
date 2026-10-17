@@ -201,7 +201,7 @@ export interface NativeHeaderOptions {
  * bytes. So everything outside printable ASCII is percent-encoded as UTF-8,
  * and so is `%` itself. An ASCII path is sent unchanged, and an encoded one
  * still starts the way it did, so it still reads as absolute. The agent never
- * sees this value: see `rewriteCwd`.
+ * sees this value: see `prepareSessionRequest`.
  */
 export function headerSafeCwd(cwd: string): string {
   return cwd.replace(/[^\x20-\x24\x26-\x7e]+/gu, (run) => encodeURIComponent(run));
@@ -280,18 +280,27 @@ export function rpcShape(frame: string): RpcShape | undefined {
 const CWD_METHODS: ReadonlySet<string> = new Set(["session/new", "session/load", "session/resume"]);
 
 /**
- * Puts this process's own working directory into a request that opens a
- * session, whatever AgentRQ sent. The agent runs here, so the directory it
- * works in is this one — not a server's idea of it, and not the header's
- * ASCII-safe spelling of it.
+ * Fills in a request that opens a session with what only this process knows.
+ *
+ * The working directory is this process's own: the agent runs here, so that is
+ * where it works — not a server's idea of it, not the header's ASCII-safe
+ * spelling of it, and present even when AgentRQ sends none.
+ *
+ * The MCP servers are the ones from .mcp.json, ahead of whatever AgentRQ
+ * offers; a server of AgentRQ's with the same name as one of them is left out,
+ * so the agent is not handed one workspace twice.
  */
-export function rewriteCwd(frame: string, cwd: string): string {
-  if (!frame.includes('"cwd"')) return frame;
+export function prepareSessionRequest(frame: string, cwd: string, servers: readonly unknown[] = []): string {
+  if (!frame.includes("session/")) return frame;
   const shape = rpcShape(frame);
   if (!shape?.method || !CWD_METHODS.has(shape.method) || !shape.params) return frame;
-  if (shape.params.cwd === cwd) return frame;
   const m = JSON.parse(frame);
   m.params.cwd = cwd;
+  if (servers.length > 0) {
+    const ours = new Set(servers.map((s) => (s as { name?: unknown }).name));
+    const theirs: unknown[] = Array.isArray(m.params.mcpServers) ? m.params.mcpServers : [];
+    m.params.mcpServers = [...servers, ...theirs.filter((s) => !ours.has((s as { name?: unknown })?.name))];
+  }
   return JSON.stringify(m);
 }
 

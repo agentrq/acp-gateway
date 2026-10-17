@@ -180,7 +180,7 @@ Credentials are never stored by the gateway; the agent keeps its own, exactly as
 
 `acp-gateway` searches for `.mcp.json` starting in the current working directory and up to 3 parent directories.
 
-Only the AgentRQ server's `url` (its `?token=`) or `Authorization: Bearer` header is used: the gateway connects to that server's `/api/acp/v1` endpoint, not to the MCP server itself.
+The gateway connects to the AgentRQ server's `/api/acp/v1` endpoint, using its `url` (and `?token=`) or `Authorization: Bearer` header — not to the MCP server itself. Every server in the file, the AgentRQ one included, is also handed to the agent in each session it opens, so it can use them as MCP tools.
 
 `--list-models`, `--agent-info`, `--list-auth-methods`, `--login` and `--logout` only deal with the agent itself, so they never read a workspace config. `--list-models` runs the agent in an empty temporary directory, so the agent does not pick up the workspace's `.mcp.json` and get taken for the workspace's agent.
 
@@ -217,6 +217,11 @@ directory and to keep the agent across a new connection (below).
 - **Where it connects.** The endpoint is the AgentRQ server's own origin with the path `/api/acp/v1`, over
   `wss://` for an `https://` server and `ws://` for `http://`. The workspace token is the URL's `?token=` or the
   entry's `Authorization: Bearer` header. `--acp-url` names the endpoint outright.
+- **The agent gets the workspace's MCP servers.** Every server in `.mcp.json` (and any config named with
+  `--mcp-json`) is handed to each session the agent opens — `session/new`, `session/load` and `session/resume` —
+  ahead of what AgentRQ offers, so the agent can use them as tools exactly as it did under the MCP bridge. A
+  transport the agent says it cannot take is left out; one it says nothing about is passed. Where AgentRQ offers a
+  server with the same name as one in `.mcp.json`, the `.mcp.json` one is used.
 - **The agent works in this directory.** Sessions always open in the gateway's own working directory: whatever
   directory AgentRQ names in `session/new`, `session/load` or `session/resume` is replaced with it. AgentRQ is told
   the directory in the `X-AgentRQ-Cwd` header, percent-encoded (UTF-8) wherever it is not plain ASCII, since a

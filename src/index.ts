@@ -866,6 +866,15 @@ export const WORKSPACE_OPTIONAL_COMMANDS: ReadonlySet<GatewayCommand> = new Set(
 ]);
 
 /**
+ * The workspace's MCP config: every server in it, which the agent is handed in
+ * each session it opens, and the AgentRQ one among them.
+ */
+export interface Workspace {
+  configs: McpServerConfig[];
+  agentrqConfig: McpServerConfig;
+}
+
+/**
  * Finds the AgentRQ server a command reports to: its URL and token are where
  * the ACP endpoint comes from.
  *
@@ -877,11 +886,12 @@ export function loadWorkspace(
   command: GatewayCommand,
   mcpJsonPath: string | undefined,
   startDir: string = process.cwd(),
-): McpServerConfig {
+): Workspace {
   if (WORKSPACE_OPTIONAL_COMMANDS.has(command)) {
-    return { name: "none", type: "http", env: {} };
+    return { configs: [], agentrqConfig: { name: "none", type: "http", env: {} } };
   }
-  return pickAgentrqServer(loadMcpConfig(startDir, mcpJsonPath));
+  const configs = loadMcpConfig(startDir, mcpJsonPath);
+  return { configs, agentrqConfig: pickAgentrqServer(configs) };
 }
 
 /**
@@ -1056,7 +1066,7 @@ export async function runAgentCommand(
 export function nativeOptionsFor(
   options: GatewayOptions,
   acpCmdArgs: string[],
-  agentrqConfig: McpServerConfig,
+  { configs, agentrqConfig }: Workspace,
   cwd: string = process.cwd(),
   interactive: boolean = isInteractiveTerminal(),
 ): NativeOptions | string {
@@ -1083,6 +1093,9 @@ export function nativeOptionsFor(
     permissionTimeoutMinutes: Math.round(options.permissionTimeoutMs / 60_000),
     authMethodId: options.authMethodId,
     cwd: path.resolve(cwd),
+    // Every session the agent opens gets them, as under the MCP bridge: the
+    // agent's own tools are configured here, not in AgentRQ.
+    mcpServers: configs,
     // AgentRQ never runs a terminal login itself. With a terminal here — a
     // shell, or agentrqd's browser terminal — the bridge runs it instead of
     // stopping.
@@ -1096,11 +1109,11 @@ export function nativeOptionsFor(
 export async function startNativeMode(
   options: GatewayOptions,
   acpCmdArgs: string[],
-  agentrqConfig: McpServerConfig,
+  workspace: Workspace,
   run: (o: NativeOptions) => Promise<void> = runNative,
   exit: (code: number) => void = process.exit.bind(process),
 ): Promise<void> {
-  const native = nativeOptionsFor(options, acpCmdArgs, agentrqConfig);
+  const native = nativeOptionsFor(options, acpCmdArgs, workspace);
   if (typeof native === "string") {
     console.error(`[acp-gateway] ${native}`);
     return exit(1);
@@ -1275,17 +1288,18 @@ export async function runGateway(
     exit(1);
   };
 
-  let agentrqConfig: McpServerConfig;
+  let workspace: Workspace;
   let resolved: Awaited<ReturnType<typeof resolveAgentCommand>>;
   try {
     // Optional for the commands that only ask the agent about itself.
-    agentrqConfig = loadWorkspace(options.command, options.mcpJsonPath, startDir);
+    workspace = loadWorkspace(options.command, options.mcpJsonPath, startDir);
     resolved = await resolve(options, explicitCommand);
     assertAgentRunnable(resolved.command[0], Boolean(options.agentId));
   } catch (err) {
     return fail(err);
   }
   const acpCmdArgs = resolved.command;
+  const { agentrqConfig } = workspace;
   if (resolved.env) {
     // The registry entry's env is part of how that agent must be launched, so
     // it travels with the command.
@@ -1293,7 +1307,7 @@ export async function runGateway(
   }
 
   if (options.command === "run") {
-    return bridge(options, acpCmdArgs, agentrqConfig);
+    return bridge(options, acpCmdArgs, workspace);
   }
   // One-shot commands talk to the agent and exit.
   await agentCommand(

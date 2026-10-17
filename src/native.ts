@@ -10,6 +10,9 @@
  */
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import type * as acp from "@agentclientprotocol/sdk";
+import type { McpServerConfig } from "./config.js";
+import { mapMcpServers } from "./mcpServers.js";
 import {
   BRIDGE_SUBPROTOCOL,
   LineSplitter,
@@ -23,7 +26,7 @@ import {
   isControl,
   preflightUrl,
   respawnDelayMs,
-  rewriteCwd,
+  prepareSessionRequest,
   rpcShape,
   stderrTail,
   taskIdOf,
@@ -98,6 +101,8 @@ export interface NativeOptions {
    * with AgentRQ's instructions instead.
    */
   login?: () => Promise<void>;
+  /** The servers from .mcp.json, handed to every session the agent opens. */
+  mcpServers?: McpServerConfig[];
   /** `process.versions.node`, for the Node 22 check. */
   nodeVersion?: string;
   exit?: (code: number) => void;
@@ -376,6 +381,13 @@ export async function runNative(o: NativeOptions): Promise<void> {
     }
   };
 
+  /** .mcp.json's servers, as far as the agent's own answer to `initialize` lets it take them. */
+  const sessionMcpServers = () =>
+    mapMcpServers(
+      o.mcpServers ?? [],
+      (agent.initResult as { agentCapabilities?: acp.AgentCapabilities } | undefined)?.agentCapabilities,
+    );
+
   const toServer = (line: string) => {
     ring.push(line);
     if (ready) send(line);
@@ -445,7 +457,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
     if (data.includes("\n")) return console.error("[acp-gateway] Dropped a frame from AgentRQ that contains a newline.");
     received++;
     if (++unacked >= ACK_EVERY) sendAck();
-    let frame = rewriteCwd(data, o.cwd);
+    let frame = prepareSessionRequest(data, o.cwd, sessionMcpServers());
     const shape = rpcShape(frame);
     if (shape?.isResponse) agentRequests.delete(shape.id!);
     let sessionId = shape?.params?.sessionId;

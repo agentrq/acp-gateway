@@ -445,6 +445,44 @@ describe("runNative", () => {
     expect(t.ws().init.headers["X-AgentRQ-Cwd"]).toBe("/home/%E6%96%87%E6%A1%A3 %C3%A9");
   });
 
+  it("hands every session the servers from .mcp.json, as far as the agent can take them", async () => {
+    const t = await connected({
+      cwd: "/work",
+      mcpServers: [
+        { name: "agentrq-workspace", type: "http", url: "https://w/mcp?token=t" },
+        { name: "files", type: "stdio", command: "npx", args: ["-y", "fs-mcp"] },
+      ],
+    });
+    const newSession = (id: number) =>
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "session/new",
+        params: { mcpServers: [{ type: "http", name: "agentrq-workspace", url: "https://w/mcp", headers: [] }] },
+      });
+    const params = () => t.children[0].written.map((l) => JSON.parse(l).params);
+
+    // Before the agent has said anything about its transports, every server goes.
+    t.ws().receive(newSession(1));
+    await flush();
+    expect(params()[0]).toEqual({
+      cwd: "/work",
+      mcpServers: [
+        { type: "http", name: "agentrq-workspace", url: "https://w/mcp?token=t", headers: [] },
+        { name: "files", command: "npx", args: ["-y", "fs-mcp"], env: [] },
+      ],
+    });
+
+    // An agent that refuses http keeps only what it can take.
+    t.ws().receive('{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}');
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":1,"agentCapabilities":{"mcpCapabilities":{"http":false}}}}\n');
+    await flush();
+    // (AgentRQ itself sends no http server to such an agent.)
+    t.ws().receive('{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"mcpServers":[]}}');
+    await flush();
+    expect(params()[2].mcpServers.map((s: any) => s.name)).toEqual(["files"]);
+  });
+
   it("close 4001 reconnects fresh, and the fresh welcome keeps the agent", async () => {
     const t = await connected();
     t.ws().drop(4001, "grace expired");
