@@ -150,12 +150,12 @@ export class ReplayRing {
   }
 }
 
-/** Where native mode connects: next to the MCP endpoint, on the same host. */
-export function nativeEndpoint(mcpUrl: string, version: 1 | 2, override?: string): string {
+/** Where the bridge connects: AgentRQ's ACP v1 endpoint, on the host .mcp.json names. */
+export function nativeEndpoint(mcpUrl: string, override?: string): string {
   if (override) return override;
   const u = new URL(mcpUrl);
   u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-  u.pathname = `/api/acp/v${version}`;
+  u.pathname = "/api/acp/v1";
   u.search = "";
   u.hash = "";
   return u.toString();

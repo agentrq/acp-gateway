@@ -4,23 +4,21 @@ Agent Client Protocol Gateway to remotely access your agents in AgentRQ.
 
 ## Overview
 
-`@agentrq/acp-gateway` bridges the [Agent Client Protocol (ACP)](https://agentclientprotocol.com) with the [Model Context Protocol (MCP)](https://modelcontextprotocol.io) to connect ACP-compatible AI agents (e.g., Gemini) to an agentrq MCP server.
+`@agentrq/acp-gateway` connects an [Agent Client Protocol (ACP)](https://agentclientprotocol.com) agent (e.g., Gemini, Codex) to an agentrq workspace. AgentRQ speaks ACP v1 itself; the gateway runs the agent on your machine and pipes its ACP stream to AgentRQ over a WebSocket.
 
-It automates task execution by:
+It:
 
-1. Loading your workspace's `.mcp.json` configuration.
-2. Connecting to the agentrq MCP server.
-3. Spawning an ACP-compatible agent subprocess.
-4. Bridging MCP notifications (tasks, permission requests) to ACP prompts and vice versa.
-5. Providing file read/write capabilities through the ACP protocol.
-6. Auto-reconnecting the MCP transport on disconnection.
+1. Reads your workspace's `.mcp.json` for the AgentRQ server's URL and token.
+2. Starts the agent — a command you give, or one from the ACP registry.
+3. Pipes the agent's stdio to AgentRQ's `/api/acp/v1` endpoint, line for line, without parsing it.
+4. Resumes dropped connections and restarts an agent that dies.
 
 ## Prerequisites
 
-- **Node.js** >= 24
+- **Node.js** >= 22
 - **npm** or **yarn**
 - An [ACP-compatible agent](https://agentclientprotocol.com) (e.g., Gemini CLI)
-- An [agentrq](https://agentrq.com/?utm_source=github) workspace with an HTTP MCP server
+- An [agentrq](https://agentrq.com/?utm_source=github) workspace whose server offers ACP v1 (`/api/acp/v1`)
 
 ## Installation
 
@@ -65,18 +63,18 @@ You can specify gateway options before the `--` separator:
 - `--list-agents`: Prints every agent in the registry and how each one can run on this machine, then exits.
 - `--list-models`: Prints the models supported by the agent, then exits.
 - `--model <model-id>`: Selects the model a session starts on. It can be changed while running from the agentrq interface.
-- `--effort <level>`: Selects a reasoning effort level (e.g. `low`, `medium`, `high`). In native mode, sets the agent's initial reasoning effort.
+- `--effort <level>`: Selects the agent's initial reasoning effort level (e.g. `low`, `medium`, `high`).
 - `--allow-unverified-agent`: Installs a registry binary that publishes no checksum. Off by default.
 - `--registry-url <url>`: Reads a different registry index (for pinning, or for testing).
 - `--mcp-json <path>`: Reads an MCP config in addition to the one found near the working directory, so the gateway can run from outside its workspace. The path is to the file itself and the filename need not be `.mcp.json`; a directory is taken to mean the `.mcp.json` inside it. Where both files define a server under the same name, the one named here wins. A path that cannot be read is an error rather than a quiet fall back to the directory.
 - `--auth-method <id>`: The authentication method to use when the agent asks for a login. Defaults to picking one automatically.
-- `--verbose`: Prints everything — MCP connections and notifications, sessions, file reads and writes, tool calls, the agent's own logs, and its answer as it streams. Without it the gateway only prints each task it is asked to do, permission requests, how each task finished, and any warnings or errors; the agent's logs are kept back and shown only if it fails. Commands that print something and exit, like `--list-models`, print just that.
+- `--verbose`: Prints everything — the connection to AgentRQ, the agent's own logs, and what the one-shot commands exchange with the agent. Without it the gateway only prints warnings and errors; the agent's logs are kept back and shown only if it fails. Commands that print something and exit, like `--list-models`, print just that.
 - `--help` / `-h`: Explains every option, with examples. Also shown when `acp-gateway` is run with nothing to do.
 - `--list-auth-methods`: Prints the login methods the agent advertises, then exits.
 - `--login [method-id]`: Logs in to the agent, then exits.
 - `--logout`: Ends the agent's authenticated state, then exits (only for agents that support logout).
-- `--acp-version <1|2>`: Native mode. AgentRQ speaks ACP itself, and the gateway only pipes the agent's stdio to it (see [Native Mode](#native-mode-agentrq-speaks-acp)).
-- `--acp-url <url>`: The native endpoint, for a deployment where it cannot be worked out from `.mcp.json`.
+- `--acp-url <url>`: The ACP endpoint, for a deployment where it cannot be worked out from `.mcp.json`.
+- `--acp-version 1`: Still accepted so existing launch scripts keep working, but it changes nothing: ACP v1 is the only protocol. Any other version is refused.
 
 Example:
 ```bash
@@ -182,7 +180,9 @@ Credentials are never stored by the gateway; the agent keeps its own, exactly as
 
 `acp-gateway` searches for `.mcp.json` starting in the current working directory and up to 3 parent directories.
 
-`--list-models`, `--agent-info`, `--list-auth-methods`, `--login` and `--logout` only deal with the agent itself, so they do not need a workspace: they skip the search and run without a `.mcp.json`. They still read a config named with `--mcp-json`, but `--list-models` never connects to the workspace: it runs the agent in an empty temporary directory, so the agent does not pick up the workspace's `.mcp.json` and get taken for the workspace's agent.
+Only the AgentRQ server's `url` (its `?token=`) or `Authorization: Bearer` header is used: the gateway connects to that server's `/api/acp/v1` endpoint, not to the MCP server itself.
+
+`--list-models`, `--agent-info`, `--list-auth-methods`, `--login` and `--logout` only deal with the agent itself, so they never read a workspace config. `--list-models` runs the agent in an empty temporary directory, so the agent does not pick up the workspace's `.mcp.json` and get taken for the workspace's agent.
 
 `--mcp-json <path>` names a config directly, wherever it lives and whatever it is called. It is read *as well as* whatever the search finds, with the named file winning any name collision — so a gateway started from somewhere other than its workspace still connects to the right one.
 
@@ -193,7 +193,7 @@ Example `.mcp.json`:
   "mcpServers": {
     "agentrq": {
       "type": "http",
-      "url": "http://localhost:3000/mcp"
+      "url": "https://<workspace>.mcp.agentrq.com/?token=<token>"
     }
   }
 }
@@ -201,85 +201,27 @@ Example `.mcp.json`:
 
 `acp-gateway` prefers servers with `agentrq` in the name; it falls back to the first HTTP server with a `url`.
 
-### Changing Concurrency While Running
+## How It Works
 
-`--max-concurrency` is the limit the gateway boots with. The workspace can change it on a gateway that is
-already running — raising it to get through a backlog, or lowering it to drain one — without a restart that
-would drop every session the gateway holds.
-
-The workspace sends:
-
-```json
-{
-  "method": "notifications/claude/channel/set_concurrency",
-  "params": { "maxConcurrency": 4 }
-}
+```
+┌─────────────┐   ACP v1 (stdio)   ┌─────────────┐   ACP v1 (WebSocket)   ┌─────────────────────┐
+│  ACP Agent  │ ◄────────────────► │ acp-gateway │ ◄────────────────────► │ AgentRQ /api/acp/v1 │
+└─────────────┘                    └─────────────┘                        └─────────────────────┘
 ```
 
-This pair of notifications is camelCase, unlike the older snake_case messages on the same channel — it is new
-enough to have no client spelling it the other way, so it carries one spelling rather than two.
+AgentRQ is the ACP client and the gateway translates nothing. It starts the agent (a registry id or the command
+after `--`) and moves bytes: each line the agent writes becomes one WebSocket text frame to AgentRQ, and each
+frame AgentRQ sends becomes one line on the agent's stdin. It never parses the ACP messages in between.
 
-The value may be a string. A value of any other shape — `null`, a boolean, an object — is accepted at the
-door and refused downstream, so that it can still be answered; a notification dropped for being malformed
-would be a notification the gateway never replied to. A payload that names no `maxConcurrency` at all reads
-as absent and is answered with the limit still in force, so a mistaken sender sees an unchanged limit come
-back rather than silence.
-
-The gateway reports the limit in force on `notifications/claude/channel/concurrency` — on connect, on every
-reconnect, and after every `set_concurrency`:
-
-```json
-{
-  "maxConcurrency": 4,
-  "active": 2,
-  "queued": 3,
-  "min": 1,
-  "max": 64,
-  "canSet": true
-}
-```
-
-That report is unconditional, including when the requested value was refused or clamped, so the interface
-never goes on showing a limit the gateway did not adopt. `canSet` says this gateway will act on being told
-to change; versions before it report a limit and ignore the instruction, so a client should treat the flag's
-absence as no.
-
-Two things worth knowing about how a change lands:
-
-- **Raising** takes effect at once — every waiting task the new headroom allows starts immediately, rather
-  than one per completion.
-- **Lowering** never interrupts a task already in flight. Those keep the agent's attention and finish; the
-  queue simply stops handing out new ones until enough have. So `active` may exceed `maxConcurrency` for a
-  while after a lower, which is expected rather than an error.
-
-The limit lives in memory. It survives MCP reconnects but not a gateway restart, which falls back to
-`--max-concurrency`. A workspace that wants the setting to stick should store it and re-send it on connect.
-
-`--max-concurrency` goes through the same reader, so the flag and the interface cannot disagree about what a
-number means. Nothing reports a flag back to the person who typed it, so unlike the workspace's path the
-gateway says out loud on startup when a flag value was capped or could not be read.
-
-### Native Mode (AgentRQ Speaks ACP)
-
-```bash
-acp-gateway --acp-version 1 --agent codex-acp
-acp-gateway --acp-version 1 -- your-acp-agent --flag1
-```
-
-With `--acp-version`, AgentRQ is the ACP client and the gateway no longer translates anything. It starts the
-agent exactly as it would otherwise (a registry id or the command after `--`) and moves bytes: each line the
-agent writes becomes one WebSocket text frame to AgentRQ, and each frame AgentRQ sends becomes one line on the
-agent's stdin. It never parses the ACP messages in between.
-
-- **Where it connects.** `.mcp.json` is still where the workspace comes from. The endpoint is the AgentRQ
-  server's own origin with the path `/api/acp/v1` (or `/api/acp/v2`), over `wss://` for an `https://` server
-  and `ws://` for `http://`. The workspace token is the URL's `?token=` or the entry's `Authorization: Bearer`
-  header. `--acp-url` names the endpoint outright.
+- **Where it connects.** The endpoint is the AgentRQ server's own origin with the path `/api/acp/v1`, over
+  `wss://` for an `https://` server and `ws://` for `http://`. The workspace token is the URL's `?token=` or the
+  entry's `Authorization: Bearer` header. `--acp-url` names the endpoint outright.
 - **Before connecting** it sends a plain `GET` with the token, so a problem is named rather than retried for ever:
   an old server without the endpoint (404), a bad token (401/403, with the server's reason), or a proxy that does
   not pass `Upgrade` for `/api/acp/`. Each of these exits 1.
 - **Options travel as headers.** `--agent`, `--model`, `--effort`, `--max-concurrency`, `--permission-timeout` and
   `--auth-method` reach AgentRQ in the WebSocket handshake, along with the working directory every session runs in.
+  AgentRQ applies them, and can change the concurrency limit and model while running.
 - **Dropped connections resume.** The gateway reconnects with backoff (1 s doubling to 60 s), and AgentRQ keeps
   the connection for two minutes. Within that time nothing is lost or repeated: each side replays what the other
   had not acknowledged, up to 1,024 frames or 8 MiB. Past it, the agent is restarted and starts over.
@@ -287,63 +229,22 @@ agent's stdin. It never parses the ACP messages in between.
   gives up and exits 1 with the agent's last output.
 - **Errors that a retry cannot fix** (an agent that speaks a different ACP version, a login that needs a terminal)
   are printed and exit 1.
-- `--login`, `--logout`, `--list-models`, `--list-auth-methods` and `--agent-info` ignore the flag: they still talk
-  to the agent locally, as before.
-- Native mode needs **Node 22 or newer**. Without `--acp-version`, the gateway behaves exactly as before, on Node 20
-  too.
-
-## How It Works
-
-```
-┌─────────────┐       ACP (JSON-RPC)       ┌──────────────────┐
-│  ACP Agent  │ ◄─────────────────────────► │                  │
-│  (Gemini)   │                               │   acp-gateway    │
-└─────────────┘                               │                  │
-                                              │  MCP Bridge      │
-                                              │                  │
-┌─────────────────────────────────────────────┤                  │
-│                                             │                  │
-│                                             │                  │
-│                                             ▼                  │
-│                              ┌──────────────────────────┐     │
-│                              │  agentrq MCP Server      │     │
-│                              │  (HTTP / StreamableHTTP) │     │
-│                              └──────────────────────────┘     │
-└────────────────────────────────────────────────────────────────┘
-```
-
-### Flow
-
-1. **Config Loading** — Reads `.mcp.json` to find the agentrq MCP server.
-2. **MCP Connection** — Establishes a `StreamableHTTPClientTransport` to the MCP server with automatic retry and reconnection.
-3. **Agent Spawning** — Launches the specified ACP agent as a subprocess with stdio piping.
-4. **ACP Handshake** — Initializes the ACP connection.
-5. **Task Bridge & Multi-Session Isolation** — When a task is received from the MCP server:
-    - `acp-gateway` extracts the `chat_id` (Task ID).
-    - It checks if the task content is a duplicate of the last processed task for this Task ID. If it is repetitive, the task is dropped to prevent redundant processing.
-    - If not repetitive, the task is added to a concurrency-limiting queue (honoring the current concurrency limit — `--max-concurrency` at startup, or whatever the workspace has since set).
-    - It ensures a dedicated ACP session for that specific task. A task delivered twice at once joins the session already being opened for it rather than spawning a second agent, and the agent is fully handshaken and authenticated before it is ever prompted.
-    - A second delivery of a task that is already mid-turn waits for that turn to finish. A session takes one turn at a time, and because agentrq reuses a chat's id as the task id, two messages sent to one chat arrive as two deliveries of one task — so they are run in order rather than at once, and neither is dropped.
-    - If the task belongs to a different session than the current one, a new ACP session is initialized, providing clean state isolation between concurrent or sequential tasks.
-6. **Permission Bridge** — Permission requests from the ACP agent are forwarded to the MCP server; verdicts are sent back.
-7. **Concurrency Control** — The gateway reports its queue limit to the workspace on connect and on every reconnect, and applies a new limit whenever the workspace sends one (see below).
-8. **Recursive Execution** — After each task completes, `acp-gateway` checks for the next pending task automatically.
+- `--login`, `--logout`, `--list-models`, `--list-auth-methods` and `--agent-info` talk to the agent locally and
+  exit; they never connect to AgentRQ.
 
 ### Key Components
 
 | File | Description |
 |---|---|
-| `src/index.ts` | Entry point; orchestrates config loading, MCP connection, agent spawning, and ACP session lifecycle. |
-| `src/acpClient.ts` | Implements the ACP `Client` interface — routes permission requests, handles session updates, and provides file operations. |
-| `src/mcpClient.ts` | `EventEmitter`-based MCP client with auto-reconnection, notification handling, and tool call dispatch. |
+| `src/index.ts` | Entry point: options, the one-shot commands, and starting the bridge. |
+| `src/native.ts` | Runs the agent and pipes its stdio to AgentRQ's WebSocket, with resume, reconnect and respawn. |
+| `src/nativeFrames.ts` | The bridge's pure parts: line splitting, control frames, the replay ring, the endpoint and headers. |
+| `src/localClient.ts` | The ACP client the one-shot commands use; puts a login URL to the person at the terminal. |
 | `src/config.ts` | Parses `.mcp.json` from the current directory tree up to 3 levels deep, plus any config named with `--mcp-json`. |
-| `src/concurrency.ts` | How many tasks may prompt the agent at once, and the notifications that change it while the gateway runs. |
 | `src/auth.ts` | ACP authentication — lists the agent's login methods, detects `auth_required`, and runs agent or terminal logins. |
 | `src/registry.ts` | Reads the ACP registry index — agent lookup, host platform matching, and package launch commands. |
 | `src/agentInstall.ts` | Downloads, verifies, unpacks and caches a registry agent's binary distribution. |
 | `src/progress.ts` | Draws the single-line download progress bar, on a terminal and nowhere else. |
-| `src/native.ts` | Native mode: runs the agent and pipes its stdio to AgentRQ's WebSocket, with resume, reconnect and respawn. |
-| `src/nativeFrames.ts` | Native mode's pure parts: line splitting, control frames, the replay ring, the endpoint and headers. |
 
 ## Development
 
@@ -360,40 +261,10 @@ npm run typecheck
 npm test
 ```
 
-### Project Structure
-
-```
-acp-gateway/
-├── src/
-│   ├── acpClient.ts      # ACP Client implementation
-│   ├── agentInstall.ts    # Registry binary download / verify / cache
-│   ├── auth.ts            # ACP authentication (login / logout)
-│   ├── config.ts          # .mcp.json loader
-│   ├── index.ts           # Entry point & orchestrator
-│   ├── mcpClient.ts       # MCP Bridge with auto-reconnect
-│   ├── native.ts          # Native mode byte bridge (--acp-version)
-│   ├── nativeFrames.ts    # Native mode frames, replay ring, headers
-│   ├── progress.ts        # Download progress bar
-│   ├── registry.ts        # ACP registry index client
-│   ├── telemetry.ts       # Thought / plan / usage rendering
-│   └── __tests__/         # Unit tests
-├── package.json
-└── tsconfig.json
-```
-
 ### Architecture Notes
 
-- **Auto-reconnection**: The MCP transport auto-reconnects on disconnection with exponential backoff (1s → 30s max).
-- **Notification-driven tasks**: The MCP server pushes task content via `notifications/claude/channel`; `acp-gateway` reacts immediately.
-- **Permission flow**: ACP agent requests permission → `acp-gateway` forwards to MCP server → waits for verdict → resolves the ACP permission. Tool calls served by the workspace itself — replying, moving a task on, reading or writing workspace memory — are approved without asking, since the workspace is where the question would be put. Recognising one takes both halves of the call: an `agentrq` server in the title's server position, and a tool name the server actually advertised on connect. So a tool the workspace adds later is covered without a release here, while a look-alike server cannot have its whole surface waved through.
-- **Streaming telemetry**: Reasoning, execution plans and token/cost counters are forwarded on `notifications/claude/channel/telemetry`. Reasoning is batched into one block per boundary (the agent starts answering, calls a tool, or revises its plan) rather than one message per token; plans go out as they change; only the last usage snapshot of a turn is reported. Sends are queued off the ACP stream, so a workspace that is slow or unreachable never stalls the agent.
-- **Capabilities before the first task**: The gateway opens one ACP session before it connects to the workspace, so a workspace can say which model an agent is on, which models it offers and which slash commands it accepts — none of which exist outside a session, and ACP has no way to ask for them outside one. That session is handed to the first task rather than left running beside it, and it is opened before the workspace connection so a task can never be handed to a gateway whose agent is not ready yet. An agent that demands authentication stops and waits here, which is much of the point: the terminal you just typed into is where you can answer. If that login cannot happen — refused, or headless with nobody to ask — the gateway exits rather than sitting there looking connected and failing every task it is given. Any other startup failure is survived, and the first task tries again as before.
-- **Agent identity**: Which agent is behind the gateway is sent to the workspace on `notifications/claude/channel/agent`. A registry id is named as soon as the workspace connection is up — the registry knows the agent before it has been started — and the agent's own name for itself, from its `initialize` handshake, replaces it once a session exists. Without it a workspace can only name its MCP client, which for anything reached through here is `acp-gateway` — the bridge rather than the agent. An agent that supplies no `agentInfo` is named by how it was launched, since that is the only name available and it beats none.
-- **Model selection**: The models an agent offers go to the workspace on `notifications/claude/channel/models`, and one can be chosen from the interface: the workspace sends back `notifications/claude/channel/set_model` and the gateway writes it to the agent's session config. Every report carries `can_set: true`, which is what tells a workspace a picker would do something — it cannot be inferred, since gateways before this release also report their models and ignore being told to change one, and the MCP client name is `acp-gateway` on both sides of that line. What comes back is always the agent's own answer: a switch it refuses, or a model it never offered, is reported as the list that is still true, so the interface reverts rather than showing a model nothing adopted. That holds even for a session that has already ended — what each session was last on is remembered past the agent that served it, so a choice made a moment too late is answered rather than left pending. `--model` remains the starting model; a choice made while running overrides it for that session without rewriting any config.
-- **Slash commands**: The commands an agent advertises with `available_commands_update` (`/init`, `/compact`, `/review`, …) are forwarded to the workspace on `notifications/claude/channel/commands`, so its composer can offer them. The list is replaced each time the agent sends one, and an empty list is forwarded too — that is how an agent withdraws its commands. Running one needs nothing special here: ACP carries a command as ordinary prompt text, and prompt content reaches the agent verbatim.
 - **Registry agents**: `--agent <id>` resolves through the registry index; package distributions are preferred over binaries, and a binary without a published `sha256` is refused unless explicitly allowed.
 - **Authentication**: Login methods come from the `initialize` handshake; an `auth_required` refusal triggers a login and one retry of `newSession`.
-- **File I/O**: `readTextFile` / `writeTextFile` are proxied directly to the filesystem; paths are resolved relative to `process.cwd()`. Reads honour the optional 1-based `line` and `limit` bounds, returning only the requested window of the file.
 
 ## Contributing
 

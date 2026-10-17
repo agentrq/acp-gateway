@@ -88,7 +88,6 @@ async function start(over: Partial<NativeOptions> = {}) {
   const fetchImpl = (over.fetchImpl as ReturnType<typeof vi.fn>) ?? status(426);
   let finished = false;
   const done = runNative({
-    version: 1,
     acpCmdArgs: ["agent", "--acp"],
     endpoint: "wss://h/api/acp/v1",
     token: "t",
@@ -555,11 +554,11 @@ describe("runNative", () => {
     write.mockRestore();
   });
 
-  it("native mode on Node 20 refuses at start and classic is untouched", async () => {
+  it("refuses to start on Node 20", async () => {
     vi.stubGlobal("WebSocket", undefined);
     const t = await start({ WebSocketImpl: undefined });
     await t.done;
-    expect(printed()).toContain("native mode needs Node 22 or newer");
+    expect(printed()).toContain("acp-gateway needs Node 22 or newer");
     expect(t.exit).toHaveBeenCalledWith(1);
     expect(t.spawnImpl).not.toHaveBeenCalled();
     expect(t.fetchImpl).not.toHaveBeenCalled();
@@ -585,7 +584,7 @@ describe("runNative", () => {
     const t = await start({ fetchImpl: status(404) as any });
     await t.done;
     expect(printed()).toContain(
-      "this AgentRQ server does not offer native ACP v1 (HTTP 404); update the server, or start without --acp-version",
+      "this AgentRQ server does not offer ACP v1 (HTTP 404); update the server",
     );
     expect(t.exit).toHaveBeenCalledWith(1);
     expect(FakeSocket.instances).toHaveLength(0);
@@ -637,7 +636,7 @@ describe("runNative", () => {
     await vi.advanceTimersByTimeAsync(16_000);
     await t.done;
     expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(printed()).toContain("does not offer native ACP v1 (HTTP 404)");
+    expect(printed()).toContain("does not offer ACP v1 (HTTP 404)");
     expect(t.exit).toHaveBeenCalledWith(1);
     expect(FakeSocket.instances).toHaveLength(5);
   });

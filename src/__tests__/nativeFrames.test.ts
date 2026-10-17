@@ -148,17 +148,17 @@ describe("ReplayRing", () => {
 
 describe("endpoints and tokens", () => {
   it("derives wss from https, keeps the host, replaces the path", () => {
-    expect(nativeEndpoint("https://4hro0x9eslxd.mcp.agentrq.com/?token=t", 1)).toBe(
+    expect(nativeEndpoint("https://4hro0x9eslxd.mcp.agentrq.com/?token=t")).toBe(
       "wss://4hro0x9eslxd.mcp.agentrq.com/api/acp/v1",
     );
   });
 
   it("derives ws from http for a local server", () => {
-    expect(nativeEndpoint("http://localhost:3911/mcp/0kAbc?token=t#x", 2)).toBe("ws://localhost:3911/api/acp/v2");
+    expect(nativeEndpoint("http://localhost:3911/mcp/0kAbc?token=t#x")).toBe("ws://localhost:3911/api/acp/v1");
   });
 
   it("an explicit --acp-url wins", () => {
-    expect(nativeEndpoint("https://h/", 1, "wss://elsewhere/acp")).toBe("wss://elsewhere/acp");
+    expect(nativeEndpoint("https://h/", "wss://elsewhere/acp")).toBe("wss://elsewhere/acp");
   });
 
   it("turns the endpoint back into http for the preflight", () => {

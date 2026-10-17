@@ -66,7 +66,6 @@ export type BridgeSocketCtor = new (
 ) => BridgeSocket;
 
 export interface NativeOptions {
-  version: 1 | 2;
   acpCmdArgs: string[];
   env?: Record<string, string>;
   endpoint: string;
@@ -113,7 +112,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
   const WS = o.WebSocketImpl ?? ((globalThis as { WebSocket?: unknown }).WebSocket as BridgeSocketCtor | undefined);
   if (!nativeSupported(WS, o.nodeVersion)) {
     console.error(
-      "[acp-gateway] native mode needs Node 22 or newer (classic mode, without --acp-version, still runs here)",
+      "[acp-gateway] acp-gateway needs Node 22 or newer",
     );
     exit(1);
     return;
@@ -216,8 +215,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
     const body = (await res.text().catch(() => "")).trim();
     if (res.status === 404) {
       console.error(
-        `[acp-gateway] this AgentRQ server does not offer native ACP v${o.version} (HTTP 404); ` +
-          "update the server, or start without --acp-version",
+        "[acp-gateway] this AgentRQ server does not offer ACP v1 (HTTP 404); update the server",
       );
     } else if (res.status === 401 || res.status === 403) {
       console.error(

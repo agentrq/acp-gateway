@@ -25,33 +25,6 @@ export function debug(...args: unknown[]): void {
   if (verbose) console.error(...args);
 }
 
-/** Longest a task's text is shown when it is announced. */
-export const TASK_PREVIEW_LENGTH = 200;
-
-/**
- * One line saying what the gateway has been asked, for the default output.
- * The text is collapsed onto one line and cut short; the whole of it is in
- * the workspace for anyone who wants it.
- */
-export function describeAsk(text: string, taskId?: string): string {
-  const flat = text.replace(/\s+/g, " ").trim();
-  const preview =
-    flat.length > TASK_PREVIEW_LENGTH
-      ? `${flat.slice(0, TASK_PREVIEW_LENGTH - 1)}…`
-      : flat;
-  return `[task${taskId ? ` ${taskId}` : ""}] ${preview}`;
-}
-
-/** Says, by default, what the gateway has just been asked to do. */
-export function announceTask(text: string, taskId?: string): void {
-  console.error(`\n${describeAsk(text, taskId)}`);
-}
-
-/** Says, by default, how a task's turn ended. */
-export function announceFinished(taskId: string | undefined, stopReason: string): void {
-  console.error(`[task${taskId ? ` ${taskId}` : ""}] Finished: ${stopReason}`);
-}
-
 /** How much of an agent's stderr is kept to explain a failure, in characters. */
 export const AGENT_STDERR_TAIL_LENGTH = 8 * 1024;
 

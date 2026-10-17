@@ -4,7 +4,6 @@ import {
   isModelConfigOption,
   extractModels,
   formatModelsText,
-  setSessionModel,
   type AgentModelsResult,
 } from "../models.js";
 
@@ -460,27 +459,4 @@ describe("models", () => {
     });
   });
 
-  describe("setSessionModel", () => {
-    it("should call connection.setSessionConfigOption with correct params", async () => {
-      const mockConnection = {
-        setSessionConfigOption: vi.fn().mockResolvedValue({
-          configOptions: [],
-        }),
-      } as unknown as acp.ClientSideConnection;
-
-      const res = await setSessionModel(
-        mockConnection,
-        "sess-123",
-        "model",
-        "gemini-2.5-pro",
-      );
-
-      expect(mockConnection.setSessionConfigOption).toHaveBeenCalledWith({
-        sessionId: "sess-123",
-        configId: "model",
-        value: "gemini-2.5-pro",
-      });
-      expect(res).toEqual({ configOptions: [] });
-    });
-  });
 });
