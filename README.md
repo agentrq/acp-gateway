@@ -210,25 +210,38 @@ Example `.mcp.json`:
 ```
 
 AgentRQ is the ACP client and the gateway translates nothing. It starts the agent (a registry id or the command
-after `--`) and moves bytes: each line the agent writes becomes one WebSocket text frame to AgentRQ, and each
-frame AgentRQ sends becomes one line on the agent's stdin. It never parses the ACP messages in between.
+after `--`) and moves lines: each line the agent writes becomes one WebSocket text frame to AgentRQ, and each
+frame AgentRQ sends becomes one line on the agent's stdin. It reads only the JSON-RPC envelope, for the working
+directory and to keep the agent across a new connection (below).
 
 - **Where it connects.** The endpoint is the AgentRQ server's own origin with the path `/api/acp/v1`, over
   `wss://` for an `https://` server and `ws://` for `http://`. The workspace token is the URL's `?token=` or the
   entry's `Authorization: Bearer` header. `--acp-url` names the endpoint outright.
+- **The agent works in this directory.** Sessions always open in the gateway's own working directory: whatever
+  directory AgentRQ names in `session/new`, `session/load` or `session/resume` is replaced with it. AgentRQ is told
+  the directory in the `X-AgentRQ-Cwd` header, percent-encoded (UTF-8) wherever it is not plain ASCII, since a
+  header cannot carry anything else.
 - **Before connecting** it sends a plain `GET` with the token, so a problem is named rather than retried for ever:
   an old server without the endpoint (404), a bad token (401/403, with the server's reason), or a proxy that does
   not pass `Upgrade` for `/api/acp/`. Each of these exits 1.
 - **Options travel as headers.** `--agent`, `--model`, `--effort`, `--max-concurrency`, `--permission-timeout` and
   `--auth-method` reach AgentRQ in the WebSocket handshake, along with the working directory every session runs in.
   AgentRQ applies them, and can change the concurrency limit and model while running.
-- **Dropped connections resume.** The gateway reconnects with backoff (1 s doubling to 60 s), and AgentRQ keeps
-  the connection for two minutes. Within that time nothing is lost or repeated: each side replays what the other
-  had not acknowledged, up to 1,024 frames or 8 MiB. Past it, the agent is restarted and starts over.
+- **Dropped connections resume.** The gateway reconnects with backoff (1 s doubling to 60 s), for as long as it
+  takes, and AgentRQ keeps the connection for two minutes. Within that time nothing is lost or repeated: each side
+  replays what the other had not acknowledged, up to 1,024 frames or 8 MiB.
+- **Longer outages keep the agent.** After a server restart, a deploy or an outage past those two minutes, AgentRQ
+  starts a new connection, and the same agent process serves it: its `initialize` is answered from the agent's
+  first handshake, the turns that were running are cancelled and the agent's unanswered requests are answered as
+  abandoned. Each task's conversation carries on: a prompt for a task (recognised by the `[Task <id>]` header
+  AgentRQ starts it with) goes to the session that task already had, under whatever id the new connection gave it.
+  The agent is identified to AgentRQ by `X-AgentRQ-Agent-Instance`, which stays the same for as long as it runs.
 - **A dead agent is restarted** after 2 s, doubling to a minute. After five exits within five minutes the gateway
   gives up and exits 1 with the agent's last output.
-- **Errors that a retry cannot fix** (an agent that speaks a different ACP version, a login that needs a terminal)
-  are printed and exit 1.
+- **A login AgentRQ cannot run** (a terminal login) is run here when the gateway has a terminal — a shell, or
+  agentrqd's browser terminal: the agent is stopped, logged in, started again, and the gateway reconnects. Without
+  a terminal, or when the agent asks again straight after a login, it stops with AgentRQ's instructions.
+- **Errors that a retry cannot fix** (an agent that speaks a different ACP version) are printed and exit 1.
 - `--login`, `--logout`, `--list-models`, `--list-auth-methods` and `--agent-info` talk to the agent locally and
   exit; they never connect to AgentRQ.
 

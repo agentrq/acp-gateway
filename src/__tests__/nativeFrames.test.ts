@@ -15,6 +15,12 @@ import {
   stderrTail,
   tokenFrom,
   upgradeHeaders,
+  headerSafeCwd,
+  rpcShape,
+  rewriteCwd,
+  abandonedAnswer,
+  taskIdOf,
+  withSessionId,
 } from "../nativeFrames.js";
 
 describe("LineSplitter", () => {
@@ -199,8 +205,10 @@ describe("upgradeHeaders", () => {
         permissionTimeoutMinutes: 0,
         authMethodId: "chatgpt",
         resume: { connectionId: "AB", received: 7 },
+        agentInstance: "i-1",
       }),
     ).toMatchObject({
+      "X-AgentRQ-Agent-Instance": "i-1",
       "X-AgentRQ-Agent": "codex-acp",
       "X-AgentRQ-Agent-Model": "m",
       "X-AgentRQ-Agent-Effort": "high",
@@ -208,6 +216,96 @@ describe("upgradeHeaders", () => {
       "X-AgentRQ-Permission-Timeout": "0",
       "X-AgentRQ-Auth-Method": "chatgpt",
       "X-AgentRQ-Resume": "AB:7",
+    });
+  });
+});
+
+describe("headerSafeCwd", () => {
+  it("leaves an ASCII path alone, Windows ones included", () => {
+    expect(headerSafeCwd("/home/u/my project")).toBe("/home/u/my project");
+    expect(headerSafeCwd("C:\\Users\\u")).toBe("C:\\Users\\u");
+  });
+
+  it("percent-encodes everything outside printable ASCII, and % itself", () => {
+    expect(headerSafeCwd("/h/文档")).toBe("/h/%E6%96%87%E6%A1%A3");
+    expect(headerSafeCwd("/h/é\tx%")).toBe("/h/%C3%A9%09x%25");
+  });
+});
+
+describe("rpcShape", () => {
+  it("reads requests, notifications and responses", () => {
+    expect(rpcShape('{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/"}}')).toEqual({
+      id: 1,
+      method: "session/new",
+      params: { cwd: "/" },
+      result: undefined,
+      isResponse: false,
+    });
+    expect(rpcShape('{"method":"session/update","params":[1]}')).toMatchObject({ params: undefined, isResponse: false });
+    expect(rpcShape('{"id":"a","result":{"x":1}}')).toMatchObject({ id: "a", result: { x: 1 }, isResponse: true });
+    expect(rpcShape('{"id":{},"error":{}}')).toMatchObject({ id: undefined, isResponse: false });
+  });
+
+  it("is undefined for what is not a JSON-RPC object", () => {
+    expect(rpcShape("not json")).toBeUndefined();
+    expect(rpcShape("[1]")).toBeUndefined();
+    expect(rpcShape("null")).toBeUndefined();
+  });
+});
+
+describe("rewriteCwd", () => {
+  it("puts the given directory into requests that open a session", () => {
+    for (const method of ["session/new", "session/load", "session/resume"]) {
+      const out = rewriteCwd(JSON.stringify({ id: 1, method, params: { cwd: "/srv", mcpServers: [] } }), "/mine");
+      expect(JSON.parse(out).params).toEqual({ cwd: "/mine", mcpServers: [] });
+    }
+  });
+
+  it("leaves everything else exactly as it was", () => {
+    const frames = [
+      '{"id":1,"method":"session/new","params":{"cwd":"/mine"}}',
+      '{"id":1,"method":"session/prompt","params":{"cwd":"/srv"}}',
+      '{"id":1,"method":"session/new"}',
+      '{"id":1,"result":{"cwd":"/srv"}}',
+      '{"id":1,"method":"session/new","params":{}}',
+      'not json "cwd"',
+    ];
+    for (const f of frames) expect(rewriteCwd(f, "/mine")).toBe(f);
+  });
+});
+
+describe("abandonedAnswer", () => {
+  it("cancels a permission or an elicitation, and fails anything else", () => {
+    expect(JSON.parse(abandonedAnswer(1, "session/request_permission")).result).toEqual({ outcome: { outcome: "cancelled" } });
+    expect(JSON.parse(abandonedAnswer("e", "elicitation/create"))).toEqual({ jsonrpc: "2.0", id: "e", result: { action: "cancel" } });
+    expect(JSON.parse(abandonedAnswer(2, "fs/read_text_file")).error.code).toBe(-32603);
+  });
+});
+
+describe("taskIdOf", () => {
+  const p = (text: string) => [{ type: "text", text }];
+
+  it("reads the task from AgentRQ's message headers", () => {
+    expect(taskIdOf(p("[Task 0kU6mhKzQ6j]\nRemove legacy"))).toBe("0kU6mhKzQ6j");
+    expect(taskIdOf(p("  [Reply to task abc] hi"))).toBe("abc");
+    expect(taskIdOf(p("[Response to task x-1] action=text"))).toBe("x-1");
+    expect(taskIdOf(p("[Task reassigned to agent] 0kAbc"))).toBe("0kAbc");
+  });
+
+  it("takes nothing that is not a header at the start", () => {
+    expect(taskIdOf(p("see [Task abc]"))).toBeUndefined();
+    expect(taskIdOf(p("plain"))).toBeUndefined();
+    expect(taskIdOf([{ type: "image" }])).toBeUndefined();
+    expect(taskIdOf([])).toBeUndefined();
+    expect(taskIdOf(undefined)).toBeUndefined();
+  });
+});
+
+describe("withSessionId", () => {
+  it("replaces only the session id", () => {
+    expect(JSON.parse(withSessionId('{"id":1,"params":{"sessionId":"a","x":1}}', "b"))).toEqual({
+      id: 1,
+      params: { sessionId: "b", x: 1 },
     });
   });
 });

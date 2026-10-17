@@ -189,13 +189,29 @@ export interface NativeHeaderOptions {
   permissionTimeoutMinutes?: number;
   authMethodId?: string;
   resume?: { connectionId: string; received: number };
+  /** Stable for the life of one agent process, so AgentRQ can tell a kept agent from a new one. */
+  agentInstance?: string;
+}
+
+/**
+ * The working directory as a header can carry it.
+ *
+ * Header values are bytes, and the built-in WebSocket refuses anything past
+ * Latin-1 outright (a CJK path threw) and sends Latin-1 itself as the wrong
+ * bytes. So everything outside printable ASCII is percent-encoded as UTF-8,
+ * and so is `%` itself. An ASCII path is sent unchanged, and an encoded one
+ * still starts the way it did, so it still reads as absolute. The agent never
+ * sees this value: see `rewriteCwd`.
+ */
+export function headerSafeCwd(cwd: string): string {
+  return cwd.replace(/[^\x20-\x24\x26-\x7e]+/gu, (run) => encodeURIComponent(run));
 }
 
 export function upgradeHeaders(o: NativeHeaderOptions): Record<string, string> {
   const h: Record<string, string> = {
     Authorization: `Bearer ${o.token}`,
     "X-AgentRQ-Bridge-Version": o.bridgeVersion,
-    "X-AgentRQ-Cwd": o.cwd,
+    "X-AgentRQ-Cwd": headerSafeCwd(o.cwd),
     "X-AgentRQ-Platform": o.platform,
   };
   if (o.agentId) h["X-AgentRQ-Agent"] = o.agentId;
@@ -204,6 +220,7 @@ export function upgradeHeaders(o: NativeHeaderOptions): Record<string, string> {
   if (o.maxConcurrency !== undefined) h["X-AgentRQ-Max-Concurrency"] = String(o.maxConcurrency);
   if (o.permissionTimeoutMinutes !== undefined) h["X-AgentRQ-Permission-Timeout"] = String(o.permissionTimeoutMinutes);
   if (o.authMethodId) h["X-AgentRQ-Auth-Method"] = o.authMethodId;
+  if (o.agentInstance) h["X-AgentRQ-Agent-Instance"] = o.agentInstance;
   if (o.resume) h["X-AgentRQ-Resume"] = `${o.resume.connectionId}:${o.resume.received}`;
   return h;
 }
@@ -228,4 +245,89 @@ export function stderrTail(lines: string[]): string[] {
     bytes -= Buffer.byteLength(kept[start++]);
   }
   return start > 0 ? kept.slice(start) : kept;
+}
+
+/** The JSON-RPC fields the bridge looks at, when a frame is one. */
+export interface RpcShape {
+  id?: string | number;
+  method?: string;
+  params?: Record<string, unknown>;
+  result?: unknown;
+  isResponse: boolean;
+}
+
+/**
+ * Reads the envelope of an ACP frame, or undefined when it is not a JSON-RPC
+ * object. The bridge reads only the envelope, and only for what it has to do
+ * itself: keeping the working directory its own, and keeping an agent across a
+ * new AgentRQ connection.
+ */
+export function rpcShape(frame: string): RpcShape | undefined {
+  let m: any;
+  try {
+    m = JSON.parse(frame);
+  } catch {
+    return undefined;
+  }
+  if (!m || typeof m !== "object" || Array.isArray(m)) return undefined;
+  const id = typeof m.id === "string" || typeof m.id === "number" ? m.id : undefined;
+  const method = typeof m.method === "string" ? m.method : undefined;
+  const params = m.params && typeof m.params === "object" && !Array.isArray(m.params) ? m.params : undefined;
+  return { id, method, params, result: m.result, isResponse: method === undefined && id !== undefined };
+}
+
+/** The requests that carry the directory a session runs in. */
+const CWD_METHODS: ReadonlySet<string> = new Set(["session/new", "session/load", "session/resume"]);
+
+/**
+ * Puts this process's own working directory into a request that opens a
+ * session, whatever AgentRQ sent. The agent runs here, so the directory it
+ * works in is this one — not a server's idea of it, and not the header's
+ * ASCII-safe spelling of it.
+ */
+export function rewriteCwd(frame: string, cwd: string): string {
+  if (!frame.includes('"cwd"')) return frame;
+  const shape = rpcShape(frame);
+  if (!shape?.method || !CWD_METHODS.has(shape.method) || !shape.params) return frame;
+  if (shape.params.cwd === cwd) return frame;
+  const m = JSON.parse(frame);
+  m.params.cwd = cwd;
+  return JSON.stringify(m);
+}
+
+/** What answers an agent's request that AgentRQ will now never answer. */
+export function abandonedAnswer(id: string | number, method: string): string {
+  if (method === "session/request_permission") {
+    return JSON.stringify({ jsonrpc: "2.0", id, result: { outcome: { outcome: "cancelled" } } });
+  }
+  if (method === "elicitation/create") {
+    return JSON.stringify({ jsonrpc: "2.0", id, result: { action: "cancel" } });
+  }
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    error: { code: -32603, message: "AgentRQ reconnected before answering" },
+  });
+}
+
+/**
+ * The AgentRQ task a prompt is for, from the header AgentRQ starts every task
+ * message with: `[Task <id>]`, `[Reply to task <id>]`, `[Response to task
+ * <id>]` or `[Task reassigned to agent] <id>`. Only a header at the very start
+ * counts, so text that merely mentions a task is never taken for one.
+ */
+export function taskIdOf(prompt: unknown): string | undefined {
+  const first = Array.isArray(prompt) ? prompt[0] : undefined;
+  const text = first && typeof first === "object" && typeof first.text === "string" ? first.text : "";
+  const m =
+    /^\s*\[(?:Task|Reply to task|Response to task)\s+([A-Za-z0-9_-]+)\]/i.exec(text) ??
+    /^\s*\[Task reassigned to agent\]\s+([A-Za-z0-9_-]+)/i.exec(text);
+  return m?.[1];
+}
+
+/** The frame with its `params.sessionId` replaced. */
+export function withSessionId(frame: string, sessionId: string): string {
+  const m = JSON.parse(frame);
+  m.params.sessionId = sessionId;
+  return JSON.stringify(m);
 }

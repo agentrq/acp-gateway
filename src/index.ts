@@ -1058,6 +1058,7 @@ export function nativeOptionsFor(
   acpCmdArgs: string[],
   agentrqConfig: McpServerConfig,
   cwd: string = process.cwd(),
+  interactive: boolean = isInteractiveTerminal(),
 ): NativeOptions | string {
   const token = tokenFrom(agentrqConfig);
   if (!token) return "acp-gateway needs the workspace token from .mcp.json";
@@ -1082,6 +1083,12 @@ export function nativeOptionsFor(
     permissionTimeoutMinutes: Math.round(options.permissionTimeoutMs / 60_000),
     authMethodId: options.authMethodId,
     cwd: path.resolve(cwd),
+    // AgentRQ never runs a terminal login itself. With a terminal here — a
+    // shell, or agentrqd's browser terminal — the bridge runs it instead of
+    // stopping.
+    login: interactive
+      ? () => runAgentCommand("login", acpCmdArgs, agentrqConfig.env, options.authMethodId)
+      : undefined,
   };
 }
 

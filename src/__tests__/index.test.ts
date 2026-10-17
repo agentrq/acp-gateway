@@ -1621,6 +1621,13 @@ describe("index", () => {
       );
     });
 
+    it("needs no URL in .mcp.json when --acp-url names the endpoint", () => {
+      const options = parseGatewayArgs(["--acp-url", "wss://x/acp"]);
+      expect(
+        nativeOptionsFor(options, ["a"], { name: "x", type: "http", headers: { Authorization: "Bearer t" } }),
+      ).toMatchObject({ endpoint: "wss://x/acp", token: "t" });
+    });
+
     it("needs a URL, from .mcp.json or --acp-url", () => {
       const options = parseGatewayArgs(["--acp-version", "1"]);
       expect(
@@ -1651,6 +1658,18 @@ describe("index", () => {
       expect(errorSpy).toHaveBeenCalledWith("[acp-gateway] acp-gateway needs the workspace token from .mcp.json");
       expect(exit).toHaveBeenCalledWith(1);
       expect(run).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it("logs the agent in at this terminal only when there is one", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const options = parseGatewayArgs(["--auth-method", "oauth"]);
+      expect((nativeOptionsFor(options, ["gemini"], agentrq, "/w", false) as any).login).toBeUndefined();
+
+      const native = nativeOptionsFor(options, [process.execPath, "agent.js"], agentrq, "/w", true) as any;
+      // The mocked agent offers no login methods, so the login has nothing to do.
+      await expect(native.login()).resolves.toBeUndefined();
+      expect(errorSpy.mock.calls.flat().join("\n")).toContain("advertises no authentication methods");
       errorSpy.mockRestore();
     });
 
