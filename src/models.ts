@@ -206,19 +206,3 @@ export function formatModelsText(
 
   return `${header}\n\n${body}`;
 }
-
-/**
- * Sets the active model on an ACP session via `session/set_config_option`.
- */
-export async function setSessionModel(
-  connection: acp.ClientSideConnection,
-  sessionId: string,
-  configId: string,
-  modelId: string,
-): Promise<acp.SetSessionConfigOptionResponse> {
-  return await connection.setSessionConfigOption({
-    sessionId,
-    configId,
-    value: modelId,
-  });
-}

@@ -88,7 +88,6 @@ async function start(over: Partial<NativeOptions> = {}) {
   const fetchImpl = (over.fetchImpl as ReturnType<typeof vi.fn>) ?? status(426);
   let finished = false;
   const done = runNative({
-    version: 1,
     acpCmdArgs: ["agent", "--acp"],
     endpoint: "wss://h/api/acp/v1",
     token: "t",
@@ -298,19 +297,305 @@ describe("runNative", () => {
     expect(t.ws().data()).toEqual(["offline"]);
   });
 
-  it("a fresh welcome on a reconnect restarts the agent first", async () => {
+  /** Connects, has the agent answer AgentRQ's initialize, and opens a session for a prompt. */
+  async function initialized() {
     const t = await connected();
+    t.ws().receive('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}');
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}\n');
+    t.ws().receive('{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"S1"}}');
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"S1"}}\n');
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":8,"method":"elicitation/create","params":{}}\n');
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":9,"method":"fs/read_text_file","params":{}}\n');
+    await flush();
+    t.children[0].written.length = 0;
+    return t;
+  }
+
+  /** Drops the connection and takes a fresh (not resumed) welcome on the next. */
+  function freshReconnect(t: Awaited<ReturnType<typeof start>>) {
     t.ws().drop(1006);
     vi.advanceTimersByTime(1000);
     t.ws().open();
     t.ws().welcome({ resumed: false, connectionId: "CD" });
-    expect(t.children[0].kill).toHaveBeenCalled();
-    expect(t.children).toHaveLength(2);
+  }
 
-    t.ws().receive('{"jsonrpc":"2.0","id":0,"method":"initialize"}');
+  it("a fresh welcome on a reconnect keeps the agent and its sessions", async () => {
+    const t = await initialized();
+    const instance = t.ws().init.headers["X-AgentRQ-Agent-Instance"];
+    expect(instance).toMatch(/^[0-9a-f-]{36}$/);
+    freshReconnect(t);
+    await flush();
+
+    expect(t.children).toHaveLength(1);
+    expect(t.children[0].kill).not.toHaveBeenCalled();
+    expect(t.ws().init.headers["X-AgentRQ-Agent-Instance"]).toBe(instance);
+    expect(printed()).toMatch(/keeping the agent and its sessions/);
+    // What the old connection left open is closed: its requests answered, its turns cancelled.
+    expect(t.children[0].written.map((l) => JSON.parse(l))).toEqual([
+      { jsonrpc: "2.0", id: 7, result: { outcome: { outcome: "cancelled" } } },
+      { jsonrpc: "2.0", id: 8, result: { action: "cancel" } },
+      { jsonrpc: "2.0", id: 9, error: { code: -32603, message: "AgentRQ reconnected before answering" } },
+      { jsonrpc: "2.0", method: "session/cancel", params: { sessionId: "S1" } },
+    ]);
+  });
+
+  it("answers a new connection's initialize from the agent's first answer", async () => {
+    const t = await initialized();
+    freshReconnect(t);
+    await flush();
+    t.children[0].written.length = 0;
+
+    t.ws().receive('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}');
     await flush();
     expect(t.children[0].written).toEqual([]);
-    expect(t.children[1].written).toEqual(['{"jsonrpc":"2.0","id":0,"method":"initialize"}\n']);
+    expect(t.ws().data()).toEqual(['{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}']);
+  });
+
+  it("keeps a new connection's request ids apart from an earlier connection's", async () => {
+    const t = await initialized();
+    freshReconnect(t);
+    await flush();
+    t.children[0].written.length = 0;
+
+    t.ws().receive('{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/work","mcpServers":[]}}');
+    await flush();
+    expect(JSON.parse(t.children[0].written[0]).id).toBe("1:1");
+
+    // The cancelled turn of the old connection answers its id 1 late: nobody asked.
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":1,"result":{"stopReason":"cancelled"}}\n');
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":"1:1","result":{"sessionId":"S2"}}\n');
+    await flush();
+    expect(t.ws().data()).toEqual(['{"jsonrpc":"2.0","id":1,"result":{"sessionId":"S2"}}']);
+  });
+
+  it("sends a second connection's initialize to an agent that never answered the first", async () => {
+    const t = await connected();
+    t.ws().receive('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}');
+    await flush();
+    freshReconnect(t);
+    await flush();
+    t.children[0].written.length = 0;
+
+    t.ws().receive('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}');
+    await flush();
+    expect(t.children[0].written).toEqual(['{"jsonrpc":"2.0","id":"1:0","method":"initialize","params":{}}\n']);
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":"1:0","result":{"protocolVersion":1}}\n');
+    await flush();
+    expect(t.ws().data()).toEqual(['{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}']);
+
+    // ...and remembers that answer for the next connection.
+    freshReconnect(t);
+    t.ws().receive('{"jsonrpc":"2.0","id":5,"method":"initialize","params":{}}');
+    await flush();
+    expect(t.ws().data()).toEqual(['{"jsonrpc":"2.0","id":5,"result":{"protocolVersion":1}}']);
+  });
+
+  it("carries a task's conversation on in its own session after the agent is kept", async () => {
+    const t = await connected();
+    const prompt = (id: number, sessionId: string, text: string) =>
+      JSON.stringify({ jsonrpc: "2.0", id, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text }] } });
+    const sent = () => t.children[0].written.map((l) => JSON.parse(l));
+    t.ws().receive(prompt(1, "S1", "[Task T1] start"));
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}\n');
+    await flush();
+    freshReconnect(t);
+    await flush();
+    t.children[0].written.length = 0;
+
+    // The new connection opened S2 for T1; its prompts reach S1, where T1's conversation is.
+    t.ws().receive(prompt(2, "S2", "[Reply to task T1] more"));
+    t.ws().receive('{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"S2"}}');
+    t.ws().receive(prompt(3, "S3", "[Task T2] new task"));
+    t.ws().receive(prompt(4, "S4", "no task header"));
+    await flush();
+    expect(sent().map((m) => m.params.sessionId)).toEqual(["S1", "S1", "S3", "S4"]);
+
+    // What the agent says about S1 is what AgentRQ knows as S2.
+    t.children[0].stdout.write('{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S1","update":{}}}\n');
+    t.children[0].stdout.write('{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S3","update":{}}}\n');
+    await flush();
+    expect(t.ws().data().map((f) => JSON.parse(f).params.sessionId)).toEqual(["S2", "S3"]);
+
+    // Once AgentRQ closes it, the task starts afresh in whatever session it opens next.
+    t.children[0].written.length = 0;
+    t.ws().receive('{"jsonrpc":"2.0","id":5,"method":"session/close","params":{"sessionId":"S2"}}');
+    t.ws().receive(prompt(6, "S5", "[Task T1] again"));
+    await flush();
+    expect(sent().map((m) => m.params.sessionId)).toEqual(["S1", "S5"]);
+  });
+
+  it("forgets the agent's requests AgentRQ has answered", async () => {
+    const t = await initialized();
+    t.ws().receive('{"jsonrpc":"2.0","id":7,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}');
+    t.ws().receive('{"jsonrpc":"2.0","id":8,"result":{"action":"accept"}}');
+    t.ws().receive('{"jsonrpc":"2.0","id":9,"result":{"content":""}}');
+    await flush();
+    t.children[0].written.length = 0;
+    freshReconnect(t);
+    await flush();
+    expect(t.children[0].written.map((l) => JSON.parse(l).method)).toEqual(["session/cancel"]);
+  });
+
+  // #130: an automatic approval can come back before the request has finished
+  // going out. The verdict is the answer to the agent's own request, so it has
+  // nothing to wait for here, and no timer of ours can cancel the turn later.
+  it("hands the agent a verdict that arrives before the request has finished sending", async () => {
+    const t = await initialized();
+    const ws = t.ws();
+    const sendFrame = ws.send.bind(ws);
+    ws.send = (data: string) => {
+      sendFrame(data);
+      const m = JSON.parse(data);
+      if (m.method === "session/request_permission") {
+        ws.receive(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { outcome: { outcome: "selected", optionId: "allow" } } }));
+      }
+    };
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":{"sessionId":"S1"}}\n');
+    await flush();
+    vi.advanceTimersByTime(31 * 60_000);
+    await flush();
+    expect(t.children[0].written.map((l) => JSON.parse(l))).toEqual([
+      { jsonrpc: "2.0", id: 10, result: { outcome: { outcome: "selected", optionId: "allow" } } },
+    ]);
+  });
+
+  it("gives the agent this process's own directory, whatever AgentRQ sends", async () => {
+    const t = await connected({ cwd: "/home/文档 é" });
+    t.ws().receive('{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/home/%E6%96%87%E6%A1%A3%20%C3%A9","mcpServers":[]}}');
+    t.ws().receive('{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"S","cwd":"/elsewhere","mcpServers":[]}}');
+    await flush();
+    expect(t.children[0].written.map((l) => JSON.parse(l).params.cwd)).toEqual(["/home/文档 é", "/home/文档 é"]);
+    expect(t.ws().init.headers["X-AgentRQ-Cwd"]).toBe("/home/%E6%96%87%E6%A1%A3 %C3%A9");
+  });
+
+  it("hands every session the servers from .mcp.json, as far as the agent can take them", async () => {
+    const t = await connected({
+      cwd: "/work",
+      mcpServers: [
+        { name: "agentrq-workspace", type: "http", url: "https://w/mcp?token=t" },
+        { name: "files", type: "stdio", command: "npx", args: ["-y", "fs-mcp"] },
+      ],
+    });
+    const newSession = (id: number) =>
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "session/new",
+        params: { mcpServers: [{ type: "http", name: "agentrq-workspace", url: "https://w/mcp", headers: [] }] },
+      });
+    const params = () => t.children[0].written.map((l) => JSON.parse(l).params);
+
+    // Before the agent has said anything about its transports, every server goes.
+    t.ws().receive(newSession(1));
+    await flush();
+    expect(params()[0]).toEqual({
+      cwd: "/work",
+      mcpServers: [
+        { type: "http", name: "agentrq-workspace", url: "https://w/mcp?token=t", headers: [] },
+        { name: "files", command: "npx", args: ["-y", "fs-mcp"], env: [] },
+      ],
+    });
+
+    // An agent that refuses http keeps only what it can take.
+    t.ws().receive('{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}');
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":1,"agentCapabilities":{"mcpCapabilities":{"http":false}}}}\n');
+    await flush();
+    // (AgentRQ itself sends no http server to such an agent.)
+    t.ws().receive('{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"mcpServers":[]}}');
+    await flush();
+    expect(params()[2].mcpServers.map((s: any) => s.name)).toEqual(["files"]);
+  });
+
+  it("close 4001 reconnects fresh, and the fresh welcome keeps the agent", async () => {
+    const t = await connected();
+    t.ws().drop(4001, "grace expired");
+    vi.advanceTimersByTime(1000);
+    expect(t.ws().init.headers["X-AgentRQ-Resume"]).toBeUndefined();
+    t.ws().open();
+    t.ws().welcome();
+    expect(t.children).toHaveLength(1);
+  });
+
+  it("a resume it cannot replay reconnects fresh and keeps the agent", async () => {
+    const t = await connected();
+    t.ws().drop(1006);
+    vi.advanceTimersByTime(1000);
+    t.ws().open();
+    t.ws().welcome({ resumed: true, received: 99 });
+    expect(t.children).toHaveLength(1);
+    expect(FakeSocket.instances).toHaveLength(3);
+    expect(t.ws().init.headers["X-AgentRQ-Resume"]).toBeUndefined();
+    expect(printed()).toMatch(/can no longer be replayed; reconnecting/);
+  });
+
+  describe("an agent that needs a terminal login", () => {
+    const refuse = (t: Awaited<ReturnType<typeof start>>) => {
+      t.ws().receive(JSON.stringify({ agentrqBridge: "error", error: "auth_required", message: "run --login on this machine" }));
+      t.ws().drop(4003, "auth_required");
+    };
+
+    it("is logged in at this terminal, then started again on a new connection", async () => {
+      const login = vi.fn(async () => {});
+      const t = await connected({ login });
+      refuse(t);
+      await flush();
+
+      expect(login).toHaveBeenCalledTimes(1);
+      expect(t.children[0].kill).toHaveBeenCalled();
+      expect(t.children).toHaveLength(2);
+      expect(FakeSocket.instances).toHaveLength(2);
+      expect(t.ws().init.headers["X-AgentRQ-Resume"]).toBeUndefined();
+      expect(t.exit).not.toHaveBeenCalled();
+      expect(printed()).toMatch(/logging it in at this terminal/);
+      expect(printed()).not.toMatch(/run --login on this machine/);
+    });
+
+    it("stops when the login fails", async () => {
+      const t = await connected({ login: vi.fn(async () => Promise.reject(new Error("abandoned"))) });
+      refuse(t);
+      await t.done;
+      expect(printed()).toMatch(/The login did not work: abandoned/);
+      expect(t.exit).toHaveBeenCalledWith(1);
+    });
+
+    it("stops when a non-Error failure ends the login", async () => {
+      const t = await connected({ login: vi.fn(async () => Promise.reject("no")) });
+      refuse(t);
+      await t.done;
+      expect(printed()).toMatch(/The login did not work: no/);
+    });
+
+    it("is not logged in again straight after a login", async () => {
+      const login = vi.fn(async () => {});
+      const t = await connected({ login });
+      refuse(t);
+      await flush();
+      t.ws().open();
+      t.ws().welcome();
+      refuse(t);
+      await t.done;
+      expect(login).toHaveBeenCalledTimes(1);
+      expect(printed()).toMatch(/run --login on this machine/);
+      expect(t.exit).toHaveBeenCalledWith(1);
+    });
+
+    it("does not start an agent when the bridge was stopped during the login", async () => {
+      let finish!: () => void;
+      const t = await connected({ login: vi.fn(() => new Promise<void>((r) => (finish = r))) });
+      refuse(t);
+      process.emit("SIGTERM");
+      finish();
+      await flush();
+      expect(t.children).toHaveLength(1);
+    });
+
+    it("stops with AgentRQ's instructions when there is no terminal", async () => {
+      const t = await connected();
+      refuse(t);
+      await t.done;
+      expect(printed()).toMatch(/run --login on this machine/);
+      expect(t.exit).toHaveBeenCalledWith(1);
+    });
   });
 
   it("ignores what a replaced agent still writes", async () => {
@@ -353,27 +638,6 @@ describe("runNative", () => {
     t.ws().open();
     t.ws().welcome();
     expect(t.children).toHaveLength(2);
-  });
-
-  it("close 4001 reconnects fresh, and the fresh welcome restarts the agent", async () => {
-    const t = await connected();
-    t.ws().drop(4001, "grace expired");
-    vi.advanceTimersByTime(1000);
-    expect(t.ws().init.headers["X-AgentRQ-Resume"]).toBeUndefined();
-    t.ws().open();
-    t.ws().welcome();
-    expect(t.children).toHaveLength(2);
-  });
-
-  it("a resume it cannot replay starts over", async () => {
-    const t = await connected();
-    t.ws().drop(1006);
-    vi.advanceTimersByTime(1000);
-    t.ws().open();
-    t.ws().welcome({ resumed: true, received: 99 });
-    expect(t.children).toHaveLength(2);
-    expect(FakeSocket.instances).toHaveLength(3);
-    expect(t.ws().init.headers["X-AgentRQ-Resume"]).toBeUndefined();
   });
 
   it("does not ask to resume once its replay ring has overflowed", async () => {
@@ -555,11 +819,11 @@ describe("runNative", () => {
     write.mockRestore();
   });
 
-  it("native mode on Node 20 refuses at start and classic is untouched", async () => {
+  it("refuses to start on Node 20", async () => {
     vi.stubGlobal("WebSocket", undefined);
     const t = await start({ WebSocketImpl: undefined });
     await t.done;
-    expect(printed()).toContain("native mode needs Node 22 or newer");
+    expect(printed()).toContain("acp-gateway needs Node 22 or newer");
     expect(t.exit).toHaveBeenCalledWith(1);
     expect(t.spawnImpl).not.toHaveBeenCalled();
     expect(t.fetchImpl).not.toHaveBeenCalled();
@@ -585,7 +849,7 @@ describe("runNative", () => {
     const t = await start({ fetchImpl: status(404) as any });
     await t.done;
     expect(printed()).toContain(
-      "this AgentRQ server does not offer native ACP v1 (HTTP 404); update the server, or start without --acp-version",
+      "this AgentRQ server does not offer ACP v1 (HTTP 404); update the server",
     );
     expect(t.exit).toHaveBeenCalledWith(1);
     expect(FakeSocket.instances).toHaveLength(0);
@@ -637,7 +901,7 @@ describe("runNative", () => {
     await vi.advanceTimersByTimeAsync(16_000);
     await t.done;
     expect(fetchImpl).toHaveBeenCalledTimes(2);
-    expect(printed()).toContain("does not offer native ACP v1 (HTTP 404)");
+    expect(printed()).toContain("does not offer ACP v1 (HTTP 404)");
     expect(t.exit).toHaveBeenCalledWith(1);
     expect(FakeSocket.instances).toHaveLength(5);
   });

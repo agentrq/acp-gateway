@@ -1,25 +1,36 @@
 /**
  * native.ts
  *
- * Native mode: AgentRQ speaks ACP itself, and this process only moves bytes.
+ * The ACP v1 bridge: AgentRQ speaks ACP itself, and this process moves lines.
  * Each line the agent writes becomes one WebSocket text frame and each frame
- * becomes one line on the agent's stdin. It never parses ACP; it reads only
- * the bridge's own control frames, recognised by their prefix.
+ * becomes one line on the agent's stdin. Besides the bridge's own control
+ * frames, recognised by their prefix, it reads only the JSON-RPC envelope: to
+ * give sessions this process's working directory, and to keep the agent — and
+ * each task's session in it — across a new AgentRQ connection.
  */
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import type * as acp from "@agentclientprotocol/sdk";
+import type { McpServerConfig } from "./config.js";
+import { mapMcpServers } from "./mcpServers.js";
 import {
   BRIDGE_SUBPROTOCOL,
   LineSplitter,
   MAX_LINE_BYTES,
   ReplayRing,
   STDERR_TAIL_LINES,
+  abandonedAnswer,
   backoffMs,
   decodeControl,
   encodeControl,
   isControl,
   preflightUrl,
   respawnDelayMs,
+  prepareSessionRequest,
+  rpcShape,
   stderrTail,
+  taskIdOf,
+  withSessionId,
   upgradeHeaders,
   type Control,
 } from "./nativeFrames.js";
@@ -37,6 +48,8 @@ const FATAL_ERRORS: ReadonlySet<string> = new Set([
   "workspace_archived",
 ]);
 const ACK_EVERY = 64;
+/** An agent that asks for a login again within this long of one is not logged in again. */
+const LOGIN_RETRY_MS = 5 * 60_000;
 const ACK_INTERVAL_MS = 1000;
 const RESPAWN_LIMIT = 5;
 const RESPAWN_WINDOW_MS = 5 * 60_000;
@@ -66,7 +79,6 @@ export type BridgeSocketCtor = new (
 ) => BridgeSocket;
 
 export interface NativeOptions {
-  version: 1 | 2;
   acpCmdArgs: string[];
   env?: Record<string, string>;
   endpoint: string;
@@ -83,6 +95,14 @@ export interface NativeOptions {
   fetchImpl?: typeof fetch;
   now?: () => number;
   random?: () => number;
+  /**
+   * Runs the agent's own login at this terminal, for an agent AgentRQ cannot
+   * log in itself. Left out when there is no terminal: the bridge then stops
+   * with AgentRQ's instructions instead.
+   */
+  login?: () => Promise<void>;
+  /** The servers from .mcp.json, handed to every session the agent opens. */
+  mcpServers?: McpServerConfig[];
   /** `process.versions.node`, for the Node 22 check. */
   nodeVersion?: string;
   exit?: (code: number) => void;
@@ -90,6 +110,10 @@ export interface NativeOptions {
 
 interface Agent {
   child: ChildProcess;
+  /** Sent as X-AgentRQ-Agent-Instance, so AgentRQ can tell this process from its replacement. */
+  instance: string;
+  /** The agent's answer to its one `initialize`, which a later AgentRQ connection is given instead. */
+  initResult?: unknown;
   /** Set once this process is replaced or stopped: what it says after that is ignored. */
   replaced: boolean;
   ended: boolean;
@@ -113,7 +137,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
   const WS = o.WebSocketImpl ?? ((globalThis as { WebSocket?: unknown }).WebSocket as BridgeSocketCtor | undefined);
   if (!nativeSupported(WS, o.nodeVersion)) {
     console.error(
-      "[acp-gateway] native mode needs Node 22 or newer (classic mode, without --acp-version, still runs here)",
+      "[acp-gateway] acp-gateway needs Node 22 or newer",
     );
     exit(1);
     return;
@@ -141,10 +165,38 @@ export async function runNative(o: NativeOptions): Promise<void> {
   let closesWithoutWelcome = 0;
   /** The message of a fatal error frame, waiting for the close that follows it. */
   let fatal: string | undefined;
+  /** An `auth_required` this terminal can answer, waiting for the close that follows it. */
+  let loginNeeded = false;
+  let lastLogin: number | undefined;
   let stopped = false;
   /** Bumped when the agent exits: a reconnect scheduled before that must not run. */
   let generation = 0;
   let agent: Agent;
+  /**
+   * How many times the running agent has been kept across a new AgentRQ
+   * connection. From the first time on, AgentRQ's request ids are sent on as
+   * `"<epoch>:<id>"`, so an answer the agent gives to a request of an earlier
+   * connection can never be taken for the answer to a new one.
+   */
+  let epoch = 0;
+  /** The id the agent sees → the id AgentRQ sent, for requests of this epoch. */
+  const requestIds = new Map<string, string | number>();
+  /** AgentRQ's `initialize`, sent on to the agent and not yet answered. */
+  let initRequestId: string | number | undefined;
+  /** The agent's requests AgentRQ has not answered, by id: method. */
+  const agentRequests = new Map<string | number, string>();
+  /** Sessions AgentRQ has used on this connection, cancelled when the agent is kept past it. */
+  const sessionsInUse = new Set<string>();
+  /**
+   * Each task's session in the running agent. A connection that comes after the
+   * agent was kept opens a new session for a task; its prompts are sent to this
+   * one instead, so the task's conversation carries on.
+   */
+  const taskSessions = new Map<string, string>();
+  /** For this connection: AgentRQ's session id → the agent's, where they differ. */
+  const toAgentSession = new Map<string, string>();
+  /** The same, the other way round. */
+  const toServerSession = new Map<string, string>();
   const exits: number[] = [];
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let drainPoll: ReturnType<typeof setInterval> | undefined;
@@ -216,8 +268,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
     const body = (await res.text().catch(() => "")).trim();
     if (res.status === 404) {
       console.error(
-        `[acp-gateway] this AgentRQ server does not offer native ACP v${o.version} (HTTP 404); ` +
-          "update the server, or start without --acp-version",
+        "[acp-gateway] this AgentRQ server does not offer ACP v1 (HTTP 404); update the server",
       );
     } else if (res.status === 401 || res.status === 403) {
       console.error(
@@ -243,11 +294,19 @@ export async function runNative(o: NativeOptions): Promise<void> {
       shell: needsShell(target),
       cwd: o.cwd,
     });
-    const a: Agent = { child, replaced: false, ended: false, stderr: [] };
+    const a: Agent = { child, instance: randomUUID(), replaced: false, ended: false, stderr: [] };
     ring.reset();
     received = 0;
     unacked = 0;
     agentFresh = true;
+    epoch = 0;
+    requestIds.clear();
+    initRequestId = undefined;
+    agentRequests.clear();
+    sessionsInUse.clear();
+    taskSessions.clear();
+    toAgentSession.clear();
+    toServerSession.clear();
 
     const lines = new LineSplitter(MAX_LINE_BYTES, () => dropLine("a line over 16 MiB", true));
     child.stdout?.setEncoding("utf8");
@@ -322,11 +381,65 @@ export async function runNative(o: NativeOptions): Promise<void> {
     }
   };
 
+  /** .mcp.json's servers, as far as the agent's own answer to `initialize` lets it take them. */
+  const sessionMcpServers = () =>
+    mapMcpServers(
+      o.mcpServers ?? [],
+      (agent.initResult as { agentCapabilities?: acp.AgentCapabilities } | undefined)?.agentCapabilities,
+    );
+
+  const toServer = (line: string) => {
+    ring.push(line);
+    if (ready) send(line);
+  };
+
   const onAgentLine = (line: string) => {
     if (Buffer.byteLength(line) > MAX_LINE_BYTES) return dropLine("a line over 16 MiB", true);
     if (isControl(line)) return dropLine("a line that looks like a bridge control frame");
-    ring.push(line);
-    if (ready) send(line);
+    const shape = rpcShape(line);
+    const serverSide = toServerSession.get(shape?.params?.sessionId as string);
+    if (serverSide !== undefined) line = withSessionId(line, serverSide);
+    if (shape?.method !== undefined && shape.id !== undefined) {
+      agentRequests.set(shape.id, shape.method);
+    } else if (shape?.isResponse) {
+      if (shape.id === initRequestId) {
+        agent.initResult = shape.result;
+        initRequestId = undefined;
+      }
+      if (epoch > 0) {
+        const original = requestIds.get(String(shape.id));
+        // An answer to a request of a connection that is gone: nobody asked.
+        if (original === undefined) return debug(`[native] Dropped the agent's answer to an earlier connection's request ${shape.id}`);
+        requestIds.delete(String(shape.id));
+        line = JSON.stringify({ ...JSON.parse(line), id: original });
+      }
+    }
+    toServer(line);
+  };
+
+  /**
+   * Keeps the running agent across a new AgentRQ connection, rather than
+   * restarting it and losing every session it holds. What the old connection
+   * left open is closed here: the agent's unanswered requests are answered as
+   * abandoned, and the turns AgentRQ was running are cancelled.
+   */
+  const keepAgent = () => {
+    console.error("[acp-gateway] AgentRQ started a new connection; keeping the agent and its sessions.");
+    ring.reset();
+    received = 0;
+    unacked = 0;
+    epoch++;
+    requestIds.clear();
+    initRequestId = undefined;
+    const stdin = agent.child.stdin;
+    for (const [id, method] of agentRequests) stdin?.write(abandonedAnswer(id, method) + "\n");
+    agentRequests.clear();
+    for (const sessionId of sessionsInUse) {
+      stdin?.write(JSON.stringify({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } }) + "\n");
+    }
+    sessionsInUse.clear();
+    toAgentSession.clear();
+    toServerSession.clear();
   };
 
   const sendAck = () => {
@@ -343,8 +456,48 @@ export async function runNative(o: NativeOptions): Promise<void> {
     if (isControl(data)) return onControl(decodeControl(data));
     if (data.includes("\n")) return console.error("[acp-gateway] Dropped a frame from AgentRQ that contains a newline.");
     received++;
-    agent.child.stdin?.write(data + "\n");
     if (++unacked >= ACK_EVERY) sendAck();
+    let frame = prepareSessionRequest(data, o.cwd, sessionMcpServers());
+    const shape = rpcShape(frame);
+    if (shape?.isResponse) agentRequests.delete(shape.id!);
+    let sessionId = shape?.params?.sessionId;
+    if (typeof sessionId === "string") {
+      if (shape!.method === "session/prompt") {
+        const taskId = taskIdOf(shape!.params!.prompt);
+        const kept = taskId === undefined ? undefined : taskSessions.get(taskId);
+        if (epoch > 0 && kept !== undefined && kept !== sessionId && !toAgentSession.has(sessionId)) {
+          debug(`[native] Task ${taskId} carries on in its session ${kept} (AgentRQ calls it ${sessionId})`);
+          toAgentSession.set(sessionId, kept);
+          toServerSession.set(kept, sessionId);
+        }
+        if (taskId !== undefined) taskSessions.set(taskId, toAgentSession.get(sessionId) ?? sessionId);
+      }
+      const agentSide = toAgentSession.get(sessionId);
+      if (agentSide !== undefined) {
+        sessionId = agentSide;
+        frame = withSessionId(frame, agentSide);
+      }
+      if (shape!.method === "session/close") {
+        for (const [task, s] of taskSessions) if (s === sessionId) taskSessions.delete(task);
+      }
+      sessionsInUse.add(sessionId as string);
+    }
+    if (shape?.method !== undefined && shape.id !== undefined) {
+      if (shape.method === "initialize") {
+        // The agent was initialized once and is still running: a new
+        // connection is given that answer rather than a second handshake.
+        if (agent.initResult !== undefined) {
+          return toServer(JSON.stringify({ jsonrpc: "2.0", id: shape.id, result: agent.initResult }));
+        }
+        initRequestId = epoch > 0 ? `${epoch}:${shape.id}` : shape.id;
+      }
+      if (epoch > 0) {
+        const id = `${epoch}:${shape.id}`;
+        requestIds.set(id, shape.id);
+        frame = JSON.stringify({ ...JSON.parse(frame), id });
+      }
+    }
+    agent.child.stdin?.write(frame + "\n");
   };
 
   const onControl = (c: Control | undefined) => {
@@ -356,16 +509,16 @@ export async function runNative(o: NativeOptions): Promise<void> {
         if (c.resumed) {
           replay = ring.after(c.received ?? 0);
           if (replay === undefined) {
-            // The server kept the connection, but what it missed is gone here.
-            restartAgent("what AgentRQ missed while disconnected can no longer be replayed");
+            // The server kept the connection, but what it missed is gone here:
+            // start a new one, which keeps the agent.
+            console.error("[acp-gateway] What AgentRQ missed while disconnected can no longer be replayed; reconnecting.");
             connectionId = undefined;
             return reconnectNow();
           }
         } else if (agentFresh) {
           replay = ring.after(0) ?? [];
         } else {
-          // The server started over, so the agent's session state is gone with it: so do we.
-          restartAgent("AgentRQ started a new connection");
+          keepAgent();
           replay = [];
         }
         connectionId = c.connectionId;
@@ -382,9 +535,15 @@ export async function runNative(o: NativeOptions): Promise<void> {
         connectionId = undefined;
         return reconnectNow();
       case "error": {
+        const code = String(c.code ?? c.error);
         const message = c.message ?? String(c.code ?? c.error ?? "unknown error");
+        if (code === "auth_required" && canLogInHere()) {
+          debug(`[native] ${message}`);
+          loginNeeded = true;
+          return;
+        }
         console.error(`[acp-gateway] ${message}`);
-        if (FATAL_ERRORS.has(String(c.code ?? c.error))) fatal = message;
+        if (FATAL_ERRORS.has(code)) fatal = message;
         return;
       }
       default:
@@ -408,6 +567,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
       permissionTimeoutMinutes: o.permissionTimeoutMinutes,
       authMethodId: o.authMethodId,
       resume,
+      agentInstance: agent.instance,
     });
     ready = false;
     let welcomed = false;
@@ -461,7 +621,40 @@ export async function runNative(o: NativeOptions): Promise<void> {
     }, delay);
   };
 
+  /**
+   * Whether an agent AgentRQ cannot log in can be logged in here instead: there
+   * is a terminal to do it at, and it was not tried a moment ago — an agent
+   * still refusing straight after a login will not be helped by another.
+   */
+  const canLogInHere = () => o.login !== undefined && (lastLogin === undefined || now() - lastLogin > LOGIN_RETRY_MS);
+
+  /** Logs the agent in at this terminal, then starts it again on a new connection. */
+  const logInAndRestart = async () => {
+    console.error("[acp-gateway] The agent needs a login AgentRQ cannot run; logging it in at this terminal.");
+    lastLogin = now();
+    generation++;
+    // Still running: an agent that exits takes the socket down with it, so its
+    // close never reaches here.
+    agent.replaced = true;
+    terminateAgentProcess(agent.child);
+    try {
+      await o.login!();
+    } catch (err) {
+      console.error(`[acp-gateway] The login did not work: ${err instanceof Error ? err.message : err}`);
+      return stop(1);
+    }
+    if (stopped) return;
+    agent = startAgent();
+    connectionId = undefined;
+    connect(true);
+  };
+
   const onClose = (code: number, reason: string) => {
+    if (loginNeeded) {
+      loginNeeded = false;
+      void logInAndRestart();
+      return;
+    }
     if (fatal || FATAL_CLOSES.has(code)) {
       if (!fatal) console.error(`[acp-gateway] AgentRQ closed the connection (${code})${reason ? `: ${reason}` : ""}`);
       return stop(1);
@@ -473,7 +666,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
     }
     debug(`[native] Connection closed (${code})${reason ? `: ${reason}` : ""}`);
     // 4001 is a grace that expired or a connection the server does not know:
-    // the fresh welcome that follows restarts the agent.
+    // the fresh welcome that follows keeps the agent (see keepAgent).
     if (code === 4001) connectionId = undefined;
     scheduleReconnect(code === 4001);
   };

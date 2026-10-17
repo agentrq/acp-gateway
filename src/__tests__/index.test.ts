@@ -7,28 +7,7 @@ import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import * as acp from "@agentclientprotocol/sdk";
 import {
-  createAcpSessionSwitcher,
-  fetchNextTask,
-  startPendingTask,
-  drainPendingTasks,
-  createSelfFillingTaskQueue,
-  MAX_SKIPPED_FETCHES,
-  IDLE_TASK_POLL_INTERVAL_MS,
-  freeSlots,
-  resetPendingTaskDrain,
-  mapMcpServers,
-  TaskQueue,
-  createTaskQueue,
-  resetConcurrencyReports,
-  getOrCreateSession,
-  openIdleSession,
-  resetIdleSession,
-  activeSessions,
   AuthenticationFailed,
-  IDLE_SESSION_KEY,
-  loginCommandFor,
-  authConfig,
-  modelConfig,
   createSessionWithAuth,
   isInteractiveTerminal,
   openAgentConnection,
@@ -50,36 +29,17 @@ import {
   printHelp,
   resolveAgentCommand,
   runListAgents,
-  pickHumanApprovalMode,
-  enforceHumanApprovalMode,
-  handleAgentModeChange,
   runAgentCommand,
   loadWorkspace,
-  createDetachedBridge,
   makeIsolatedDir,
   WORKSPACE_OPTIONAL_COMMANDS,
-  findActiveSession,
-  handleTaskCancellation,
-  handleSetModel,
-  handleSetConcurrency,
-  runTurnForTask,
-  resetTaskTurns,
-  registerConcurrencyListeners,
-  reportConcurrency,
-  applyModelSelection,
-  cancelledTaskSeq,
-  markTaskCancelled,
-  isTaskCancelled,
-  nextTaskSeq,
   CLOSE_SESSION_TIMEOUT_MS,
   supportsCloseSession,
   closeSession,
-  closeAllSessions,
-  setupSignalHandlers,
   nativeOptionsFor,
   startNativeMode,
+  runGateway,
 } from "../index.js";
-import { AgentRQACPClient, lastModelsForSession, sendModelsNotification } from "../acpClient.js";
 import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
 
@@ -142,2416 +102,12 @@ vi.mock("@agentclientprotocol/sdk", async () => {
 
 describe("index", () => {
   afterEach(() => setVerbose(false));
-  describe("mapMcpServers", () => {
-    it("should correctly map HTTP servers with headers and env", () => {
-      const configs: McpServerConfig[] = [{
-        type: "http",
-        name: "test-http",
-        url: "http://localhost:8000",
-        env: { "Authorization": "Bearer env-token", "Other": "Val" },
-        headers: { "Authorization": "Bearer header-token", "Custom": "Header" }
-      }];
-      const result = mapMcpServers(configs);
-      expect(result).toEqual([{
-        type: "http",
-        name: "test-http",
-        url: "http://localhost:8000",
-        headers: [
-          { name: "Authorization", value: "Bearer header-token" },
-          { name: "Custom", value: "Header" }
-        ]
-      }]);
-    });
-
-    it("should default headers to empty object for HTTP servers", () => {
-      const configs: McpServerConfig[] = [{
-        type: "http",
-        name: "test-http",
-        url: "http://localhost:8000"
-      }];
-      const result = mapMcpServers(configs);
-      expect(result).toEqual([{
-        type: "http",
-        name: "test-http",
-        url: "http://localhost:8000",
-        headers: []
-      }]);
-    });
-
-    it("should map an sse server as its own transport", () => {
-      const configs: McpServerConfig[] = [{
-        type: "sse",
-        name: "events",
-        url: "http://localhost:8000/sse",
-      }];
-
-      expect(mapMcpServers(configs, { mcpCapabilities: { sse: true } } as any)).toEqual([{
-        type: "sse",
-        name: "events",
-        url: "http://localhost:8000/sse",
-        headers: [],
-      }]);
-    });
-
-    it("should leave out a transport the agent says it does not support", () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const configs: McpServerConfig[] = [
-        { type: "http", name: "remote", url: "http://localhost:8000" },
-        { type: "stdio", name: "local", command: "npx" },
-      ];
-
-      // An agent may refuse the whole session/new rather than skip one entry.
-      const result = mapMcpServers(configs, {
-        mcpCapabilities: { http: false, sse: false },
-      } as any);
-
-      expect(result.map((s: any) => s.name)).toEqual(["local"]);
-      expect(errorSpy.mock.calls.flat().join("\n")).toContain(
-        'Not passing MCP server "remote"',
-      );
-      errorSpy.mockRestore();
-    });
-
-    it("should still hand over a transport the agent never mentions", () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const configs: McpServerConfig[] = [
-        { type: "http", name: "remote", url: "http://localhost:8000" },
-      ];
-
-      // A terse agent is likelier than one that genuinely cannot reach HTTP,
-      // and dropping this would take the workspace's own server away from it.
-      expect(mapMcpServers(configs, {} as any).map((s: any) => s.name)).toEqual(["remote"]);
-      expect(mapMcpServers(configs).map((s: any) => s.name)).toEqual(["remote"]);
-      errorSpy.mockRestore();
-    });
-
-    it("should correctly map stdio servers", () => {
-      const configs: McpServerConfig[] = [{
-        type: "stdio",
-        name: "test-stdio",
-        command: "npx",
-        args: ["-y", "some-pkg"],
-        env: {
-          API_KEY: "secret",
-          MODE: "test"
-        }
-      }];
-      const result = mapMcpServers(configs);
-      expect(result).toEqual([{
-        name: "test-stdio",
-        command: "npx",
-        args: ["-y", "some-pkg"],
-        env: [
-          { name: "API_KEY", value: "secret" },
-          { name: "MODE", value: "test" }
-        ]
-      }]);
-    });
-
-    it("should default args to empty array and env to empty object for stdio servers", () => {
-      const configs: McpServerConfig[] = [{
-        type: "stdio",
-        name: "minimal-stdio",
-        command: "echo"
-      }];
-      const result = mapMcpServers(configs);
-      expect(result).toEqual([{
-        name: "minimal-stdio",
-        command: "echo",
-        args: [],
-        env: []
-      }]);
-    });
-  });
-
-  describe("createAcpSessionSwitcher", () => {
-    let mockConnection: any;
-    let params: any;
-
-    beforeEach(() => {
-      mockConnection = {
-        newSession: vi.fn().mockResolvedValue({ sessionId: "new-session-id" }),
-      };
-      params = { cwd: "/test", mcpServers: [{ name: "s1", url: "http://s1", headers: [] }] };
-    });
-
-    it("should return initial session ID", () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      expect(switcher.getSessionId()).toBe("initial-id");
-    });
-
-    it("should return current session ID if taskId is undefined", async () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      const id = await switcher.ensureForTask(undefined);
-      expect(id).toBe("initial-id");
-      expect(mockConnection.newSession).not.toHaveBeenCalled();
-    });
-
-    it("should create a new session on first call with taskId", async () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      const id = await switcher.ensureForTask("task-1");
-      expect(id).toBe("new-session-id");
-      expect(mockConnection.newSession).toHaveBeenCalled();
-
-      // Second call with same taskId should still return same ID
-      const id2 = await switcher.ensureForTask("task-1");
-      expect(id2).toBe("new-session-id");
-      expect(mockConnection.newSession).toHaveBeenCalledTimes(1);
-    });
-
-    it("should create a new session when taskId changes", async () => {
-      params = { cwd: "/test", mcpServers: [{ name: "s1", url: "http://s1", headers: [] }] };
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-
-      // Set initial task
-      await switcher.ensureForTask("task-1");
-
-      // Change task
-      const id = await switcher.ensureForTask("task-2");
-
-      expect(id).toBe("new-session-id");
-      expect(mockConnection.newSession).toHaveBeenCalledTimes(2);
-      expect(switcher.getSessionId()).toBe("new-session-id");
-    });
-
-    it("should return existing session when a previously seen task returns", async () => {
-      mockConnection.newSession
-        .mockResolvedValueOnce({ sessionId: "session-for-task-1" })
-        .mockResolvedValueOnce({ sessionId: "session-for-task-2" });
-
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-
-      const id1 = await switcher.ensureForTask("task-1");
-      expect(id1).toBe("session-for-task-1");
-
-      const id2 = await switcher.ensureForTask("task-2");
-      expect(id2).toBe("session-for-task-2");
-
-      // task-1 returns — must reuse session-for-task-1, not create a third session
-      const id3 = await switcher.ensureForTask("task-1");
-      expect(id3).toBe("session-for-task-1");
-      expect(mockConnection.newSession).toHaveBeenCalledTimes(2);
-    });
-  });
-
-  describe("createAcpSessionSwitcher – getTaskIdForSession", () => {
-    let mockConnection: any;
-    let params: any;
-
-    beforeEach(() => {
-      mockConnection = {
-        newSession: vi.fn()
-          .mockResolvedValueOnce({ sessionId: "session-for-task-1" })
-          .mockResolvedValueOnce({ sessionId: "session-for-task-2" }),
-      };
-      params = { cwd: "/test", mcpServers: [] };
-    });
-
-    it("should return taskId for a known session", async () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      await switcher.ensureForTask("task-1");
-      expect(switcher.getTaskIdForSession("session-for-task-1")).toBe("task-1");
-    });
-
-    it("should return undefined for an unknown session", async () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      expect(switcher.getTaskIdForSession("unknown-session")).toBeUndefined();
-    });
-
-    it("should track multiple sessions independently", async () => {
-      const switcher = createAcpSessionSwitcher(mockConnection, params, "initial-id");
-      await switcher.ensureForTask("task-1");
-      await switcher.ensureForTask("task-2");
-      expect(switcher.getTaskIdForSession("session-for-task-1")).toBe("task-1");
-      expect(switcher.getTaskIdForSession("session-for-task-2")).toBe("task-2");
-    });
-  });
-
-  describe("running a task the workspace handed over", () => {
-    let mockMcpBridge: any;
-    let mockConnection: any;
-    let mockSessionSwitcher: any;
-    let mockAcpClient: any;
-
-    /** What the gateway's fetch-and-run path needs, with a session already open. */
-    const deps = (taskQueue?: TaskQueue) => ({
-      acpCmdArgsOrConnection: mockConnection,
-      configsOrSessionSwitcher: mockSessionSwitcher,
-      agentrqConfigOrAcpClient: mockAcpClient,
-      taskQueue,
-    });
-
-    beforeEach(() => {
-      vi.clearAllMocks();
-      resetPendingTaskDrain();
-      mockMcpBridge = {
-        callTool: vi.fn(),
-      };
-      mockConnection = {
-        prompt: vi.fn().mockResolvedValue({ stopReason: "complete" }),
-      };
-      mockSessionSwitcher = {
-        getSessionId: vi.fn().mockReturnValue("current-session"),
-        ensureForTask: vi.fn().mockResolvedValue("current-session"),
-      };
-      mockAcpClient = {
-        flushReply: vi.fn().mockResolvedValue(undefined),
-        reportStopReason: vi.fn().mockResolvedValue(undefined),
-      };
-
-      // Mock console.error to avoid cluttering test output
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      vi.spyOn(console, "log").mockImplementation(() => {});
-    });
-
-    afterEach(() => {
-      vi.restoreAllMocks();
-    });
-
-    it("prompts the agent in the session that belongs to the task", async () => {
-      const queue = new TaskQueue(1);
-      mockMcpBridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "Task ID: T1\ndo something" }],
-      });
-
-      await drainPendingTasks(mockMcpBridge, queue, deps(queue));
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockSessionSwitcher.ensureForTask).toHaveBeenCalledWith("T1");
-      expect(mockConnection.prompt).toHaveBeenCalledWith({
-        sessionId: "current-session",
-        prompt: [{ type: "text", text: "Task ID: T1\ndo something" }],
-      });
-      expect(mockAcpClient.flushReply).toHaveBeenCalledWith("current-session");
-    });
-
-    it("runs a queued task through the queue, and behind any turn it already has", async () => {
-      // The queue is how a concurrency limit is enforced at all, and the turn
-      // guard is what keeps a second delivery of this task off a session that
-      // is already mid-prompt.
-      resetTaskTurns();
-      mockMcpBridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "Task ID: T-Queued\nwork please" }],
-      });
-      const queue = new TaskQueue(2);
-
-      let releaseEarlier: () => void;
-      const earlier = new Promise<void>((resolve) => { releaseEarlier = resolve; });
-      const earlierTurn = runTurnForTask("T-Queued", () => earlier);
-
-      const draining = drainPendingTasks(mockMcpBridge, queue, deps(queue));
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(mockConnection.prompt).not.toHaveBeenCalled();
-
-      releaseEarlier!();
-      await Promise.all([earlierTurn, draining]);
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockConnection.prompt).toHaveBeenCalledTimes(1);
-      expect(queue.getActiveCount()).toBe(0);
-    });
-
-    it("waits for the turn ahead of it without holding a concurrency slot", async () => {
-      // A second message on one chat arrives as a second delivery of one task
-      // and has to wait for the first. Waiting *inside* a queue slot would hold
-      // a share of the limit while doing nothing at all — so a chat with a few
-      // messages in flight could hold every slot the gateway has and stop it
-      // running anything else, which is precisely what raising the limit is
-      // supposed to prevent.
-      resetTaskTurns();
-      mockMcpBridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "Task ID: T-Chatty\nand another thing" }],
-      });
-      const queue = new TaskQueue(1);
-
-      let releaseEarlier: () => void;
-      const earlier = new Promise<void>((resolve) => { releaseEarlier = resolve; });
-      const earlierTurn = runTurnForTask("T-Chatty", () => earlier);
-
-      const draining = drainPendingTasks(mockMcpBridge, queue, deps(queue));
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      // Behind the turn, but not occupying the gateway's only slot.
-      expect(mockConnection.prompt).not.toHaveBeenCalled();
-      expect(queue.getActiveCount()).toBe(0);
-
-      // So an unrelated task still runs while the duplicate waits.
-      let unrelatedRan = false;
-      const unrelated = queue.run(async () => { unrelatedRan = true; });
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(unrelatedRan).toBe(true);
-
-      releaseEarlier!();
-      await Promise.all([earlierTurn, draining, unrelated]);
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockConnection.prompt).toHaveBeenCalledTimes(1);
-      expect(queue.getActiveCount()).toBe(0);
-    });
-
-    it("forwards a slash command to the agent unmodified", async () => {
-      // ACP runs a command as ordinary prompt text and the agent matches the
-      // prefix at the *start* of it, so anything prepended here — a wrapper, a
-      // task header, a courtesy sentence — stops it being a command at all.
-      // agentrq relies on this passthrough to deliver what the human typed.
-      const queue = new TaskQueue(1);
-      mockMcpBridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "/compact keep the API discussion" }],
-      });
-
-      await drainPendingTasks(mockMcpBridge, queue, deps(queue));
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockConnection.prompt).toHaveBeenCalledWith({
-        sessionId: "current-session",
-        prompt: [{ type: "text", text: "/compact keep the API discussion" }],
-      });
-    });
-  });
-
-  describe("fetchNextTask", () => {
-    let bridge: any;
-
-    beforeEach(() => {
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      vi.spyOn(console, "log").mockImplementation(() => {});
-      bridge = { callTool: vi.fn() };
-    });
-
-    afterEach(() => {
-      vi.restoreAllMocks();
-    });
-
-    it("hands back the task the workspace dequeued", async () => {
-      bridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "Task ID: T-Fetch\nplease do it" }],
-      });
-
-      const outcome = await fetchNextTask(bridge);
-
-      expect(bridge.callTool).toHaveBeenCalledWith("getTask");
-      expect(outcome.status).toBe("task");
-      const task = (outcome as { status: "task"; task: any }).task;
-      expect(task.text).toBe("Task ID: T-Fetch\nplease do it");
-      expect(task.taskId).toBe("T-Fetch");
-      // Stamped at the fetch, so a cancel landing during session setup still bites.
-      expect(task.queuedSeq).toBeGreaterThan(0);
-    });
-
-    it("tells an empty workspace apart from one it could not ask", async () => {
-      // A caller filling slots treats these differently: an empty workspace is
-      // the end of the drain, while a workspace that could not be reached is
-      // the bridge's problem to reconnect rather than this loop's to retry.
-      bridge.callTool.mockResolvedValueOnce({
-        isError: false,
-        content: [{ type: "text", text: "no pending tasks exist" }],
-      });
-      expect(await fetchNextTask(bridge)).toEqual({ status: "empty" });
-
-      bridge.callTool.mockResolvedValueOnce({ isError: false, content: [] });
-      expect(await fetchNextTask(bridge)).toEqual({ status: "empty" });
-
-      bridge.callTool.mockResolvedValueOnce({
-        isError: false,
-        content: [{ type: "text", text: "" }],
-      });
-      expect(await fetchNextTask(bridge)).toEqual({ status: "empty" });
-
-      bridge.callTool.mockResolvedValueOnce({ isError: true, content: "nope" });
-      expect(await fetchNextTask(bridge)).toEqual({ status: "failed" });
-
-      bridge.callTool.mockRejectedValueOnce(new Error("network error"));
-      expect(await fetchNextTask(bridge)).toEqual({ status: "failed" });
-      expect(console.error).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to check for next task"),
-        expect.any(Error),
-      );
-    });
-
-    it("says a repeat was skipped, not that the workspace is empty", async () => {
-      // The difference matters: a repeat has been dequeued and dropped, so the
-      // slot it was meant to fill is still free and something else may fill it.
-      bridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "Task ID: T-Twice\nsame words" }],
-      });
-
-      expect((await fetchNextTask(bridge)).status).toBe("task");
-      expect(await fetchNextTask(bridge)).toEqual({ status: "skipped" });
-    });
-
-    it("takes an unnamed task, since not every delivery carries an id", async () => {
-      bridge.callTool.mockResolvedValue({
-        isError: false,
-        content: [{ type: "text", text: "/compact keep the API discussion" }],
-      });
-
-      const outcome = await fetchNextTask(bridge);
-      expect(outcome.status).toBe("task");
-      const task = (outcome as { status: "task"; task: any }).task;
-      expect(task.taskId).toBeUndefined();
-      expect(task.text).toBe("/compact keep the API discussion");
-    });
-  });
-
-  describe("startPendingTask", () => {
-    afterEach(() => {
-      activeSessions.clear();
-      resetIdleSession();
-      resetTaskTurns();
-      vi.restoreAllMocks();
-    });
-
-    it("opens a session from the agent command when it was given one", async () => {
-      // The gateway's own path passes a command rather than an open
-      // connection, and that is the shape `main` uses — so it is the shape
-      // that has to work when the workspace hands over a task.
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      const prompt = vi.fn().mockResolvedValue({ stopReason: "end_turn" });
-      const acpClient = {
-        flushReply: vi.fn().mockResolvedValue(undefined),
-        reportStopReason: vi.fn().mockResolvedValue(undefined),
-      };
-      activeSessions.set("T-Cmd", {
-        process: {},
-        connection: { prompt } as any,
-        acpClient: acpClient as any,
-        sessionId: "S-Cmd",
-        initResult: {} as any,
-        adopt: vi.fn(),
-      } as any);
-
-      await startPendingTask(
-        { text: "Task ID: T-Cmd\nwork", taskId: "T-Cmd", queuedSeq: 1 },
-        { callTool: vi.fn() } as any,
-        {
-          acpCmdArgsOrConnection: ["fake-agent"],
-          configsOrSessionSwitcher: [],
-          agentrqConfigOrAcpClient: { name: "agentrq", type: "http" } as any,
-        },
-      );
-
-      expect(prompt).toHaveBeenCalledWith({
-        sessionId: "S-Cmd",
-        prompt: [{ type: "text", text: "Task ID: T-Cmd\nwork" }],
-      });
-      expect(acpClient.reportStopReason).toHaveBeenCalledWith("S-Cmd", "end_turn");
-    });
-
-    it("uses the session it was handed when there is no switcher to ask", async () => {
-      // --list-models and friends open a session that belongs to no task and
-      // hand it straight over; there is nothing to switch between.
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      const prompt = vi.fn().mockResolvedValue({ stopReason: "end_turn" });
-      const acpClient = {
-        flushReply: vi.fn().mockResolvedValue(undefined),
-        reportStopReason: vi.fn().mockResolvedValue(undefined),
-      };
-
-      await startPendingTask(
-        { text: "just do it", queuedSeq: 1 },
-        { callTool: vi.fn() } as any,
-        {
-          acpCmdArgsOrConnection: { prompt } as any,
-          configsOrSessionSwitcher: undefined,
-          agentrqConfigOrAcpClient: acpClient as any,
-        },
-      );
-
-      expect(prompt).toHaveBeenCalledWith({
-        sessionId: undefined,
-        prompt: [{ type: "text", text: "just do it" }],
-      });
-    });
-
-    it("cancels the session when the cancel lands while it is being opened", async () => {
-      // Opening a session takes seconds, and a cancel that arrives inside that
-      // window has no turn to stop yet — so the task must not be handed to the
-      // agent once the session finally exists.
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      cancelledTaskSeq.clear();
-      const prompt = vi.fn().mockResolvedValue({ stopReason: "end_turn" });
-      const acpClient = {
-        flushReply: vi.fn().mockResolvedValue(undefined),
-        reportStopReason: vi.fn().mockResolvedValue(undefined),
-        cancelTurn: vi.fn().mockResolvedValue(undefined),
-      };
-      const switcher = {
-        getSessionId: vi.fn().mockReturnValue("S-Late"),
-        ensureForTask: vi.fn(async (id: string) => {
-          markTaskCancelled(id);
-          return `S-${id}`;
-        }),
-      };
-
-      await startPendingTask(
-        { text: "Task ID: T-Late\nnever mind", taskId: "T-Late", queuedSeq: 1 },
-        { callTool: vi.fn() } as any,
-        {
-          acpCmdArgsOrConnection: { prompt } as any,
-          configsOrSessionSwitcher: switcher,
-          agentrqConfigOrAcpClient: acpClient as any,
-        },
-      );
-
-      expect(acpClient.cancelTurn).toHaveBeenCalledWith("S-T-Late");
-      expect(prompt).not.toHaveBeenCalled();
-      cancelledTaskSeq.clear();
-    });
-  });
-
-  describe("createSelfFillingTaskQueue", () => {
-    it("fetches work whenever the queue has room, at startup and after", async () => {
-      // The whole of "a gateway allowed three tasks runs three tasks": the
-      // queue says it has room, and something goes and fills it.
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      vi.spyOn(console, "log").mockImplementation(() => {});
-      resetPendingTaskDrain();
-      resetTaskTurns();
-      resetConcurrencyReports();
-
-      const bridge: any = {
-        callTool: vi.fn(),
-        sendNotification: vi.fn().mockResolvedValue(undefined),
-      };
-      const connection = {
-        prompt: vi.fn().mockResolvedValue({ stopReason: "end_turn" }),
-      };
-      const acpClient = {
-        flushReply: vi.fn().mockResolvedValue(undefined),
-        reportStopReason: vi.fn().mockResolvedValue(undefined),
-      };
-      const switcher = {
-        getSessionId: vi.fn().mockReturnValue("S"),
-        ensureForTask: vi.fn(async (id: string) => `S-${id}`),
-      };
-      bridge.callTool
-        .mockResolvedValueOnce({
-          isError: false,
-          content: [{ type: "text", text: "Task ID: W1\nfirst" }],
-        })
-        .mockResolvedValue({
-          isError: false,
-          content: [{ type: "text", text: "no pending tasks exist" }],
-        });
-
-      const queue = createSelfFillingTaskQueue(1, bridge, {
-        acpCmdArgsOrConnection: connection as any,
-        configsOrSessionSwitcher: switcher,
-        agentrqConfigOrAcpClient: acpClient as any,
-      });
-
-      await drainPendingTasks(bridge, queue, {
-        acpCmdArgsOrConnection: connection as any,
-        configsOrSessionSwitcher: switcher,
-        agentrqConfigOrAcpClient: acpClient as any,
-        taskQueue: queue,
-      });
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(connection.prompt).toHaveBeenCalledTimes(1);
-      // The task finished and freed its slot, so the queue went back for more
-      // on its own rather than sitting idle until something pushed it.
-      expect(bridge.callTool.mock.calls.length).toBeGreaterThanOrEqual(2);
-      // And it still reports itself to the workspace, as before.
-      expect(bridge.sendNotification).toHaveBeenCalled();
-      resetConcurrencyReports();
-      vi.restoreAllMocks();
-    });
-
-    it("keeps checking for work on an interval while idle, so a workspace with nothing at startup is not idle forever", async () => {
-      // Nothing ever runs in this test, so nothing frees a slot and the
-      // event-driven check (a task finishing) never fires. A fetch here can
-      // only be the idle timer.
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      vi.spyOn(console, "log").mockImplementation(() => {});
-      resetPendingTaskDrain();
-      resetTaskTurns();
-      resetConcurrencyReports();
-      vi.useFakeTimers();
-
-      const bridge: any = {
-        callTool: vi.fn().mockResolvedValue({
-          isError: false,
-          content: [{ type: "text", text: "no pending tasks exist" }],
-        }),
-        sendNotification: vi.fn().mockResolvedValue(undefined),
-      };
-
-      createSelfFillingTaskQueue(1, bridge, {
-        acpCmdArgsOrConnection: [] as any,
-        configsOrSessionSwitcher: [] as any,
-        agentrqConfigOrAcpClient: {} as any,
-      });
-
-      expect(bridge.callTool).not.toHaveBeenCalled();
-
-      await vi.advanceTimersByTimeAsync(IDLE_TASK_POLL_INTERVAL_MS);
-      expect(bridge.callTool).toHaveBeenCalledTimes(1);
-
-      await vi.advanceTimersByTimeAsync(IDLE_TASK_POLL_INTERVAL_MS);
-      expect(bridge.callTool).toHaveBeenCalledTimes(2);
-
-      vi.useRealTimers();
-      resetConcurrencyReports();
-      vi.restoreAllMocks();
-    });
-
-    it("skips the idle check while a task is still running", async () => {
-      // A running task will free its own slot and trigger the event-driven
-      // check when it finishes, so the idle timer firing in the meantime has
-      // nothing to do here.
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      vi.spyOn(console, "log").mockImplementation(() => {});
-      resetPendingTaskDrain();
-      resetTaskTurns();
-      resetConcurrencyReports();
-      vi.useFakeTimers();
-
-      const bridge: any = {
-        callTool: vi.fn().mockResolvedValue({
-          isError: false,
-          content: [{ type: "text", text: "no pending tasks exist" }],
-        }),
-        sendNotification: vi.fn().mockResolvedValue(undefined),
-      };
-
-      const queue = createSelfFillingTaskQueue(1, bridge, {
-        acpCmdArgsOrConnection: [] as any,
-        configsOrSessionSwitcher: [] as any,
-        agentrqConfigOrAcpClient: {} as any,
-      });
-
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      void queue.run(() => held);
-
-      await vi.advanceTimersByTimeAsync(IDLE_TASK_POLL_INTERVAL_MS);
-      expect(bridge.callTool).not.toHaveBeenCalled();
-
-      release();
-      await vi.advanceTimersByTimeAsync(0);
-
-      vi.useRealTimers();
-      resetConcurrencyReports();
-      vi.restoreAllMocks();
-    });
-  });
-
-  describe("freeSlots", () => {
-    it("counts the room left, with what is waiting already spoken for", () => {
-      const queue = new TaskQueue(3);
-      expect(freeSlots(queue)).toBe(3);
-    });
-
-    it("never goes negative when the limit was lowered under running work", () => {
-      // Lowering never interrupts, so the queue can legitimately hold more than
-      // the limit allows — and a negative number of slots would read as room.
-      const queue = new TaskQueue(3);
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const running = [queue.run(() => held), queue.run(() => held), queue.run(() => held)];
-      queue.setMaxConcurrency(1);
-      expect(freeSlots(queue)).toBe(0);
-      release();
-      return Promise.all(running);
-    });
-  });
-
-  describe("drainPendingTasks", () => {
-    let bridge: any;
-    let connection: any;
-    let switcher: any;
-    let acpClient: any;
-
-    /** A workspace answer holding one task. */
-    const task = (id: string) => ({
-      isError: false,
-      content: [{ type: "text", text: `Task ID: ${id}\nwork on ${id}` }],
-    });
-    /** The workspace answer meaning there is nothing left. */
-    const nothing = () => ({
-      isError: false,
-      content: [{ type: "text", text: "no pending tasks exist" }],
-    });
-
-    const deps = () => ({
-      acpCmdArgsOrConnection: connection,
-      configsOrSessionSwitcher: switcher,
-      agentrqConfigOrAcpClient: acpClient,
-    });
-
-    beforeEach(() => {
-      vi.spyOn(console, "error").mockImplementation(() => {});
-      vi.spyOn(console, "log").mockImplementation(() => {});
-      resetPendingTaskDrain();
-      resetTaskTurns();
-      bridge = { callTool: vi.fn() };
-      connection = { prompt: vi.fn().mockResolvedValue({ stopReason: "end_turn" }) };
-      switcher = {
-        getSessionId: vi.fn().mockReturnValue("S"),
-        ensureForTask: vi.fn(async (id: string) => `S-${id}`),
-      };
-      acpClient = {
-        flushReply: vi.fn().mockResolvedValue(undefined),
-        reportStopReason: vi.fn().mockResolvedValue(undefined),
-      };
-    });
-
-    afterEach(() => {
-      vi.restoreAllMocks();
-    });
-
-    it("fills every free slot instead of taking a single task", async () => {
-      // The bug this exists for: three tasks waiting, three slots, and the
-      // gateway running one of them because it only ever asked once.
-      const queue = new TaskQueue(3);
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      connection.prompt.mockReturnValue(held.then(() => ({ stopReason: "end_turn" })));
-      bridge.callTool
-        .mockResolvedValueOnce(task("D1"))
-        .mockResolvedValueOnce(task("D2"))
-        .mockResolvedValueOnce(task("D3"))
-        .mockResolvedValue(nothing());
-
-      await drainPendingTasks(bridge, queue, deps());
-
-      expect(queue.getActiveCount()).toBe(3);
-      // Three fetches and no fourth: it stops at the limit rather than
-      // emptying the workspace into a queue nobody asked it to hold.
-      expect(bridge.callTool).toHaveBeenCalledTimes(3);
-
-      release();
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(connection.prompt).toHaveBeenCalledTimes(3);
-    });
-
-    it("keeps working after a drain that found no room at all", async () => {
-      // The drain that does nothing never waits for anything, so it finishes
-      // before the promise it will be remembered by even exists. Remembering
-      // it anyway left a settled promise in the one-drain-at-a-time slot, and
-      // every later drain joined it and fetched nothing — the whole feature
-      // switching itself off after one harmless call.
-      const queue = new TaskQueue(1);
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const running = queue.run(() => held);
-
-      await drainPendingTasks(bridge, queue, deps());
-      expect(bridge.callTool).not.toHaveBeenCalled();
-
-      release();
-      await running;
-
-      bridge.callTool.mockResolvedValueOnce(task("A1")).mockResolvedValue(nothing());
-      await drainPendingTasks(bridge, queue, deps());
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(connection.prompt).toHaveBeenCalledTimes(1);
-    });
-
-    it("counts a task parked behind an earlier turn against the room it has", async () => {
-      // A second message on one chat waits for the first and takes no slot, so
-      // the queue still reads as having room. Fetching against that same room
-      // again and again would empty the workspace into this process, where
-      // nobody else can pick the work up.
-      resetTaskTurns();
-      const queue = new TaskQueue(2);
-      let releaseEarlier!: () => void;
-      const earlier = new Promise<void>((resolve) => { releaseEarlier = resolve; });
-      const earlierTurn = runTurnForTask("P1", () => earlier);
-
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      connection.prompt.mockReturnValue(held.then(() => ({ stopReason: "end_turn" })));
-      bridge.callTool
-        .mockResolvedValueOnce(task("P1"))
-        .mockResolvedValueOnce(task("P2"))
-        .mockResolvedValue(nothing());
-
-      await drainPendingTasks(bridge, queue, deps());
-
-      // Two slots, two tasks taken: the parked one counts, so there is no
-      // third fetch against the slot it is going to want.
-      expect(bridge.callTool).toHaveBeenCalledTimes(2);
-
-      releaseEarlier();
-      release();
-      await earlierTurn;
-    });
-
-    it("moves past a repeat instead of abandoning the slot it was meant to fill", async () => {
-      // A repeat has already been dequeued and dropped. Treating that as "the
-      // workspace is empty" left every slot idle behind it, and with nothing
-      // running there is no completion coming to start another drain.
-      const queue = new TaskQueue(2);
-      bridge.callTool
-        .mockResolvedValueOnce(task("S1"))
-        .mockResolvedValueOnce(task("S1"))
-        .mockResolvedValueOnce(task("S2"))
-        .mockResolvedValue(nothing());
-      // The first S1 is taken and run; the second is the repeat.
-      await drainPendingTasks(bridge, queue, deps());
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(connection.prompt).toHaveBeenCalledTimes(2);
-      expect(connection.prompt).toHaveBeenLastCalledWith({
-        sessionId: "S-S2",
-        prompt: [{ type: "text", text: "Task ID: S2\nwork on S2" }],
-      });
-    });
-
-    it("gives up on a workspace that hands back nothing but repeats", async () => {
-      const queue = new TaskQueue(4);
-      bridge.callTool.mockResolvedValueOnce(task("K1")).mockResolvedValue(task("K1"));
-
-      await drainPendingTasks(bridge, queue, deps());
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      // The task itself, then the repeats it is willing to sit through.
-      expect(bridge.callTool).toHaveBeenCalledTimes(1 + MAX_SKIPPED_FETCHES);
-    });
-
-    it("leaves a workspace it could not reach to its own reconnection", async () => {
-      // Retrying a failing call in a tight loop is how a gateway turns a blip
-      // into an outage of its own.
-      const queue = new TaskQueue(3);
-      bridge.callTool.mockRejectedValue(new Error("network error"));
-
-      await drainPendingTasks(bridge, queue, deps());
-
-      expect(bridge.callTool).toHaveBeenCalledTimes(1);
-    });
-
-    it("asks once and stops when the workspace has nothing waiting", async () => {
-      const queue = new TaskQueue(3);
-      bridge.callTool.mockResolvedValue(nothing());
-
-      await drainPendingTasks(bridge, queue, deps());
-
-      expect(bridge.callTool).toHaveBeenCalledTimes(1);
-      expect(connection.prompt).not.toHaveBeenCalled();
-    });
-
-    it("does not ask at all while the queue is full", async () => {
-      const queue = new TaskQueue(1);
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const running = queue.run(() => held);
-
-      await drainPendingTasks(bridge, queue, deps());
-
-      expect(bridge.callTool).not.toHaveBeenCalled();
-      release();
-      await running;
-    });
-
-    it("counts a task waiting in the queue as a slot already spoken for", async () => {
-      // Queued work is work this gateway has promised to run; fetching more
-      // against it would pull the whole workspace in and hold it here.
-      const queue = new TaskQueue(1);
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const running = queue.run(() => held);
-      const waiting = queue.run(async () => {});
-
-      await drainPendingTasks(bridge, queue, deps());
-
-      expect(bridge.callTool).not.toHaveBeenCalled();
-      release();
-      await Promise.all([running, waiting]);
-    });
-
-    it("joins a drain already running, and answers the wake-up that joining collapsed", async () => {
-      // Every trigger — a task finishing, a limit rising — can land while a
-      // drain is waiting on getTask. A second drain started there would be
-      // asking for the task the first one is about to be handed; but simply
-      // swallowing the news would leave the slot that just came free empty,
-      // because the drain that swallowed it may already have been told the
-      // workspace is empty.
-      let queue!: TaskQueue;
-      const rejoined: Array<Promise<void>> = [];
-      queue = new TaskQueue(2, undefined, () => {
-        rejoined.push(drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue }));
-      });
-
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const running = queue.run(() => held);
-
-      const answerFetch: Array<(value: any) => void> = [];
-      bridge.callTool.mockImplementation(
-        () => new Promise((resolve) => { answerFetch.push(resolve); }),
-      );
-
-      const draining = drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue });
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(answerFetch.length).toBe(1);
-
-      // The slot comes free while that fetch is still in the air.
-      release();
-      await running;
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(rejoined).toHaveLength(1);
-      expect(rejoined[0]).toBe(draining);
-
-      // The drain that collapsed it is told there is nothing — and goes back
-      // anyway, because the slot it heard about came free after it had asked.
-      answerFetch[0](nothing());
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(answerFetch.length).toBe(2);
-
-      answerFetch[1](nothing());
-      await draining;
-      expect(connection.prompt).not.toHaveBeenCalled();
-    });
-
-    it("goes back for more when a finished task frees a slot", async () => {
-      let queue!: TaskQueue;
-      queue = new TaskQueue(1, undefined, () => {
-        void drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue });
-      });
-      bridge.callTool.mockResolvedValueOnce(task("L1")).mockResolvedValue(nothing());
-
-      await drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue });
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(connection.prompt).toHaveBeenCalledTimes(1);
-      // Asked again once the slot came back, and was told there was nothing.
-      expect(bridge.callTool.mock.calls.length).toBeGreaterThanOrEqual(2);
-    });
-
-    it("keeps filling slots when one of the tasks fails", async () => {
-      // One task that cannot run is not a reason to leave the other slots empty.
-      const queue = new TaskQueue(2);
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      connection.prompt
-        .mockRejectedValueOnce(new Error("agent said no"))
-        .mockReturnValue(held.then(() => ({ stopReason: "end_turn" })));
-      bridge.callTool
-        .mockResolvedValueOnce(task("F1"))
-        .mockResolvedValueOnce(task("F2"))
-        .mockResolvedValue(nothing());
-
-      await drainPendingTasks(bridge, queue, deps());
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(connection.prompt).toHaveBeenCalledTimes(2);
-      expect(console.error).toHaveBeenCalledWith(
-        expect.stringContaining("Error running task F1"),
-        expect.any(Error),
-      );
-      release();
-    });
-
-    it("names an unnamed task in the log rather than saying nothing went wrong", async () => {
-      const queue = new TaskQueue(1);
-      connection.prompt.mockRejectedValue(new Error("agent said no"));
-      bridge.callTool
-        .mockResolvedValueOnce({
-          isError: false,
-          content: [{ type: "text", text: "/compact and then some" }],
-        })
-        .mockResolvedValue(nothing());
-
-      await drainPendingTasks(bridge, queue, deps());
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(console.error).toHaveBeenCalledWith(
-        expect.stringContaining("Error running task (unnamed)"),
-        expect.any(Error),
-      );
-    });
-
-    it("fills the slots a raised limit just opened", async () => {
-      // Raising the limit with nothing waiting internally used to start
-      // nothing at all: the tasks it could now run were in the workspace,
-      // and nothing went to ask for them.
-      let queue!: TaskQueue;
-      queue = new TaskQueue(1, undefined, () => {
-        void drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue });
-      });
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      connection.prompt.mockReturnValue(held.then(() => ({ stopReason: "end_turn" })));
-      bridge.callTool
-        .mockResolvedValueOnce(task("U1"))
-        .mockResolvedValueOnce(task("U2"))
-        .mockResolvedValueOnce(task("U3"))
-        .mockResolvedValue(nothing());
-
-      await drainPendingTasks(bridge, queue, { ...deps(), taskQueue: queue });
-      expect(queue.getActiveCount()).toBe(1);
-
-      queue.setMaxConcurrency(3);
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(queue.getActiveCount()).toBe(3);
-      release();
-    });
-  });
-
-  describe("TaskQueue", () => {
-    it("should run tasks up to maxConcurrency immediately", async () => {
-      const queue = new TaskQueue(2);
-      let running = 0;
-      const tasks = Array.from({ length: 3 }, async (_, i) => {
-        return queue.run(async () => {
-          running++;
-          expect(running).toBeLessThanOrEqual(2);
-          await new Promise((resolve) => setTimeout(resolve, 20));
-          running--;
-        });
-      });
-      await Promise.all(tasks);
-    });
-
-    it("should queue subsequent tasks and execute them when previous ones finish", async () => {
-      const queue = new TaskQueue(1);
-      const executionOrder: number[] = [];
-      const t1 = queue.run(async () => {
-        executionOrder.push(1);
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      });
-      const t2 = queue.run(async () => {
-        executionOrder.push(2);
-      });
-      await Promise.all([t1, t2]);
-      expect(executionOrder).toEqual([1, 2]);
-    });
-
-    it("should handle error in immediate task and decrement activeCount", async () => {
-      const queue = new TaskQueue(1);
-      await expect(queue.run(async () => {
-        throw new Error("immediate error");
-      })).rejects.toThrow("immediate error");
-      expect(queue.getActiveCount()).toBe(0);
-    });
-
-    it("should handle error in queued task, reject, and trigger next task", async () => {
-      const queue = new TaskQueue(1);
-      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-
-      let resolveFirst: any;
-      const firstPromise = new Promise<void>((resolve) => { resolveFirst = resolve; });
-      const t1 = queue.run(async () => {
-        await firstPromise;
-      });
-
-      const t2 = queue.run(async () => {
-        throw new Error("queued error");
-      });
-
-      let ranThird = false;
-      const t3 = queue.run(async () => {
-        ranThird = true;
-      });
-
-      expect(queue.getQueueLength()).toBe(2);
-
-      resolveFirst();
-      await t1;
-
-      await expect(t2).rejects.toThrow("queued error");
-      await t3;
-
-      // Allow catch microtasks to run
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(ranThird).toBe(true);
-      expect(queue.getActiveCount()).toBe(0);
-      expect(logSpy).toHaveBeenCalledWith("[queue] Error executing queued task:", expect.any(Error));
-
-      logSpy.mockRestore();
-    });
-
-    it("reports the limit it was built with", () => {
-      expect(new TaskQueue(3).getMaxConcurrency()).toBe(3);
-    });
-
-    it("starts every task a raised limit has room for, not one at a time", async () => {
-      const queue = new TaskQueue(1);
-      let release: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-
-      const started: number[] = [];
-      const runs = [
-        queue.run(async () => { started.push(0); await held; }),
-        queue.run(async () => { started.push(1); }),
-        queue.run(async () => { started.push(2); }),
-        queue.run(async () => { started.push(3); }),
-      ];
-
-      // Only the first is running; the other three are waiting on a limit of 1.
-      expect(queue.getActiveCount()).toBe(1);
-      expect(queue.getQueueLength()).toBe(3);
-
-      queue.setMaxConcurrency(4);
-
-      // All three waiting tasks start at once, without the running one
-      // finishing first — a raise that took effect one task per completion
-      // would leave two of them still queued here.
-      expect(started).toEqual([0, 1, 2, 3]);
-      expect(queue.getMaxConcurrency()).toBe(4);
-
-      release!();
-      await Promise.all(runs);
-    });
-
-    it("starts only as many as the new limit allows, and leaves the rest queued", async () => {
-      const queue = new TaskQueue(1);
-      let release: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-
-      const runs = [
-        queue.run(async () => { await held; }),
-        queue.run(async () => { await held; }),
-        queue.run(async () => { await held; }),
-        queue.run(async () => { await held; }),
-      ];
-
-      queue.setMaxConcurrency(2);
-
-      expect(queue.getActiveCount()).toBe(2);
-      expect(queue.getQueueLength()).toBe(2);
-
-      release!();
-      await Promise.all(runs);
-    });
-
-    it("never interrupts work already in flight when the limit is lowered", async () => {
-      const queue = new TaskQueue(3);
-      let release: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const finished: number[] = [];
-
-      const runs = [
-        queue.run(async () => { await held; finished.push(0); }),
-        queue.run(async () => { await held; finished.push(1); }),
-        queue.run(async () => { await held; finished.push(2); }),
-      ];
-      const queued = queue.run(async () => { finished.push(3); });
-
-      expect(queue.getActiveCount()).toBe(3);
-
-      queue.setMaxConcurrency(1);
-
-      // The three that already have the agent's attention keep it — a lowered
-      // limit is honoured going forward, not retroactively.
-      expect(queue.getActiveCount()).toBe(3);
-      expect(queue.getQueueLength()).toBe(1);
-
-      release!();
-      await Promise.all([...runs, queued]);
-
-      expect(finished).toEqual([0, 1, 2, 3]);
-      expect(queue.getActiveCount()).toBe(0);
-    });
-
-    it("holds the queue until the active count falls under a lowered limit", async () => {
-      const queue = new TaskQueue(2);
-      const releases: Array<() => void> = [];
-      const hold = () => new Promise<void>((resolve) => { releases.push(resolve); });
-
-      const first = queue.run(hold);
-      const second = queue.run(hold);
-      const third = queue.run(async () => {});
-
-      queue.setMaxConcurrency(1);
-      expect(queue.getQueueLength()).toBe(1);
-
-      // One finishing still leaves one running, which is already the whole of
-      // the new limit, so the waiting task must not start yet.
-      releases[0]();
-      await first;
-      expect(queue.getQueueLength()).toBe(1);
-      expect(queue.getActiveCount()).toBe(1);
-
-      releases[1]();
-      await second;
-      await third;
-      expect(queue.getActiveCount()).toBe(0);
-    });
-
-    it("does nothing, and says nothing, when the limit has not actually changed", () => {
-      const queue = new TaskQueue(4);
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      errorSpy.mockClear();
-
-      queue.setMaxConcurrency(4);
-
-      expect(queue.getMaxConcurrency()).toBe(4);
-      expect(errorSpy).not.toHaveBeenCalled();
-      errorSpy.mockRestore();
-    });
-
-    describe("saying when its numbers move", () => {
-      /** Records what the queue looked like at each announcement. */
-      const watch = (queue: () => TaskQueue) => {
-        const seen: Array<{ active: number; queued: number }> = [];
-        return {
-          seen,
-          onChange: () =>
-            seen.push({
-              active: queue().getActiveCount(),
-              queued: queue().getQueueLength(),
-            }),
-        };
-      };
-
-      it("says so when a task starts, and again when it finishes", async () => {
-        // Without this the workspace hears the count once, while the gateway is
-        // idle, and then shows 0 running for the rest of its life.
-        let queue!: TaskQueue;
-        const { seen, onChange } = watch(() => queue);
-        queue = new TaskQueue(2, onChange);
-
-        let release!: () => void;
-        const held = new Promise<void>((resolve) => { release = resolve; });
-        const running = queue.run(() => held);
-
-        expect(seen).toEqual([{ active: 1, queued: 0 }]);
-
-        release();
-        await running;
-
-        expect(seen).toEqual([
-          { active: 1, queued: 0 },
-          { active: 0, queued: 0 },
-        ]);
-      });
-
-      it("says so when a task is made to wait, with nothing newly running", async () => {
-        let queue!: TaskQueue;
-        const { seen, onChange } = watch(() => queue);
-        queue = new TaskQueue(1, onChange);
-
-        let release!: () => void;
-        const held = new Promise<void>((resolve) => { release = resolve; });
-        const first = queue.run(() => held);
-        const second = queue.run(async () => {});
-
-        // The second changed what is waiting, not what is running.
-        expect(seen).toEqual([
-          { active: 1, queued: 0 },
-          { active: 1, queued: 1 },
-        ]);
-
-        release();
-        await Promise.all([first, second]);
-
-        // A slot came free, then the waiting task took it, then it finished.
-        expect(seen.slice(2)).toEqual([
-          { active: 0, queued: 1 },
-          { active: 1, queued: 0 },
-          { active: 0, queued: 0 },
-        ]);
-      });
-
-      it("runs tasks normally when nobody is listening", async () => {
-        // The queue is built without a listener throughout these tests and in
-        // --list-models; an optional callback must stay optional.
-        const queue = new TaskQueue(1);
-        let ran = false;
-
-        await expect(queue.run(async () => { ran = true; })).resolves.toBeUndefined();
-
-        expect(ran).toBe(true);
-        expect(queue.getActiveCount()).toBe(0);
-      });
-
-      it("tells the workspace, end to end, when a task starts and finishes", async () => {
-        const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
-        // The callback is only worth anything if it reaches the wire, so this
-        // asserts on the notification rather than on the callback firing.
-        const bridge: any = { sendNotification: vi.fn().mockResolvedValue(undefined) };
-        const queue = createTaskQueue(2, bridge);
-
-        let release!: () => void;
-        const held = new Promise<void>((resolve) => { release = resolve; });
-        const running = queue.run(() => held);
-        await flush();
-
-        expect(bridge.sendNotification).toHaveBeenCalledWith(
-          "notifications/claude/channel/concurrency",
-          expect.objectContaining({ maxConcurrency: 2, active: 1, queued: 0 }),
-        );
-
-        release();
-        await running;
-        await flush();
-
-        expect(bridge.sendNotification).toHaveBeenLastCalledWith(
-          "notifications/claude/channel/concurrency",
-          expect.objectContaining({ maxConcurrency: 2, active: 0, queued: 0 }),
-        );
-      });
-
-      it("keeps running tasks when the listener throws", async () => {
-        // Announcing happens inside execute, including in its finally — a
-        // listener that threw there would replace the task's own error with its
-        // own. Running tasks is the job; telling an interface is a courtesy.
-        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-        const queue = new TaskQueue(1, () => {
-          throw new Error("the workspace is on fire");
-        });
-
-        let ran = false;
-        await expect(queue.run(async () => { ran = true; })).resolves.toBeUndefined();
-        expect(ran).toBe(true);
-
-        // And a task's own failure still reaches its caller unchanged.
-        await expect(
-          queue.run(async () => { throw new Error("the task itself failed"); }),
-        ).rejects.toThrow("the task itself failed");
-
-        expect(errorSpy).toHaveBeenCalledWith(
-          "[queue] Error reporting the queue's state:",
-          expect.any(Error),
-        );
-        errorSpy.mockRestore();
-      });
-    });
-  });
-
-  describe("offering its free capacity", () => {
-    it("says so when a task finishes, but not when one starts", async () => {
-      // Two different questions: the numbers moved (a start moves them too),
-      // and there may be room now. Only the second is a reason to go and ask
-      // the workspace for more work.
-      let queue!: TaskQueue;
-      const offers: number[] = [];
-      queue = new TaskQueue(1, undefined, () => offers.push(queue.getActiveCount()));
-
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const running = queue.run(() => held);
-      expect(offers).toEqual([]);
-
-      release();
-      await running;
-      expect(offers).toEqual([0]);
-    });
-
-    it("says so when the limit is raised, even with nothing waiting here", async () => {
-      // The tasks a raise makes room for are usually still in the workspace,
-      // so a raise that told nobody would run nothing at all.
-      let offered = 0;
-      const queue = new TaskQueue(1, undefined, () => { offered++; });
-
-      queue.setMaxConcurrency(3);
-      expect(offered).toBe(1);
-
-      // Not a change, so nothing to offer.
-      queue.setMaxConcurrency(3);
-      expect(offered).toBe(1);
-    });
-
-    it("says nothing when what was queued here takes the slot straight back", async () => {
-      // Otherwise the gateway hears "room!" and fetches a task to sit beside
-      // work it had already promised to run.
-      let queue!: TaskQueue;
-      const roomSeen: number[] = [];
-      queue = new TaskQueue(1, undefined, () => roomSeen.push(freeSlots(queue)));
-
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const first = queue.run(() => held);
-      let releaseSecond!: () => void;
-      const second = queue.run(() => new Promise<void>((resolve) => { releaseSecond = resolve; }));
-
-      release();
-      await first;
-      expect(roomSeen).toEqual([]);
-
-      releaseSecond();
-      await second;
-      // Only now, with nothing left waiting, is there room worth mentioning.
-      expect(roomSeen).toEqual([1]);
-    });
-
-    it("says nothing when the limit is lowered under work already running", async () => {
-      // Lowering never interrupts, so a lowered limit leaves less room, not
-      // more — and asking the workspace for another task would be absurd.
-      let offered = 0;
-      const queue = new TaskQueue(3, undefined, () => { offered++; });
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const running = [queue.run(() => held), queue.run(() => held), queue.run(() => held)];
-
-      queue.setMaxConcurrency(1);
-      expect(offered).toBe(0);
-
-      release();
-      await Promise.all(running);
-    });
-
-    it("survives a listener that throws, so a finished task still finishes", async () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const queue = new TaskQueue(1, undefined, () => {
-        throw new Error("nobody to tell");
-      });
-
-      await expect(queue.run(async () => {})).resolves.toBeUndefined();
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Error offering the queue's free capacity"),
-        expect.any(Error),
-      );
-      errorSpy.mockRestore();
-    });
-
-    it("is wired through createTaskQueue, which is how the gateway gets it", () => {
-      const bridge = { sendNotification: vi.fn().mockResolvedValue(undefined) };
-      let offered = 0;
-      const queue = createTaskQueue(2, bridge, () => { offered++; });
-
-      queue.setMaxConcurrency(3);
-      expect(offered).toBe(1);
-      resetConcurrencyReports();
-    });
-  });
-
-  describe("handleSetConcurrency", () => {
-    let errorSpy: ReturnType<typeof vi.spyOn>;
-
-    beforeEach(() => {
-      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    });
-
-    afterEach(() => {
-      errorSpy.mockRestore();
-    });
-
-    const fakeConcurrencyBridge = () => ({
-      sendNotification: vi.fn().mockResolvedValue(undefined),
-    });
-
-    it("applies the limit the workspace asked for and reports it back", async () => {
-      const queue = new TaskQueue(1);
-      const bridge = fakeConcurrencyBridge();
-
-      await handleSetConcurrency({ maxConcurrency: 5 }, queue, bridge);
-
-      expect(queue.getMaxConcurrency()).toBe(5);
-      expect(bridge.sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/concurrency",
-        expect.objectContaining({ maxConcurrency: 5, active: 0, queued: 0 }),
-      );
-    });
-
-    it("reports the clamped limit, so the interface shows what took effect", async () => {
-      const queue = new TaskQueue(1);
-      const bridge = fakeConcurrencyBridge();
-
-      await handleSetConcurrency({ maxConcurrency: 100_000 }, queue, bridge);
-
-      expect(queue.getMaxConcurrency()).toBe(64);
-      expect(bridge.sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/concurrency",
-        expect.objectContaining({ maxConcurrency: 64 }),
-      );
-    });
-
-    it("keeps the current limit when asked for something that is not a number", async () => {
-      const queue = new TaskQueue(3);
-      const bridge = fakeConcurrencyBridge();
-
-      await handleSetConcurrency({ maxConcurrency: "lots" }, queue, bridge);
-
-      expect(queue.getMaxConcurrency()).toBe(3);
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining('asking for "lots"'),
-      );
-    });
-
-    it("still answers a rejected value, rather than leaving the control hanging", async () => {
-      const queue = new TaskQueue(3);
-      const bridge = fakeConcurrencyBridge();
-
-      await handleSetConcurrency({}, queue, bridge);
-
-      // The interface moved a control and is waiting to see where it landed;
-      // silence would leave it showing a limit this gateway never adopted.
-      expect(bridge.sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/concurrency",
-        expect.objectContaining({ maxConcurrency: 3 }),
-      );
-    });
-
-    it("reports what the queue is doing under the new limit", async () => {
-      const queue = new TaskQueue(1);
-      const bridge = fakeConcurrencyBridge();
-      let release: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-
-      const runs = [
-        queue.run(async () => { await held; }),
-        queue.run(async () => { await held; }),
-        queue.run(async () => { await held; }),
-      ];
-
-      await handleSetConcurrency({ maxConcurrency: 2 }, queue, bridge);
-
-      expect(bridge.sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/concurrency",
-        expect.objectContaining({ maxConcurrency: 2, active: 2, queued: 1 }),
-      );
-
-      release!();
-      await Promise.all(runs);
-    });
-
-    it("answers even when applying the change throws", async () => {
-      // "Always answered" is the design; it must not depend on the change
-      // itself going well, or the interface is left showing a limit nothing
-      // adopted precisely when something has gone wrong.
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const queue = new TaskQueue(3);
-      const bridge = fakeConcurrencyBridge();
-      vi.spyOn(queue, "setMaxConcurrency").mockImplementation(() => {
-        throw new Error("queue is wedged");
-      });
-
-      await expect(
-        handleSetConcurrency({ maxConcurrency: 5 }, queue, bridge),
-      ).rejects.toThrow("queue is wedged");
-
-      expect(bridge.sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/concurrency",
-        expect.objectContaining({ maxConcurrency: 3 }),
-      );
-      errorSpy.mockRestore();
-    });
-
-    it("applies the limit even with no bridge to report it to", async () => {
-      const queue = new TaskQueue(1);
-
-      await handleSetConcurrency({ maxConcurrency: 6 }, queue);
-
-      expect(queue.getMaxConcurrency()).toBe(6);
-    });
-  });
-
-  describe("runTurnForTask", () => {
-    beforeEach(() => {
-      resetTaskTurns();
-    });
-
-    it("holds a second message on a chat until the first turn has finished", async () => {
-      // A session takes one turn at a time, and agentrq reuses a chat's id as
-      // the task id — so two messages to one chat are two deliveries of one
-      // task, and running them at once puts two prompts on one session.
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const events: string[] = [];
-      let releaseFirst: () => void;
-      const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
-
-      const first = runTurnForTask("T-Chat", async () => {
-        events.push("first:start");
-        await firstHeld;
-        events.push("first:end");
-      });
-      const second = runTurnForTask("T-Chat", async () => {
-        events.push("second:start");
-      });
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(events).toEqual(["first:start"]);
-
-      releaseFirst!();
-      await Promise.all([first, second]);
-
-      expect(events).toEqual(["first:start", "first:end", "second:start"]);
-      errorSpy.mockRestore();
-    });
-
-    it("lets a second message through after the first turn failed", async () => {
-      // Losing it would lose what someone typed, and the first message erroring
-      // is no reason the agent should never hear the second.
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const ran: string[] = [];
-
-      const first = runTurnForTask("T-Fail", async () => {
-        ran.push("first");
-        throw new Error("agent blew up");
-      });
-      const second = runTurnForTask("T-Fail", async () => {
-        ran.push("second");
-      });
-
-      await expect(first).rejects.toThrow("agent blew up");
-      await second;
-
-      expect(ran).toEqual(["first", "second"]);
-      errorSpy.mockRestore();
-    });
-
-    it("keeps a queue of messages in the order they were sent", async () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const ran: number[] = [];
-      const turns = [0, 1, 2, 3].map((n) =>
-        runTurnForTask("T-Order", async () => {
-          await new Promise((resolve) => setTimeout(resolve, 5 - n));
-          ran.push(n);
-        }),
-      );
-
-      await Promise.all(turns);
-
-      expect(ran).toEqual([0, 1, 2, 3]);
-      errorSpy.mockRestore();
-    });
-
-    it("never makes one chat wait on another", async () => {
-      // Serialising per task, not globally — a shared lock would undo the whole
-      // point of a concurrency limit above 1.
-      const started: string[] = [];
-      let release: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-
-      const a = runTurnForTask("T-One", async () => { started.push("a"); await held; });
-      const b = runTurnForTask("T-Two", async () => { started.push("b"); await held; });
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      expect(started.sort()).toEqual(["a", "b"]);
-
-      release!();
-      await Promise.all([a, b]);
-    });
-
-    it("runs a delivery with no task id straight away", async () => {
-      let ran = false;
-      await runTurnForTask(undefined, async () => { ran = true; });
-      expect(ran).toBe(true);
-    });
-
-    it("forgets a task once its last turn is done, rather than growing forever", async () => {
-      await runTurnForTask("T-Clean", async () => {});
-      const ran: string[] = [];
-
-      // A stale chain tail would make this wait on an already-settled promise
-      // instead of starting at once; a leaked one would never be collected.
-      await runTurnForTask("T-Clean", async () => { ran.push("second"); });
-
-      expect(ran).toEqual(["second"]);
-    });
-  });
-
-  describe("registerConcurrencyListeners", () => {
-    let errorSpy: ReturnType<typeof vi.spyOn>;
-
-    beforeEach(() => {
-      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    });
-
-    afterEach(() => {
-      errorSpy.mockRestore();
-    });
-
-    const listeningBridge = () => {
-      const bridge: any = new EventEmitter();
-      bridge.sendNotification = vi.fn().mockResolvedValue(undefined);
-      return bridge;
-    };
-
-    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
-
-    it("applies a limit the workspace pushes while the gateway is running", async () => {
-      const bridge = listeningBridge();
-      const queue = new TaskQueue(1);
-      registerConcurrencyListeners(bridge, queue);
-
-      bridge.emit("setConcurrency", { maxConcurrency: 5 });
-      await settle();
-
-      expect(queue.getMaxConcurrency()).toBe(5);
-      expect(bridge.sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/concurrency",
-        expect.objectContaining({ maxConcurrency: 5 }),
-      );
-    });
-
-    it("re-reports the limit on reconnect, which the workspace has just forgotten", async () => {
-      const bridge = listeningBridge();
-      const queue = new TaskQueue(1);
-      registerConcurrencyListeners(bridge, queue);
-
-      bridge.emit("setConcurrency", { maxConcurrency: 7 });
-      await settle();
-      bridge.sendNotification.mockClear();
-
-      bridge.emit("reconnected");
-      await settle();
-
-      // The limit in force, not the one the gateway booted with.
-      expect(bridge.sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/concurrency",
-        expect.objectContaining({ maxConcurrency: 7 }),
-      );
-    });
-
-    it("logs rather than throws when applying the change goes wrong", async () => {
-      const bridge = listeningBridge();
-      const queue = new TaskQueue(1);
-      vi.spyOn(queue, "setMaxConcurrency").mockImplementation(() => {
-        throw new Error("queue is wedged");
-      });
-      registerConcurrencyListeners(bridge, queue);
-
-      // An unhandled rejection here would be logged and swallowed by the
-      // process-level net in production, which is a worse place to find out.
-      bridge.emit("setConcurrency", { maxConcurrency: 2 });
-      await settle();
-
-      expect(errorSpy).toHaveBeenCalledWith(
-        "[bridge] Error handling concurrency change:",
-        expect.any(Error),
-      );
-    });
-  });
-
-  describe("reportConcurrency", () => {
-    beforeEach(() => resetConcurrencyReports());
-    afterEach(() => resetConcurrencyReports());
-
-    /** A bridge whose sends finish only when the test says so. */
-    const heldBridge = () => {
-      const releases: Array<() => void> = [];
-      const sendNotification = vi.fn(
-        () => new Promise<void>((resolve) => { releases.push(resolve); }),
-      );
-      return { bridge: { sendNotification } as any, sendNotification, releases };
-    };
-
-    it("never puts two reports on the wire at once", async () => {
-      // Each report is its own POST and nothing sequences them, so two in
-      // flight can be processed in either order — and the workspace would then
-      // show whichever landed last rather than whichever is true.
-      const { bridge, sendNotification, releases } = heldBridge();
-      const queue = new TaskQueue(4);
-
-      void reportConcurrency(bridge, queue);
-      void reportConcurrency(bridge, queue);
-      void reportConcurrency(bridge, queue);
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      // The second and third waited for the first rather than racing it.
-      expect(sendNotification).toHaveBeenCalledTimes(1);
-
-      releases[0]();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(sendNotification).toHaveBeenCalledTimes(2);
-
-      releases[1]();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      // Three asks, two reports: the ones that piled up became one.
-      expect(sendNotification).toHaveBeenCalledTimes(2);
-    });
-
-    it("makes the report that follows a burst describe the queue now", async () => {
-      // A collapsed report is worth sending only because it is current; one
-      // carrying the state at the moment it was asked for would be a stale
-      // number arriving late, which is the thing being fixed.
-      const { bridge, sendNotification, releases } = heldBridge();
-      // Wired to the bridge, so a task starting is what asks for the report.
-      const queue = createTaskQueue(4, bridge);
-
-      void reportConcurrency(bridge, queue);
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(sendNotification).toHaveBeenLastCalledWith(
-        "notifications/claude/channel/concurrency",
-        expect.objectContaining({ active: 0, queued: 0 }),
-      );
-
-      // The numbers move while the first report is still flying.
-      let release!: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const running = queue.run(() => held);
-
-      releases[0]();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      expect(sendNotification).toHaveBeenLastCalledWith(
-        "notifications/claude/channel/concurrency",
-        expect.objectContaining({ active: 1, queued: 0 }),
-      );
-
-      release();
-      releases.slice(1).forEach((r) => r());
-      await running;
-    });
-
-    it("resolves only once the workspace has been told", async () => {
-      // handleSetConcurrency awaits this to make "always answered" true, so it
-      // must not resolve on the strength of somebody else's report.
-      const { bridge, sendNotification, releases } = heldBridge();
-      const queue = new TaskQueue(4);
-
-      void reportConcurrency(bridge, queue);
-      let answered = false;
-      void reportConcurrency(bridge, queue).then(() => { answered = true; });
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      // The first report has not even landed yet.
-      expect(answered).toBe(false);
-
-      releases[0]();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      // Nor on the first one landing — the second is what it is owed.
-      expect(answered).toBe(false);
-
-      releases[1]();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(answered).toBe(true);
-      expect(sendNotification).toHaveBeenCalledTimes(2);
-    });
-
-    it("describes the queue as it stands", async () => {
-      const bridge: any = { sendNotification: vi.fn().mockResolvedValue(undefined) };
-      const queue = new TaskQueue(2);
-      let release: () => void;
-      const held = new Promise<void>((resolve) => { release = resolve; });
-      const runs = [
-        queue.run(async () => { await held; }),
-        queue.run(async () => { await held; }),
-        queue.run(async () => { await held; }),
-      ];
-
-      await reportConcurrency(bridge, queue);
-
-      expect(bridge.sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/concurrency",
-        expect.objectContaining({ maxConcurrency: 2, active: 2, queued: 1 }),
-      );
-
-      release!();
-      await Promise.all(runs);
-    });
-  });
-
-  describe("getOrCreateSession", () => {
-    beforeEach(() => {
-      activeSessions.clear();
-      resetIdleSession();
-      newSessionError.value = null;
-      newSessionHangs.value = false;
-    });
-
-    it("should spawn a new session when not cached", async () => {
-      const mockBridge: any = fakeBridge();
-      const configs: any[] = [];
-      const agentrqConfig: any = { env: {} };
-      
-      const session = await getOrCreateSession("T-New", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
-      
-      expect(session).toBeDefined();
-      expect(session.sessionId).toBe("test-sess-123");
-      expect(activeSessions.has("T-New")).toBe(true);
-    });
-
-    it("files a session opened with no task under the idle key", async () => {
-      // This is the session the gateway opens at startup so a workspace can say
-      // what its agent offers before any work arrives.
-      const mockBridge: any = fakeBridge();
-
-      const session = await getOrCreateSession(undefined, ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(session).toBeDefined();
-      expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(true);
-    });
-
-    it("gives two deliveries of one task a single agent, not one each", async () => {
-      // activeSessions only learns about a session once the agent has spawned,
-      // handshaken and opened it. Two deliveries inside that window both missed
-      // the cache and both spawned — two processes on one task, and only the
-      // second reachable afterwards, so the first could never be closed.
-      const mockBridge: any = fakeBridge();
-      spawnedAgents.length = 0;
-
-      const [first, second] = await Promise.all([
-        getOrCreateSession("T-Dup", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
-        getOrCreateSession("T-Dup", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
-      ]);
-
-      expect(spawnedAgents.length).toBe(1);
-      expect(second).toBe(first);
-      expect(activeSessions.size).toBe(1);
-    });
-
-    it("holds a crowd of simultaneous deliveries to one agent", async () => {
-      const mockBridge: any = fakeBridge();
-      spawnedAgents.length = 0;
-
-      const sessions = await Promise.all(
-        Array.from({ length: 8 }, () =>
-          getOrCreateSession("T-Crowd", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
-        ),
-      );
-
-      expect(spawnedAgents.length).toBe(1);
-      expect(new Set(sessions).size).toBe(1);
-    });
-
-    it("still opens separate agents for separate tasks at the same time", async () => {
-      // The guard is per task, not a lock on opening sessions at all — a raised
-      // concurrency limit would be worth nothing if it serialised every spawn.
-      const mockBridge: any = fakeBridge();
-      spawnedAgents.length = 0;
-
-      const [a, b, c] = await Promise.all([
-        getOrCreateSession("T-A", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
-        getOrCreateSession("T-B", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
-        getOrCreateSession("T-C", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
-      ]);
-
-      expect(spawnedAgents.length).toBe(3);
-      expect(new Set([a, b, c]).size).toBe(3);
-      expect(activeSessions.size).toBe(3);
-    });
-
-    it("serves a later delivery from the cache, not from a spent attempt", async () => {
-      const mockBridge: any = fakeBridge();
-      spawnedAgents.length = 0;
-
-      const first = await getOrCreateSession("T-Later", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-      const second = await getOrCreateSession("T-Later", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(second).toBe(first);
-      expect(spawnedAgents.length).toBe(1);
-    });
-
-    it("lets a task try again after the attempt it waited on failed", async () => {
-      // A failed attempt must not leave the key wedged, or one bad spawn would
-      // cost the task every later delivery too.
-      const mockBridge: any = fakeBridge();
-      newSessionError.value = new Error("agent said no");
-
-      await expect(
-        getOrCreateSession("T-Retry", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
-      ).rejects.toThrow("agent said no");
-
-      newSessionError.value = null;
-      const recovered = await getOrCreateSession(
-        "T-Retry", ["node", "agent.js"], [], { env: {} } as any, mockBridge,
-      );
-
-      expect(recovered).toBeDefined();
-      expect(activeSessions.has("T-Retry")).toBe(true);
-    });
-
-    it("fails both waiters together rather than spawning a second agent to retry", async () => {
-      const mockBridge: any = fakeBridge();
-      newSessionError.value = new Error("agent said no");
-      spawnedAgents.length = 0;
-
-      const results = await Promise.allSettled([
-        getOrCreateSession("T-BothFail", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
-        getOrCreateSession("T-BothFail", ["node", "agent.js"], [], { env: {} } as any, mockBridge),
-      ]);
-
-      expect(results.every((r) => r.status === "rejected")).toBe(true);
-      expect(spawnedAgents.length).toBe(1);
-      newSessionError.value = null;
-    });
-
-    it("hands the startup session to the first task rather than opening a second", async () => {
-      // Sessions are keyed by task, so without this the first real task would
-      // spawn a second agent alongside the one already running.
-      const mockBridge: any = fakeBridge();
-
-      const idle = await getOrCreateSession(undefined, ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-      const forTask = await getOrCreateSession("T-First", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(forTask).toBe(idle);
-      expect(activeSessions.has("T-First")).toBe(true);
-      expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(false);
-      expect(activeSessions.size).toBe(1);
-    });
-
-    it("attributes what an adopted session reports to the task that took it", async () => {
-      // Everything the session says afterwards — models, commands, replies —
-      // belongs to that task, so the task id has to follow the adoption.
-      const mockBridge: any = fakeBridge();
-
-      const idle = await getOrCreateSession(undefined, ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-      mockBridge.sendNotification.mockClear();
-      await getOrCreateSession("T-Owner", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      await idle.acpClient.sendCommandsToWorkspace(idle.sessionId, [{ name: "init", description: "d" }]);
-
-      expect(mockBridge.sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/commands",
-        expect.objectContaining({ task_id: "T-Owner" }),
-      );
-    });
-
-    it("re-advertises known models with the adopted task id when taken over", async () => {
-      const mockBridge: any = fakeBridge();
-
-      const idle = await getOrCreateSession(undefined, ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-      await idle.acpClient.sendModelsToWorkspace(idle.sessionId, {
-        configId: "model",
-        currentModelId: "m1",
-        models: [{ id: "m1", name: "Model 1", current: true }],
-      });
-      mockBridge.sendNotification.mockClear();
-
-      await getOrCreateSession("T-Adopt", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(mockBridge.sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/models",
-        expect.objectContaining({
-          task_id: "T-Adopt",
-          session_id: idle.sessionId,
-          current_model: "m1",
-        }),
-      );
-    });
-
-    it("gives a second task its own session, having only one to hand over", async () => {
-      const mockBridge: any = fakeBridge();
-
-      await getOrCreateSession(undefined, ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-      const first = await getOrCreateSession("T-A", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-      const second = await getOrCreateSession("T-B", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(second).not.toBe(first);
-      expect(activeSessions.has("T-A")).toBe(true);
-      expect(activeSessions.has("T-B")).toBe(true);
-    });
-
-    it("opens the idle session at startup", async () => {
-      const mockBridge: any = fakeBridge();
-
-      await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(true);
-    });
-
-    it("never fails when the agent cannot be started", async () => {
-      // The safety property of the whole change: a broken agent used to fail
-      // when the first task arrived, and it still must. Failing at startup
-      // would turn it into a gateway that will not run at all.
-      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const mockBridge: any = fakeBridge();
-      newSessionError.value = new Error("agent will not start");
-
-      // Survivable: it says the gateway can carry on, and the first task retries.
-      await expect(
-        openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge),
-      ).resolves.toBe("unknown");
-
-      expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(false);
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("the first task will start one"),
-        expect.anything(),
-      );
-      consoleSpy.mockRestore();
-    });
-
-    it("reports that the gateway cannot continue when the agent is unauthenticated", async () => {
-      // Carrying on would leave the workspace showing a live agent that fails
-      // every task it is given, which is worse than not running at all.
-      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const mockBridge: any = fakeBridge();
-      newSessionError.value = { code: -32000, data: { authRequired: true }, message: "auth_required" };
-
-      const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(outcome).toBe("unauthenticated");
-      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("until it is authenticated"));
-      expect(activeSessions.has(IDLE_SESSION_KEY)).toBe(false);
-      // Nothing was claimed about an agent that never started.
-      expect(mockBridge.sendNotification).not.toHaveBeenCalledWith(
-        "notifications/claude/channel/models",
-        expect.anything(),
-      );
-      consoleSpy.mockRestore();
-    });
-
-    it("shuts down when the login itself went wrong", async () => {
-      // A terminal login the human abandoned, a login subcommand exiting
-      // non-zero, no usable method on a headless run: all of them come back as
-      // AuthenticationFailed, so none of them has to be recognised by its
-      // message. The conclusion is the same — an agent that cannot authenticate
-      // cannot work.
-      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const mockBridge: any = fakeBridge();
-      newSessionError.value = new AuthenticationFailed(
-        new Error('Terminal login "oauth" failed (code=1, signal=null).'),
-      );
-
-      const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(outcome).toBe("unauthenticated");
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("npx @agentrq/acp-gateway@latest --login"),
-      );
-      consoleSpy.mockRestore();
-    });
-
-    it("tells the owner of an API-key agent to set the key, not to log in", async () => {
-      // Plenty of agents never ask anyone to log in — they read a key from the
-      // environment. When one of those refuses, sending its owner looking for a
-      // login prompt that does not exist is worse than saying nothing.
-      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const mockBridge: any = fakeBridge();
-      newSessionError.value = new AuthenticationFailed(new Error("auth_required"), false);
-
-      const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(outcome).toBe("unauthenticated");
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("expecting a credential of its own"),
-      );
-      expect(consoleSpy).not.toHaveBeenCalledWith(
-        expect.stringContaining("--login"),
-      );
-      consoleSpy.mockRestore();
-    });
-
-    it("gives up waiting on an agent that never opens a session", async () => {
-      // Nothing reaches the workspace until this settles, so an agent that
-      // spawns and then goes quiet would otherwise take the whole gateway with
-      // it — a worse failure than the one the startup session fixes.
-      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const mockBridge: any = fakeBridge();
-      newSessionHangs.value = true;
-
-      const outcome = await openIdleSession(
-        ["node", "agent.js"],
-        [],
-        { env: {} } as any,
-        mockBridge,
-        loginCommandFor("some-agent"),
-        20,
-      );
-
-      expect(outcome).toBe("unknown");
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("has not opened a session"),
-      );
-      consoleSpy.mockRestore();
-    });
-
-    it("keeps running when the agent merely failed to start", async () => {
-      // Not the same thing at all: that may have been a race, it used to fail
-      // when the first task arrived, and it still should.
-      const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const mockBridge: any = fakeBridge();
-      newSessionError.value = new Error("spawn ENOENT");
-
-      const outcome = await openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      // Survivable, so the gateway keeps running.
-      expect(outcome).toBe("unknown");
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("the first task will start one"),
-        expect.anything(),
-      );
-      consoleSpy.mockRestore();
-    });
-
-    it("makes a task wait for a startup session still coming up, rather than starting a second agent", async () => {
-      // Opening one can take a long time when an agent wants a human to log in,
-      // and a task arriving in that window used to find nothing cached.
-      const mockBridge: any = fakeBridge();
-
-      const startup = openIdleSession(["node", "agent.js"], [], { env: {} } as any, mockBridge);
-      const forTask = getOrCreateSession("T-Racer", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      await startup;
-      const session = await forTask;
-
-      expect(activeSessions.size).toBe(1);
-      expect(activeSessions.get("T-Racer")).toBe(session);
-    });
-
-    it("should return cached session when already created", async () => {
-      const mockBridge: any = fakeBridge();
-      const configs: any[] = [];
-      const agentrqConfig: any = { env: {} };
-
-      const session1 = await getOrCreateSession("T-Cache", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
-      const session2 = await getOrCreateSession("T-Cache", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
-
-      expect(session1).toBe(session2);
-    });
-
-    it("should pass clientInfo with package name and version when initializing the ACP connection", async () => {
-      const mockBridge: any = fakeBridge();
-      const configs: any[] = [];
-      const agentrqConfig: any = { env: {} };
-
-      const session = await getOrCreateSession("T-ClientInfo", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
-
-      expect(session.connection.initialize).toHaveBeenCalledWith(
-        expect.objectContaining({
-          clientInfo: expect.objectContaining({
-            name: "@agentrq/acp-gateway",
-            version: expect.any(String),
-          }),
-        }),
-      );
-    });
-
-    it("should declare plan capability when initializing the ACP connection", async () => {
-      const mockBridge: any = fakeBridge();
-      const configs: any[] = [];
-      const agentrqConfig: any = { env: {} };
-
-      const session = await getOrCreateSession("T-Plan", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
-
-      expect(session.connection.initialize).toHaveBeenCalledWith(
-        expect.objectContaining({
-          clientCapabilities: expect.objectContaining({
-            plan: {},
-          }),
-        }),
-      );
-    });
-
-    it("should declare elicitation support when initializing the ACP connection", async () => {
-      const mockBridge: any = fakeBridge();
-      const configs: any[] = [];
-      const agentrqConfig: any = { env: {} };
-
-      const session = await getOrCreateSession("T-Elicit", ["node", "agent.js"], configs, agentrqConfig, mockBridge);
-
-      expect(session.connection.initialize).toHaveBeenCalledWith(
-        expect.objectContaining({
-          clientCapabilities: expect.objectContaining({
-            elicitation: { form: {}, url: {} },
-          }),
-        }),
-      );
-    });
-
-    it("should declare whether it can host a terminal login", async () => {
-      const mockBridge: any = fakeBridge();
-
-      const session = await getOrCreateSession("T-Auth-Cap", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(session.connection.initialize).toHaveBeenCalledWith(
-        expect.objectContaining({
-          clientCapabilities: expect.objectContaining({
-            auth: { terminal: isInteractiveTerminal() },
-          }),
-        }),
-      );
-    });
-
-    it("should log in and retry when the agent refuses the session", async () => {
-      const authenticate = vi.fn().mockResolvedValue({});
-      const newSession = vi
-        .fn()
-        .mockRejectedValueOnce(
-          Object.assign(new Error("Authentication required"), { code: AUTH_REQUIRED_CODE }),
-        )
-        .mockResolvedValue({ sessionId: "authed-sess" });
-      vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
-        return {
-          initialize: vi.fn().mockResolvedValue({
-            protocolVersion: "0.1.0",
-            authMethods: [{ id: "agent-login", name: "Agent login" }],
-          }),
-          newSession,
-          authenticate,
-          prompt: vi.fn(),
-        } as any;
-      } as any);
-
-      const session = await getOrCreateSession("T-Login", ["node", "agent.js"], [], { env: {} } as any, fakeBridge());
-
-      expect(authenticate).toHaveBeenCalledWith({ methodId: "agent-login" });
-      expect(newSession).toHaveBeenCalledTimes(2);
-      expect(session.sessionId).toBe("authed-sess");
-    });
-
-    it("should forward models to workspace on session creation and set model if configured", async () => {
-      const mockBridge: any = fakeBridge();
-      const setSessionConfigOption = vi.fn().mockResolvedValue({
-        configOptions: [
-          {
-            id: "model",
-            name: "Model",
-            type: "select",
-            currentValue: "gpt-4o",
-            options: [
-              { value: "gpt-4", name: "GPT-4" },
-              { value: "gpt-4o", name: "GPT-4o" },
-            ],
-          },
-        ],
-      });
-      vi.mocked(acp.ClientSideConnection).mockImplementationOnce(function () {
-        return {
-          initialize: vi.fn().mockResolvedValue({ protocolVersion: "0.1.0" }),
-          newSession: vi.fn().mockResolvedValue({
-            sessionId: "model-sess",
-            configOptions: [
-              {
-                id: "model",
-                name: "Model",
-                type: "select",
-                currentValue: "gpt-4",
-                options: [
-                  { value: "gpt-4", name: "GPT-4" },
-                  { value: "gpt-4o", name: "GPT-4o" },
-                ],
-              },
-            ],
-          }),
-          setSessionConfigOption,
-          prompt: vi.fn(),
-        } as any;
-      } as any);
-
-      modelConfig.modelId = "gpt-4o";
-      const session = await getOrCreateSession("T-Model", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-
-      expect(setSessionConfigOption).toHaveBeenCalledWith({
-        sessionId: "model-sess",
-        configId: "model",
-        value: "gpt-4o",
-      });
-      expect(mockBridge.sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/models",
-        expect.objectContaining({
-          task_id: "T-Model",
-          session_id: "model-sess",
-          current_model: "gpt-4o",
-        }),
-      );
-      modelConfig.modelId = undefined;
-    });
-
-    it("should drop the cached session when the agent process dies", async () => {
-      const mockBridge: any = fakeBridge();
-      await getOrCreateSession("T-Exit", ["node", "agent.js"], [], { env: {} } as any, mockBridge);
-      expect(activeSessions.has("T-Exit")).toBe(true);
-
-      spawnedAgents[spawnedAgents.length - 1].emit("exit", 1, null);
-      expect(activeSessions.has("T-Exit")).toBe(false);
-    });
-  });
-
   describe("openAgentConnection", () => {
     beforeEach(() => {
       spawnedAgents.length = 0;
     });
 
-    it("should pass clientInfo and plan capability in initialize handshake", async () => {
+    it("should pass clientInfo and the url elicitation capability in initialize handshake", async () => {
       const initSpy = vi.fn().mockResolvedValue({
         protocolVersion: "0.1.0",
       });
@@ -2563,7 +119,6 @@ describe("index", () => {
 
       await openAgentConnection({
         acpCmdArgs: ["node", "agent.js"],
-        mcpBridge: fakeBridge(),
         label: "init-test",
       });
 
@@ -2574,7 +129,7 @@ describe("index", () => {
             version: expect.any(String),
           }),
           clientCapabilities: expect.objectContaining({
-            plan: {},
+            elicitation: { url: {} },
           }),
         }),
       );
@@ -2584,7 +139,6 @@ describe("index", () => {
       const { spawn } = await import("node:child_process");
       await openAgentConnection({
         acpCmdArgs: ["node", "agent.js"],
-        mcpBridge: fakeBridge(),
         label: "spawn-plain",
       });
 
@@ -2608,8 +162,7 @@ describe("index", () => {
       try {
         await openAgentConnection({
           acpCmdArgs: ["npx", "-y", "@zed-industries/codex-acp"],
-          mcpBridge: fakeBridge(),
-          label: "spawn-windows",
+            label: "spawn-windows",
         });
       } finally {
         Object.defineProperty(process, "platform", { value: platform, configurable: true });
@@ -2635,20 +188,18 @@ describe("index", () => {
         } as any;
       } as any);
 
-      const onExit = vi.fn();
       const agent = await openAgentConnection({
         acpCmdArgs: ["node", "agent.js"],
-        mcpBridge: fakeBridge(),
         label: "login",
-        onExit,
       });
+      const dispose = vi.spyOn(agent.acpClient, "dispose");
 
       expect(agent.initResult.authMethods).toHaveLength(1);
       expect(errorSpy.mock.calls.flat().join("\n")).toContain("Agent login (agent-login)");
 
       agent.process.emit("error", new Error("spawn failed"));
       agent.process.stdin.emit("error", new Error("EPIPE"));
-      expect(onExit).toHaveBeenCalledTimes(1);
+      expect(dispose).toHaveBeenCalledTimes(1);
 
       errorSpy.mockRestore();
     });
@@ -2669,7 +220,6 @@ describe("index", () => {
       mockInit();
       const agent = await openAgentConnection({
         acpCmdArgs: ["node", "agent.js"],
-        mcpBridge: fakeBridge(),
         label: "list-models",
       });
 
@@ -2688,7 +238,6 @@ describe("index", () => {
       mockInit();
       const agent = await openAgentConnection({
         acpCmdArgs: ["node", "agent.js"],
-        mcpBridge: fakeBridge(),
         label: "task t1",
       });
 
@@ -2709,7 +258,6 @@ describe("index", () => {
       mockInit();
       const agent = await openAgentConnection({
         acpCmdArgs: ["node", "agent.js"],
-        mcpBridge: fakeBridge(),
         label: "task t1",
       });
 
@@ -2740,7 +288,7 @@ describe("index", () => {
       } as any);
 
       await expect(
-        openAgentConnection({ acpCmdArgs: ["node", "agent.js"], mcpBridge: fakeBridge(), label: "list-models" }),
+        openAgentConnection({ acpCmdArgs: ["node", "agent.js"], label: "list-models" }),
       ).rejects.toThrow("ACP connection closed");
       expect(errorSpy).toHaveBeenCalledWith(
         "[acp] The agent's last output:\nE1002 fatal: no credentials",
@@ -2817,6 +365,61 @@ describe("index", () => {
         "cwd does not exist",
       );
       expect(connection.authenticate).not.toHaveBeenCalled();
+    });
+
+    const authRequired = () =>
+      Object.assign(new Error("Authentication required"), { code: AUTH_REQUIRED_CODE });
+
+    it("should log in and retry when the agent refuses without a login", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const connection: any = {
+        newSession: vi.fn().mockRejectedValueOnce(authRequired()).mockResolvedValue({ sessionId: "s2" }),
+        authenticate: vi.fn().mockResolvedValue({}),
+      };
+
+      const result = await createSessionWithAuth(connection, {} as any, auth);
+
+      expect(result.sessionId).toBe("s2");
+      expect(connection.authenticate).toHaveBeenCalledWith({ methodId: "agent-login" });
+      expect(errorSpy).toHaveBeenCalledWith(
+        "[auth] Agent requires authentication before a session can start.",
+      );
+      errorSpy.mockRestore();
+    });
+
+    it("should report a login that does not help as an authentication failure", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const connection: any = {
+        newSession: vi.fn().mockRejectedValue(authRequired()),
+        authenticate: vi.fn().mockResolvedValue({}),
+      };
+
+      const failure = await createSessionWithAuth(connection, {} as any, auth).catch((e) => e);
+
+      expect(failure).toBeInstanceOf(AuthenticationFailed);
+      expect(failure).toMatchObject({ name: "AuthenticationFailed", hasLogin: true });
+      expect(failure.message).toBe("Authentication required");
+      errorSpy.mockRestore();
+    });
+
+    it("should say when the agent offers no login at all", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const connection: any = {
+        newSession: vi.fn().mockRejectedValue(authRequired()),
+        authenticate: vi.fn(),
+      };
+
+      const failure = await createSessionWithAuth(connection, {} as any, { ...auth, methods: [] }).catch(
+        (e) => e,
+      );
+
+      expect(failure).toBeInstanceOf(AuthenticationFailed);
+      expect(failure.hasLogin).toBe(false);
+      errorSpy.mockRestore();
+    });
+
+    it("should describe a failure that is not an Error", () => {
+      expect(new AuthenticationFailed("no").message).toBe("no");
     });
   });
 
@@ -3036,19 +639,17 @@ describe("index", () => {
       errorSpy.mockRestore();
     });
 
-    it("leaves native mode off unless --acp-version is given", () => {
-      const options = parseGatewayArgs(["--agent", "gemini"]);
-      expect(options.acpVersion).toBeUndefined();
-      expect(options.acpUrl).toBeUndefined();
+    it("leaves --acp-url unset unless it is given", () => {
+      expect(parseGatewayArgs(["--agent", "gemini"]).acpUrl).toBeUndefined();
     });
 
-    it.each([["1", 1], ["2", 2]])("reads --acp-version %s", (value, version) => {
+    it("still accepts --acp-version 1, from launch scripts written before v1 was the only mode", () => {
       expect(
-        parseGatewayArgs(["--acp-version", value, "--acp-url", "wss://x/api/acp/v1", "gemini"]),
-      ).toMatchObject({ acpVersion: version, acpUrl: "wss://x/api/acp/v1", rest: ["gemini"] });
+        parseGatewayArgs(["--acp-version", "1", "--acp-url", "wss://x/api/acp/v1", "gemini"]),
+      ).toMatchObject({ command: "run", acpUrl: "wss://x/api/acp/v1", rest: ["gemini"] });
     });
 
-    it.each([["3"], ["v1"], [undefined]])("refuses --acp-version %s", (value) => {
+    it.each([["2"], ["3"], ["v1"], [undefined]])("refuses --acp-version %s", (value) => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {
         throw new Error("exit");
@@ -3056,7 +657,7 @@ describe("index", () => {
 
       expect(() => parseGatewayArgs(value ? ["--acp-version", value] : ["--acp-version"])).toThrow("exit");
 
-      expect(errorSpy).toHaveBeenCalledWith("[acp-gateway] --acp-version must be 1 or 2");
+      expect(errorSpy).toHaveBeenCalledWith("[acp-gateway] --acp-version must be 1, the only version supported");
       expect(exitSpy).toHaveBeenCalledWith(1);
       errorSpy.mockRestore();
       exitSpy.mockRestore();
@@ -3558,44 +1159,6 @@ describe("index", () => {
       expect(resolved.env).toEqual({ K: "v" });
     });
 
-    it("reports who the registry says the agent is, before it has been started", async () => {
-      // This is the only name available while the gateway is idle: the agent
-      // itself does not speak until a task starts it, and until then a
-      // workspace can only see the gateway.
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const fetchImpl = vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({
-          version: "1.0.0",
-          agents: [
-            {
-              id: "antigravity-acp",
-              name: "Google Antigravity",
-              version: "1.1.1",
-              description: "…",
-              distribution: { npx: { package: "antigravity-acp@1.1.1", args: [] } },
-            },
-          ],
-        }),
-      });
-
-      const resolved = await resolveAgentCommand(
-        options({ agentId: "antigravity-acp" }),
-        [],
-        fetchImpl as any,
-      );
-      errorSpy.mockRestore();
-
-      expect(resolved.identity).toEqual({ name: "Google Antigravity", version: "1.1.1" });
-    });
-
-    it("has no identity to report for a command given after --", async () => {
-      // Nothing named it, so there is nothing to say until the agent does.
-      const resolved = await resolveAgentCommand(options(), ["gemini", "--acp"], vi.fn() as any);
-
-      expect(resolved.identity).toBeUndefined();
-    });
-
     it("should surface a registry id that does not exist", async () => {
       const fetchImpl = vi.fn().mockResolvedValue({
         ok: true,
@@ -3647,9 +1210,7 @@ describe("index", () => {
       (command) => {
         const workspace = loadWorkspace(command, undefined, emptyWorkspaceDir());
 
-        expect(workspace.configs).toEqual([]);
-        expect(workspace.agentrqConfig.env).toEqual({});
-        expect(workspace.mcpBridge.getSessionId()).toBeUndefined();
+        expect(workspace).toEqual({ configs: [], agentrqConfig: { name: "none", type: "http", env: {} } });
       },
     );
 
@@ -3658,53 +1219,38 @@ describe("index", () => {
       // Broken on purpose: had it been read, this would throw.
       writeFileSync(join(dir, ".mcp.json"), "{ not json");
 
-      expect(loadWorkspace("list-models", undefined, dir).configs).toEqual([]);
+      expect(loadWorkspace("list-models", undefined, dir).agentrqConfig.name).toBe("none");
     });
 
-    it.each(["agent-info", "list-auth-methods", "login", "logout"] as const)(
-      "should still use a config named with --mcp-json for --%s",
-      (command) => {
-        const file = writeMcpJson(emptyWorkspaceDir(), "servers.json");
-
-        const workspace = loadWorkspace(command, file, emptyWorkspaceDir());
-
-        expect(workspace.agentrqConfig.name).toBe("agentrq-ws");
-        expect(workspace.mcpBridge.getServerName()).toBe("agentrq-ws");
-      },
-    );
-
-    it("should never connect --list-models to the workspace, even one named with --mcp-json", async () => {
-      const file = writeMcpJson(emptyWorkspaceDir(), "servers.json");
-
-      const workspace = loadWorkspace("list-models", file, emptyWorkspaceDir());
-
-      expect(workspace.agentrqConfig.name).toBe("agentrq-ws");
-      expect(workspace.mcpBridge.getServerName()).toBeUndefined();
-      await expect(
-        workspace.mcpBridge.callTool("elicit", {}),
-      ).rejects.toThrow("No agentrq workspace is configured");
+    it("should not read a config named with --mcp-json for a one-shot command either", () => {
+      expect(loadWorkspace("login", "/nowhere/servers.json", emptyWorkspaceDir()).agentrqConfig.name).toBe("none");
     });
 
-    it("should still report a --mcp-json path that is wrong", () => {
-      expect(() =>
-        loadWorkspace("list-models", "/nowhere/servers.json", emptyWorkspaceDir()),
-      ).toThrow();
-    });
-
-    it("should still require a .mcp.json to run tasks", () => {
+    it("should still require a .mcp.json to run the bridge", () => {
       expect(() => loadWorkspace("run", undefined, emptyWorkspaceDir())).toThrow(
         "Could not find .mcp.json",
       );
     });
 
-    it("should connect running tasks to the workspace it finds", () => {
+    it("should report a --mcp-json path that is wrong", () => {
+      expect(() =>
+        loadWorkspace("run", "/nowhere/servers.json", emptyWorkspaceDir()),
+      ).toThrow();
+    });
+
+    it("should pick the AgentRQ server from the workspace it finds", () => {
       const dir = emptyWorkspaceDir();
       writeMcpJson(dir);
 
       const workspace = loadWorkspace("run", undefined, dir);
-
+      expect(workspace.agentrqConfig.name).toBe("agentrq-ws");
       expect(workspace.configs.map((c) => c.name)).toEqual(["agentrq-ws"]);
-      expect(workspace.mcpBridge.getServerName()).toBe("agentrq-ws");
+    });
+
+    it("should read a config named with --mcp-json", () => {
+      const file = writeMcpJson(emptyWorkspaceDir(), "servers.json");
+
+      expect(loadWorkspace("run", file, emptyWorkspaceDir()).agentrqConfig.url).toBe("http://localhost:1/mcp");
     });
   });
 
@@ -3718,37 +1264,6 @@ describe("index", () => {
       expect(existsSync(isolated.dir)).toBe(false);
       // Removing twice, or after something else did, is harmless.
       expect(() => isolated.remove()).not.toThrow();
-    });
-  });
-
-  describe("createDetachedBridge", () => {
-    it("should fail tool calls, drop notifications, and close quietly", async () => {
-      const bridge = createDetachedBridge();
-
-      await expect(bridge.callTool("elicit", {})).rejects.toThrow(
-        "No agentrq workspace is configured",
-      );
-      await expect(bridge.sendNotification("notifications/x", {})).resolves.toBeUndefined();
-      expect(bridge.getSessionId()).toBeUndefined();
-      expect(bridge.getServerName()).toBeUndefined();
-      expect(bridge.getAdvertisedTools()).toBeUndefined();
-      await expect(bridge.close()).resolves.toBeUndefined();
-    });
-
-    it("should not print an error when the agent shares its slash commands", async () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      const client = new AgentRQACPClient(createDetachedBridge());
-
-      await client.sessionUpdate({
-        sessionId: "s1",
-        update: {
-          sessionUpdate: "available_commands_update",
-          availableCommands: [{ name: "init", description: "d" }],
-        },
-      } as acp.SessionNotification);
-
-      expect(errorSpy).not.toHaveBeenCalled();
-      errorSpy.mockRestore();
     });
   });
 
@@ -3780,7 +1295,7 @@ describe("index", () => {
         agentCapabilities: { auth: { logout: {} } },
       });
 
-      await runAgentCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+      await runAgentCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig.env);
 
       const printed = logSpy.mock.calls.flat().join("\n");
       expect(printed).toContain("Agent login (agent-login)");
@@ -3796,7 +1311,7 @@ describe("index", () => {
       const newSession = vi.fn().mockResolvedValue({ sessionId: "m-sess", configOptions: [] });
       mockConnection({ newSession });
 
-      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig.env);
 
       const sessionCwd = newSession.mock.calls[0][0].cwd;
       expect(sessionCwd).not.toBe(process.cwd());
@@ -3815,7 +1330,7 @@ describe("index", () => {
       mockConnection({ initialize: vi.fn().mockRejectedValue(new Error("boom")) });
 
       await expect(
-        runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig, fakeBridge()),
+        runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig.env),
       ).rejects.toThrow();
 
       const cwd = (vi.mocked(spawn).mock.calls.at(-1)![2] as any).cwd;
@@ -3827,7 +1342,7 @@ describe("index", () => {
       const { spawn } = await import("node:child_process");
       mockConnection({});
 
-      await runAgentCommand("agent-info", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+      await runAgentCommand("agent-info", ["gemini", "--acp"], agentrqConfig.env);
 
       expect(vi.mocked(spawn).mock.calls.at(-1)![2]).not.toHaveProperty("cwd");
     });
@@ -3851,7 +1366,7 @@ describe("index", () => {
         }),
       });
 
-      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig.env);
 
       const printed = logSpy.mock.calls.flat().join("\n");
       expect(printed).toContain("Models supported by \"gemini --acp\":");
@@ -3879,8 +1394,7 @@ describe("index", () => {
       await runAgentCommand(
         "list-models",
         ["gemini", "--acp"],
-        { name: "none", type: "http", env: {} },
-        createDetachedBridge(),
+        {},
       );
 
       expect(logSpy.mock.calls.flat().join("\n")).toContain("gemini-pro");
@@ -3913,8 +1427,7 @@ describe("index", () => {
       await runAgentCommand(
         "list-models",
         ["gemini", "--acp"],
-        agentrqConfig,
-        fakeBridge(),
+        agentrqConfig.env,
         undefined,
         true,
       );
@@ -3948,8 +1461,7 @@ describe("index", () => {
       await runAgentCommand(
         "list-models",
         ["gemini", "--acp"],
-        agentrqConfig,
-        fakeBridge(),
+        agentrqConfig.env,
         undefined,
         true,
       );
@@ -3973,7 +1485,7 @@ describe("index", () => {
         agentCapabilities: { providers: true },
       });
 
-      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig.env);
 
       const printed = logSpy.mock.calls.flat().join("\n");
       expect(printed).toContain("Configurable providers for \"gemini --acp\":");
@@ -3986,7 +1498,7 @@ describe("index", () => {
         newSession: vi.fn().mockResolvedValue({ sessionId: "m-sess", configOptions: [] }),
       });
 
-      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+      await runAgentCommand("list-models", ["gemini", "--acp"], agentrqConfig.env);
 
       const printed = logSpy.mock.calls.flat().join("\n");
       expect(printed).toContain("No configurable models advertised by \"gemini --acp\".");
@@ -4003,7 +1515,7 @@ describe("index", () => {
         },
       });
 
-      await runAgentCommand("agent-info", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+      await runAgentCommand("agent-info", ["gemini", "--acp"], agentrqConfig.env);
 
       const printed = String(logSpy.mock.calls.at(-1)[0]);
       expect(printed).toContain("gemini --acp");
@@ -4017,7 +1529,7 @@ describe("index", () => {
     it("should report agents that advertise no login", async () => {
       mockConnection({});
 
-      await runAgentCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+      await runAgentCommand("list-auth-methods", ["gemini", "--acp"], agentrqConfig.env);
 
       expect(logSpy.mock.calls.flat().join("\n")).toContain("no authentication methods");
     });
@@ -4027,7 +1539,7 @@ describe("index", () => {
         agentCapabilities: { auth: { logout: {} } },
       });
 
-      await runAgentCommand("logout", ["gemini", "--acp"], agentrqConfig, fakeBridge());
+      await runAgentCommand("logout", ["gemini", "--acp"], agentrqConfig.env);
 
       expect(connection.logout).toHaveBeenCalledWith({});
     });
@@ -4040,7 +1552,7 @@ describe("index", () => {
         ],
       });
 
-      await runAgentCommand("login", ["gemini", "--acp"], agentrqConfig, fakeBridge(), "oauth");
+      await runAgentCommand("login", ["gemini", "--acp"], agentrqConfig.env, "oauth");
 
       expect(connection.authenticate).toHaveBeenCalledWith({ methodId: "oauth" });
     });
@@ -4051,13 +1563,14 @@ describe("index", () => {
       });
 
       await expect(
-        runAgentCommand("login", ["gemini", "--acp"], agentrqConfig, fakeBridge(), "missing"),
+        runAgentCommand("login", ["gemini", "--acp"], agentrqConfig.env, "missing"),
       ).rejects.toThrow(/Unknown authentication method/);
       expect(spawnedAgents[0].kill).toHaveBeenCalled();
     });
   });
 
   describe("nativeOptionsFor", () => {
+    const ws = (agentrqConfig: McpServerConfig) => ({ configs: [agentrqConfig], agentrqConfig });
     const agentrq: McpServerConfig = {
       name: "agentrq",
       type: "http",
@@ -4070,8 +1583,7 @@ describe("index", () => {
         "--acp-version", "1", "--agent", "codex-acp", "--model", "m", "--effort", "high", "--max-concurrency", "4",
         "--permission-timeout", "5", "--auth-method", "chatgpt",
       ]);
-      expect(nativeOptionsFor(options, ["npx", "codex-acp"], agentrq, "/work")).toEqual({
-        version: 1,
+      expect(nativeOptionsFor(options, ["npx", "codex-acp"], ws(agentrq), "/work")).toEqual({
         acpCmdArgs: ["npx", "codex-acp"],
         env: { A: "1" },
         endpoint: "wss://4hro0x9eslxd.mcp.agentrq.com/api/acp/v1",
@@ -4083,6 +1595,7 @@ describe("index", () => {
         permissionTimeoutMinutes: 5,
         authMethodId: "chatgpt",
         cwd: "/work",
+        mcpServers: [agentrq],
       });
     });
 
@@ -4100,36 +1613,43 @@ describe("index", () => {
     });
 
     it("names a command-line agent by its basename and honours --acp-url", () => {
-      const options = parseGatewayArgs(["--acp-version", "2", "--acp-url", "ws://other/x"]);
-      const native = nativeOptionsFor(options, ["/opt/bin/gemini", "--acp"], agentrq);
-      expect(native).toMatchObject({ version: 2, agentId: "gemini", endpoint: "ws://other/x", cwd: process.cwd() });
+      const options = parseGatewayArgs(["--acp-url", "ws://other/x"]);
+      const native = nativeOptionsFor(options, ["/opt/bin/gemini", "--acp"], ws(agentrq));
+      expect(native).toMatchObject({ agentId: "gemini", endpoint: "ws://other/x", cwd: process.cwd() });
     });
 
     it("needs the workspace token", () => {
       const options = parseGatewayArgs(["--acp-version", "1"]);
-      expect(nativeOptionsFor(options, ["a"], { ...agentrq, url: "https://h/" })).toBe(
-        "native mode needs the workspace token from .mcp.json",
+      expect(nativeOptionsFor(options, ["a"], ws({ ...agentrq, url: "https://h/" }))).toBe(
+        "acp-gateway needs the workspace token from .mcp.json",
       );
+    });
+
+    it("needs no URL in .mcp.json when --acp-url names the endpoint", () => {
+      const options = parseGatewayArgs(["--acp-url", "wss://x/acp"]);
+      expect(
+        nativeOptionsFor(options, ["a"], ws({ name: "x", type: "http", headers: { Authorization: "Bearer t" } })),
+      ).toMatchObject({ endpoint: "wss://x/acp", token: "t" });
     });
 
     it("needs a URL, from .mcp.json or --acp-url", () => {
       const options = parseGatewayArgs(["--acp-version", "1"]);
       expect(
-        nativeOptionsFor(options, ["a"], { name: "x", type: "http", headers: { Authorization: "Bearer t" } }),
+        nativeOptionsFor(options, ["a"], ws({ name: "x", type: "http", headers: { Authorization: "Bearer t" } })),
       ).toMatch(/needs the AgentRQ URL/);
     });
 
     it("explains a URL it cannot read", () => {
       const options = parseGatewayArgs(["--acp-version", "1"]);
       expect(
-        nativeOptionsFor(options, ["a"], { name: "x", type: "http", url: "not a url", headers: { Authorization: "Bearer t" } }),
+        nativeOptionsFor(options, ["a"], ws({ name: "x", type: "http", url: "not a url", headers: { Authorization: "Bearer t" } })),
       ).toMatch(/cannot work out the AgentRQ endpoint from "not a url"; pass --acp-url/);
     });
 
     it("starts native mode with those options", async () => {
       const run = vi.fn(async () => {});
       const exit = vi.fn();
-      await startNativeMode(parseGatewayArgs(["--acp-version", "1"]), ["a"], agentrq, run, exit);
+      await startNativeMode(parseGatewayArgs(["--acp-version", "1"]), ["a"], ws(agentrq), run, exit);
       expect(run).toHaveBeenCalledWith(expect.objectContaining({ endpoint: "wss://4hro0x9eslxd.mcp.agentrq.com/api/acp/v1", token: "t" }));
       expect(exit).not.toHaveBeenCalled();
     });
@@ -4138,16 +1658,147 @@ describe("index", () => {
       const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
       const run = vi.fn(async () => {});
       const exit = vi.fn();
-      await startNativeMode(parseGatewayArgs(["--acp-version", "1"]), ["a"], { name: "x", type: "http", url: "https://h/" }, run, exit);
-      expect(errorSpy).toHaveBeenCalledWith("[acp-gateway] native mode needs the workspace token from .mcp.json");
+      await startNativeMode(parseGatewayArgs(["--acp-version", "1"]), ["a"], ws({ name: "x", type: "http", url: "https://h/" }), run, exit);
+      expect(errorSpy).toHaveBeenCalledWith("[acp-gateway] acp-gateway needs the workspace token from .mcp.json");
       expect(exit).toHaveBeenCalledWith(1);
       expect(run).not.toHaveBeenCalled();
       errorSpy.mockRestore();
     });
 
-    it("defaults to version 1 when called without one", () => {
+    it("logs the agent in at this terminal only when there is one", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const options = parseGatewayArgs(["--auth-method", "oauth"]);
+      expect((nativeOptionsFor(options, ["gemini"], ws(agentrq), "/w", false) as any).login).toBeUndefined();
+
+      const native = nativeOptionsFor(options, [process.execPath, "agent.js"], ws(agentrq), "/w", true) as any;
+      // The mocked agent offers no login methods, so the login has nothing to do.
+      await expect(native.login()).resolves.toBeUndefined();
+      expect(errorSpy.mock.calls.flat().join("\n")).toContain("advertises no authentication methods");
+      errorSpy.mockRestore();
+    });
+
+    it("always connects to the ACP v1 endpoint", () => {
       const options = parseGatewayArgs([]);
-      expect(nativeOptionsFor(options, [], agentrq)).toMatchObject({ version: 1, agentId: "" });
+      expect(nativeOptionsFor(options, [], ws(agentrq))).toMatchObject({
+        endpoint: "wss://4hro0x9eslxd.mcp.agentrq.com/api/acp/v1",
+        agentId: "",
+      });
+    });
+  });
+
+  describe("runGateway", () => {
+    let errorSpy: any;
+
+    beforeEach(() => {
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      errorSpy.mockRestore();
+    });
+
+    /** A workspace directory whose .mcp.json names an AgentRQ server. */
+    function workspaceDir(): string {
+      const dir = join(mkdtempSync(join(tmpdir(), "acp-gw-run-")), "a", "b", "c", "d");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, ".mcp.json"),
+        JSON.stringify({
+          mcpServers: { agentrq: { type: "http", url: "https://h.mcp.agentrq.com/?token=t", env: { A: "1" } } },
+        }),
+      );
+      return dir;
+    }
+
+    function deps(over: Record<string, any> = {}) {
+      return {
+        resolve: vi.fn(async () => ({ command: [process.execPath, "agent.js"] })),
+        agentCommand: vi.fn(async () => {}),
+        bridge: vi.fn(async () => {}),
+        exit: vi.fn(),
+        startDir: workspaceDir(),
+        ...over,
+      };
+    }
+
+    it("bridges the agent to the workspace's ACP endpoint for run", async () => {
+      const d = deps();
+      const options = parseGatewayArgs([]);
+
+      await runGateway(options, ["agent"], d);
+
+      expect(d.resolve).toHaveBeenCalledWith(options, ["agent"]);
+      expect(d.bridge).toHaveBeenCalledWith(
+        options,
+        [process.execPath, "agent.js"],
+        {
+          agentrqConfig: expect.objectContaining({ name: "agentrq", env: { A: "1" } }),
+          configs: [expect.objectContaining({ name: "agentrq" })],
+        },
+      );
+      expect(d.agentCommand).not.toHaveBeenCalled();
+      expect(d.exit).not.toHaveBeenCalled();
+    });
+
+    it("adds the registry entry's env to the agent's", async () => {
+      const d = deps({
+        resolve: vi.fn(async () => ({ command: [process.execPath], env: { B: "2" } })),
+      });
+
+      await runGateway(parseGatewayArgs(["--agent", "x"]), [], d);
+
+      expect((d.bridge.mock.calls[0] as any[])[2].agentrqConfig.env).toEqual({ A: "1", B: "2" });
+    });
+
+    it("runs a one-shot command without a workspace and exits 0", async () => {
+      const d = deps({ startDir: tmpdir() });
+
+      await runGateway(parseGatewayArgs(["--login", "oauth", "--json"]), ["agent"], d);
+
+      expect(d.agentCommand).toHaveBeenCalledWith(
+        "login",
+        [process.execPath, "agent.js"],
+        {},
+        "oauth",
+        true,
+      );
+      expect(d.bridge).not.toHaveBeenCalled();
+      expect(d.exit).toHaveBeenCalledWith(0);
+    });
+
+    it("says why it cannot run, without a stack trace, and exits 1", async () => {
+      const root = mkdtempSync(join(tmpdir(), "acp-gw-noworkspace-"));
+      const dir = join(root, "a", "b", "c", "d");
+      mkdirSync(dir, { recursive: true });
+      const d = deps({ startDir: dir });
+
+      await runGateway(parseGatewayArgs([]), ["agent"], d);
+
+      expect(errorSpy.mock.calls[0][0]).toMatch(/^\[acp-gateway\] Could not find \.mcp\.json/);
+      expect(d.exit).toHaveBeenCalledWith(1);
+      expect(d.bridge).not.toHaveBeenCalled();
+    });
+
+    it("refuses an agent command that is not installed", async () => {
+      const d = deps({
+        resolve: vi.fn(async () => ({ command: ["definitely-not-an-agent-xyz"] })),
+      });
+
+      await runGateway(parseGatewayArgs([]), ["definitely-not-an-agent-xyz"], d);
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Agent command "definitely-not-an-agent-xyz" was not found'),
+      );
+      expect(d.exit).toHaveBeenCalledWith(1);
+    });
+
+    it("reports a failure that is not an Error as it is", async () => {
+      const d = deps({ resolve: vi.fn(async () => Promise.reject("registry down")) });
+
+      await runGateway(parseGatewayArgs([]), [], d);
+
+      expect(errorSpy).toHaveBeenCalledWith("[acp-gateway] registry down");
+      expect(d.exit).toHaveBeenCalledWith(1);
     });
   });
 
@@ -4176,7 +1827,6 @@ describe("index", () => {
           "--max-concurrency",
           "--permission-timeout",
           "--mcp-json",
-          "--acp-version",
           "--acp-url",
           "--verbose",
           "--help",
@@ -4219,12 +1869,6 @@ describe("index", () => {
     });
   });
 
-  describe("authConfig", () => {
-    it("should start out with no preferred login method", () => {
-      expect(authConfig).toEqual({});
-    });
-  });
-
   describe("isInteractiveTerminal", () => {
     it("should be true only when both stdin and stderr are a TTY", () => {
       const original = { stdin: process.stdin.isTTY, stderr: process.stderr.isTTY };
@@ -4239,700 +1883,6 @@ describe("index", () => {
         process.stdin.isTTY = original.stdin;
         process.stderr.isTTY = original.stderr;
       }
-    });
-  });
-
-  describe("pickHumanApprovalMode", () => {
-    // The real modes codex-acp advertises. Its default is "agent", whose
-    // reviewer is an automated Guardian Review that approves on the human's
-    // behalf — so tool calls never reach agentrq.
-    const codexModes: any = {
-      currentModeId: "agent",
-      availableModes: [
-        { id: "read-only", name: "Ask for approval", _meta: { kind: "standard" } },
-        { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
-        { id: "agent-full-access", name: "Full access", _meta: { kind: "full_access" } },
-      ],
-    };
-
-    it("should pick the human-approval mode over auto-reviewing and full-access modes", () => {
-      expect(pickHumanApprovalMode(codexModes)).toBe("read-only");
-    });
-
-    it("should return undefined when the agent advertises no modes", () => {
-      expect(pickHumanApprovalMode(undefined)).toBeUndefined();
-      expect(pickHumanApprovalMode(null)).toBeUndefined();
-      expect(pickHumanApprovalMode({ currentModeId: "x", availableModes: [] } as any)).toBeUndefined();
-    });
-
-    it("should return undefined when every available mode auto-approves", () => {
-      const modes: any = {
-        currentModeId: "agent",
-        availableModes: [
-          { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
-          { id: "yolo", name: "Never ask", _meta: { kind: "full_access" } },
-        ],
-      };
-      expect(pickHumanApprovalMode(modes)).toBeUndefined();
-    });
-
-    it("should fall back to the first non-auto-approving mode when none names approval", () => {
-      const modes: any = {
-        currentModeId: "fast",
-        availableModes: [
-          { id: "fast", name: "Full access", _meta: { kind: "full_access" } },
-          { id: "careful", name: "Careful" },
-          { id: "other", name: "Other" },
-        ],
-      };
-      expect(pickHumanApprovalMode(modes)).toBe("careful");
-    });
-
-    it("should tolerate modes without _meta or with a non-string kind", () => {
-      const modes: any = {
-        currentModeId: "a",
-        availableModes: [
-          { id: "a", name: "Full access" },
-          { id: "b", name: "Ask first", _meta: { kind: 42 } },
-        ],
-      };
-      expect(pickHumanApprovalMode(modes)).toBe("b");
-    });
-  });
-
-  describe("enforceHumanApprovalMode", () => {
-    let consoleSpy: any;
-
-    beforeEach(() => {
-      consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    });
-
-    it("should switch out of an auto-approving default mode", async () => {
-      const connection: any = { setSessionMode: vi.fn().mockResolvedValue({}) };
-      const sessionResult: any = {
-        sessionId: "sess-1",
-        modes: {
-          currentModeId: "agent",
-          availableModes: [
-            { id: "read-only", name: "Ask for approval", _meta: { kind: "standard" } },
-            { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
-          ],
-        },
-      };
-
-      await enforceHumanApprovalMode(connection, sessionResult);
-
-      expect(connection.setSessionMode).toHaveBeenCalledWith({
-        sessionId: "sess-1",
-        modeId: "read-only",
-      });
-    });
-
-    it("should do nothing when the agent advertises no modes", async () => {
-      const connection: any = { setSessionMode: vi.fn() };
-
-      await enforceHumanApprovalMode(connection, { sessionId: "sess-1" } as any);
-      await enforceHumanApprovalMode(connection, {
-        sessionId: "sess-1",
-        modes: { currentModeId: "x", availableModes: [] },
-      } as any);
-
-      expect(connection.setSessionMode).not.toHaveBeenCalled();
-    });
-
-    it("should not switch when already in a human-approval mode", async () => {
-      const connection: any = { setSessionMode: vi.fn() };
-      const sessionResult: any = {
-        sessionId: "sess-1",
-        modes: {
-          currentModeId: "read-only",
-          availableModes: [
-            { id: "read-only", name: "Ask for approval", _meta: { kind: "standard" } },
-            { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
-          ],
-        },
-      };
-
-      await enforceHumanApprovalMode(connection, sessionResult);
-
-      expect(connection.setSessionMode).not.toHaveBeenCalled();
-    });
-
-    it("should warn and not switch when every mode auto-approves", async () => {
-      const connection: any = { setSessionMode: vi.fn() };
-      const sessionResult: any = {
-        sessionId: "sess-1",
-        modes: {
-          currentModeId: "agent",
-          availableModes: [
-            { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
-            { id: "full", name: "Full access", _meta: { kind: "full_access" } },
-          ],
-        },
-      };
-
-      await enforceHumanApprovalMode(connection, sessionResult);
-
-      expect(connection.setSessionMode).not.toHaveBeenCalled();
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("no mode that defers approvals to the human"),
-      );
-    });
-
-    it("should log and not throw when setSessionMode fails", async () => {
-      const connection: any = {
-        setSessionMode: vi.fn().mockRejectedValue(new Error("unsupported")),
-      };
-      const sessionResult: any = {
-        sessionId: "sess-1",
-        modes: {
-          currentModeId: "agent",
-          availableModes: [
-            { id: "read-only", name: "Ask for approval", _meta: { kind: "standard" } },
-            { id: "agent", name: "Approve for me", _meta: { kind: "auto_review" } },
-          ],
-        },
-      };
-
-      await expect(
-        enforceHumanApprovalMode(connection, sessionResult),
-      ).resolves.toBeUndefined();
-      expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to set session mode"),
-        expect.any(Error),
-      );
-    });
-  });
-
-  describe("task cancellation handling", () => {
-    let errorSpy: any;
-
-    beforeEach(() => {
-      activeSessions.clear();
-      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    });
-
-    afterEach(() => {
-      activeSessions.clear();
-      errorSpy.mockRestore();
-    });
-
-    describe("findActiveSession", () => {
-      it("should find session by direct task key", () => {
-        const mockSession: any = { sessionId: "sess-1", acpClient: { cancelTurn: vi.fn() } };
-        activeSessions.set("task-1", mockSession);
-
-        expect(findActiveSession("task-1")).toBe(mockSession);
-      });
-
-      it("should find session by sessionId match", () => {
-        const mockSession: any = { sessionId: "sess-custom", acpClient: { cancelTurn: vi.fn() } };
-        activeSessions.set("key-other", mockSession);
-
-        expect(findActiveSession("sess-custom")).toBe(mockSession);
-      });
-
-      it("should return the single session if no taskId is provided", () => {
-        const mockSession: any = { sessionId: "sess-only", acpClient: { cancelTurn: vi.fn() } };
-        activeSessions.set("default", mockSession);
-
-        expect(findActiveSession(undefined)).toBe(mockSession);
-      });
-
-      it("should fallback to default keyed session when taskId is given but only 1 session exists", () => {
-        const mockSession: any = { sessionId: "s1", acpClient: { cancelTurn: vi.fn() } };
-        activeSessions.set("default", mockSession);
-
-        expect(findActiveSession("task-new-id")).toBe(mockSession);
-      });
-
-      it("should not fall back to a session that belongs to a different task", () => {
-        // Task A is running; a cancel for queued task B must not abort it.
-        const sessionA: any = { sessionId: "sess-a", acpClient: { cancelTurn: vi.fn() } };
-        activeSessions.set("task-a", sessionA);
-
-        expect(findActiveSession("task-b")).toBeUndefined();
-      });
-
-      it("should return undefined if taskId is not found when multiple sessions exist", () => {
-        activeSessions.set("task-1", { sessionId: "s1" } as any);
-        activeSessions.set("task-2", { sessionId: "s2" } as any);
-        expect(findActiveSession("task-nonexistent")).toBeUndefined();
-        expect(findActiveSession(undefined)).toBeUndefined();
-      });
-    });
-
-    describe("handleTaskCancellation", () => {
-      it("should cancel turn on the matched active session", async () => {
-        const cancelTurn = vi.fn().mockResolvedValue(undefined);
-        const mockSession: any = {
-          sessionId: "sess-100",
-          acpClient: { cancelTurn },
-        };
-        activeSessions.set("task-100", mockSession);
-
-        await handleTaskCancellation("task-100", "cancelled by user");
-
-        expect(cancelTurn).toHaveBeenCalledWith("sess-100");
-        expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("Cancelling session sess-100 for task task-100 (cancelled by user)")
-        );
-      });
-
-      it("should skip a task cancelled while it was still being fetched", async () => {
-        cancelledTaskSeq.clear();
-        const promptMock = vi.fn();
-        const switcher: any = { ensureForTask: vi.fn().mockResolvedValue("s-q1") };
-        const acpClient: any = { flushReply: vi.fn(), reportStopReason: vi.fn() };
-        const connection: any = { prompt: promptMock };
-        const bridge: any = {
-          // The cancel lands while the poll is in flight — the task has no
-          // session yet, so nothing but this flag can stop it.
-          callTool: vi.fn().mockImplementation(async () => {
-            await handleTaskCancellation("task-queued-1");
-            return { content: [{ type: "text", text: "task task-queued-1: do work" }] };
-          }),
-        };
-
-        resetPendingTaskDrain();
-        await drainPendingTasks(bridge, new TaskQueue(1), {
-          acpCmdArgsOrConnection: connection,
-          configsOrSessionSwitcher: switcher,
-          agentrqConfigOrAcpClient: acpClient,
-        });
-
-        expect(promptMock).not.toHaveBeenCalled();
-      });
-
-      it("should not swallow work queued after the cancellation", async () => {
-        // agentrq reuses a chat's id as the task id, so the id cancelled a
-        // moment ago is the same id the user's next message arrives under.
-        cancelledTaskSeq.clear();
-        await handleTaskCancellation("task-queued-2");
-
-        const promptMock = vi.fn().mockResolvedValue({ stopReason: "end_turn" });
-        const switcher: any = { ensureForTask: vi.fn().mockResolvedValue("s-q2") };
-        const acpClient: any = { flushReply: vi.fn(), reportStopReason: vi.fn() };
-        const connection: any = { prompt: promptMock };
-        const bridge: any = {
-          callTool: vi.fn().mockResolvedValue({
-            content: [{ type: "text", text: "task task-queued-2: fresh work" }],
-          }),
-        };
-
-        resetPendingTaskDrain();
-        await drainPendingTasks(bridge, new TaskQueue(1), {
-          acpCmdArgsOrConnection: connection,
-          configsOrSessionSwitcher: switcher,
-          agentrqConfigOrAcpClient: acpClient,
-        });
-
-        expect(promptMock).toHaveBeenCalled();
-      });
-
-      it("should forget the oldest cancellations rather than grow forever", async () => {
-        cancelledTaskSeq.clear();
-        for (let i = 0; i < 250; i++) markTaskCancelled(`task-${i}`);
-
-        expect(cancelledTaskSeq.size).toBe(200);
-        expect(cancelledTaskSeq.has("task-0")).toBe(false);
-        expect(cancelledTaskSeq.has("task-249")).toBe(true);
-      });
-
-      it("should only stop the notification that was queued before the cancel", async () => {
-        cancelledTaskSeq.clear();
-        const older = nextTaskSeq();
-        await handleTaskCancellation("task-two-turns");
-        const newer = nextTaskSeq();
-
-        expect(isTaskCancelled("task-two-turns", older)).toBe(true);
-        expect(isTaskCancelled("task-two-turns", newer)).toBe(false);
-      });
-
-      it("should log when task to cancel is not found", async () => {
-        await handleTaskCancellation("task-missing");
-
-        expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("Received cancellation for task task-missing, but no active session found")
-        );
-      });
-
-      it("should cancel the single session when taskId is omitted and only 1 session exists", async () => {
-        const cancel1 = vi.fn().mockResolvedValue(undefined);
-        activeSessions.set("t1", { sessionId: "s1", acpClient: { cancelTurn: cancel1 } } as any);
-
-        await handleTaskCancellation(undefined, "single shutdown");
-
-        expect(cancel1).toHaveBeenCalledWith("s1");
-        expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("Received cancellation with no taskId (single shutdown). Cancelling active session s1...")
-        );
-      });
-
-      it("should fail closed and not cancel anything when taskId is omitted and multiple sessions exist", async () => {
-        const cancel1 = vi.fn().mockResolvedValue(undefined);
-        const cancel2 = vi.fn().mockResolvedValue(undefined);
-        activeSessions.set("t1", { sessionId: "s1", acpClient: { cancelTurn: cancel1 } } as any);
-        activeSessions.set("t2", { sessionId: "s2", acpClient: { cancelTurn: cancel2 } } as any);
-
-        await handleTaskCancellation(undefined, "multiple active");
-
-        expect(cancel1).not.toHaveBeenCalled();
-        expect(cancel2).not.toHaveBeenCalled();
-        expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("but 2 sessions are active (skipping to avoid aborting unrelated tasks)")
-        );
-      });
-    });
-  });
-
-  describe("choosing a model at runtime", () => {
-    // Everything here rests on one contract: the interface marks a chosen model
-    // pending and only a models notification releases it. So every path has to
-    // end in a report — including the ones that fail — or the picker is left
-    // claiming a model the agent never adopted, with nothing to correct it.
-    beforeEach(() => {
-      activeSessions.clear();
-    });
-
-    afterEach(() => {
-      activeSessions.clear();
-    });
-
-    const known = {
-      configId: "model",
-      currentModelId: "a",
-      models: [
-        { id: "a", name: "Model A", current: true },
-        { id: "b", name: "Model B", current: false },
-      ],
-    };
-
-    /** A session whose ACP set succeeds, reporting the new list back. */
-    const sessionThatSwitches = () => {
-      const sendModelsToWorkspace = vi.fn();
-      const setSessionConfigOption = vi.fn().mockResolvedValue({
-        configOptions: [
-          {
-            id: "model",
-            type: "select",
-            category: "model",
-            currentValue: "b",
-            options: [
-              { value: "a", name: "Model A" },
-              { value: "b", name: "Model B" },
-            ],
-          },
-        ],
-      });
-      const session: any = {
-        sessionId: "sess-1",
-        connection: { setSessionConfigOption },
-        acpClient: { sendModelsToWorkspace, lastModelsFor: () => known },
-      };
-      return { session, sendModelsToWorkspace, setSessionConfigOption };
-    };
-
-    it("switches the named session and reports what the agent ended up on", async () => {
-      const { session, sendModelsToWorkspace, setSessionConfigOption } = sessionThatSwitches();
-      activeSessions.set("task-1", session);
-
-      await handleSetModel({ sessionId: "sess-1", configId: "model", modelId: "b" });
-
-      expect(setSessionConfigOption).toHaveBeenCalledWith({
-        sessionId: "sess-1",
-        configId: "model",
-        value: "b",
-      });
-      // The agent's own answer, not the id that was asked for.
-      expect(sendModelsToWorkspace).toHaveBeenCalledWith(
-        "sess-1",
-        expect.objectContaining({ currentModelId: "b" }),
-      );
-    });
-
-    it("puts back what was true when the agent refuses the switch", async () => {
-      const sendModelsToWorkspace = vi.fn();
-      const session: any = {
-        sessionId: "sess-1",
-        connection: {
-          setSessionConfigOption: vi.fn().mockRejectedValue(new Error("nope")),
-        },
-        acpClient: { sendModelsToWorkspace, lastModelsFor: () => known },
-      };
-      activeSessions.set("task-1", session);
-
-      await handleSetModel({ sessionId: "sess-1", configId: "model", modelId: "b" });
-
-      // Still on "a": the picker reverts instead of hanging on "b" forever.
-      expect(sendModelsToWorkspace).toHaveBeenCalledWith(
-        "sess-1",
-        expect.objectContaining({ currentModelId: "a" }),
-      );
-    });
-
-    it("does not throw when no session matches", async () => {
-      // The session went away between the human clicking and this arriving.
-      await expect(
-        handleSetModel({ sessionId: "sess-gone", configId: "model", modelId: "b" }),
-      ).resolves.toBeUndefined();
-    });
-
-    it("answers for a session that has already ended", async () => {
-      // The agent exited, taking its client with it, so there is nothing left to
-      // set. The picker is still holding a pending model, so what was last true
-      // for that session goes out over the bridge to release it.
-      const sendNotification = vi.fn().mockResolvedValue(undefined);
-      await sendModelsNotification(
-        { sendNotification } as any,
-        "sess-ended",
-        known,
-      );
-      sendNotification.mockClear();
-
-      await handleSetModel(
-        { sessionId: "sess-ended", configId: "model", modelId: "b" },
-        { sendNotification } as any,
-      );
-
-      expect(sendNotification).toHaveBeenCalledWith(
-        "notifications/claude/channel/models",
-        expect.objectContaining({ session_id: "sess-ended", current_model: "a" }),
-      );
-    });
-
-    it("stays quiet about a set that names no session and matches none", async () => {
-      // With no id and nothing running there is nothing to identify, let alone
-      // report on.
-      const sendNotification = vi.fn().mockResolvedValue(undefined);
-
-      await handleSetModel({ configId: "model", modelId: "b" }, { sendNotification } as any);
-
-      expect(sendNotification).not.toHaveBeenCalled();
-    });
-
-    it("stays quiet about a session it has never heard of", async () => {
-      // Nothing was ever reported for it, so there is no truth to put back and
-      // inventing one would be worse than the silence.
-      const sendNotification = vi.fn().mockResolvedValue(undefined);
-
-      await handleSetModel(
-        { sessionId: "sess-never-seen", configId: "model", modelId: "b" },
-        { sendNotification } as any,
-      );
-
-      expect(sendNotification).not.toHaveBeenCalled();
-    });
-
-    it("answers a notification naming no model instead of ignoring it", async () => {
-      const { session, sendModelsToWorkspace, setSessionConfigOption } = sessionThatSwitches();
-      activeSessions.set("task-1", session);
-
-      await handleSetModel({ sessionId: "sess-1", configId: "model" });
-
-      expect(setSessionConfigOption).not.toHaveBeenCalled();
-      // A malformed notification is still a pending picker on the other end.
-      expect(sendModelsToWorkspace).toHaveBeenCalledWith("sess-1", known);
-    });
-
-    it("refuses a model the session never advertised, and says what it has", async () => {
-      const { session, sendModelsToWorkspace, setSessionConfigOption } = sessionThatSwitches();
-      activeSessions.set("task-1", session);
-
-      await handleSetModel({ sessionId: "sess-1", configId: "model", modelId: "not-a-model" });
-
-      expect(setSessionConfigOption).not.toHaveBeenCalled();
-      expect(sendModelsToWorkspace).toHaveBeenCalledWith("sess-1", known);
-    });
-
-    it("reports without asking the agent when the model is already current", async () => {
-      const { session, sendModelsToWorkspace, setSessionConfigOption } = sessionThatSwitches();
-      activeSessions.set("task-1", session);
-
-      await handleSetModel({ sessionId: "sess-1", configId: "model", modelId: "a" });
-
-      expect(setSessionConfigOption).not.toHaveBeenCalled();
-      expect(sendModelsToWorkspace).toHaveBeenCalledWith("sess-1", known);
-    });
-
-    it("resolves a model by display name, for a --model typed by a human", async () => {
-      const { session, setSessionConfigOption } = sessionThatSwitches();
-
-      await applyModelSelection({
-        connection: session.connection,
-        acpClient: session.acpClient,
-        sessionId: "sess-1",
-        known,
-        requested: "Model B",
-      });
-
-      expect(setSessionConfigOption).toHaveBeenCalledWith({
-        sessionId: "sess-1",
-        configId: "model",
-        value: "b",
-      });
-    });
-
-    it("marks the chosen model current when the agent answers without its config", async () => {
-      // Some agents acknowledge the write without repeating their options. The
-      // interface still has to end up with something selected.
-      const sendModelsToWorkspace = vi.fn();
-      const acpClient: any = { sendModelsToWorkspace, lastModelsFor: () => known };
-
-      await applyModelSelection({
-        connection: { setSessionConfigOption: vi.fn().mockResolvedValue({}) } as any,
-        acpClient,
-        sessionId: "sess-1",
-        known,
-        requested: "b",
-      });
-
-      expect(sendModelsToWorkspace).toHaveBeenCalledWith(
-        "sess-1",
-        expect.objectContaining({
-          currentModelId: "b",
-          models: [
-            expect.objectContaining({ id: "a", current: false }),
-            expect.objectContaining({ id: "b", current: true }),
-          ],
-        }),
-      );
-    });
-
-    it("puts back the newest report, not the snapshot taken before the set", async () => {
-      // The agent moved to "c" on its own while the set was in flight, and then
-      // refused the set. Reverting to the pre-set snapshot would claim the
-      // session is on "a" — a model it has already left — and, since every
-      // report is recorded, would write that stale list back over the newer one.
-      const fresher = {
-        configId: "model",
-        currentModelId: "c",
-        models: [{ id: "c", name: "Model C", current: true }],
-      };
-      const sendModelsToWorkspace = vi.fn();
-
-      await applyModelSelection({
-        connection: {
-          setSessionConfigOption: vi.fn().mockRejectedValue(new Error("nope")),
-        } as any,
-        acpClient: { sendModelsToWorkspace, lastModelsFor: () => fresher } as any,
-        sessionId: "sess-1",
-        known,
-        requested: "b",
-      });
-
-      expect(sendModelsToWorkspace).toHaveBeenCalledWith("sess-1", fresher);
-    });
-
-    it("falls back to the caller's snapshot when nothing has been reported yet", async () => {
-      // The startup path: --model runs against a session that has not sent a
-      // models notification, so the list from session/new is all there is.
-      const sendModelsToWorkspace = vi.fn();
-
-      await applyModelSelection({
-        connection: {
-          setSessionConfigOption: vi.fn().mockRejectedValue(new Error("nope")),
-        } as any,
-        acpClient: { sendModelsToWorkspace, lastModelsFor: () => undefined } as any,
-        sessionId: "sess-1",
-        known,
-        requested: "b",
-      });
-
-      expect(sendModelsToWorkspace).toHaveBeenCalledWith("sess-1", known);
-    });
-
-    it("says so rather than guessing when there is no config option to write to", async () => {
-      const sendModelsToWorkspace = vi.fn();
-      const setSessionConfigOption = vi.fn();
-
-      await applyModelSelection({
-        connection: { setSessionConfigOption } as any,
-        acpClient: { sendModelsToWorkspace, lastModelsFor: () => undefined } as any,
-        sessionId: "sess-1",
-        requested: "b",
-      });
-
-      expect(setSessionConfigOption).not.toHaveBeenCalled();
-    });
-  });
-
-  describe("handleAgentModeChange", () => {
-    const modes: any = {
-      currentModeId: "ask",
-      availableModes: [
-        { id: "ask", name: "Ask first" },
-        { id: "auto", name: "Auto approve" },
-      ],
-    };
-
-    let errorSpy: any;
-    beforeEach(() => {
-      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    });
-    afterEach(() => errorSpy.mockRestore());
-
-    it("should leave a mode that still asks the human alone", async () => {
-      const connection: any = { setSessionMode: vi.fn() };
-
-      await handleAgentModeChange(connection, "sess-ok", "ask", modes);
-
-      expect(connection.setSessionMode).not.toHaveBeenCalled();
-    });
-
-    it("should put the session back when the agent starts approving for us", async () => {
-      const connection: any = { setSessionMode: vi.fn().mockResolvedValue({}) };
-
-      await handleAgentModeChange(connection, "sess-drift", "auto", modes);
-
-      expect(connection.setSessionMode).toHaveBeenCalledWith({
-        sessionId: "sess-drift",
-        modeId: "ask",
-      });
-    });
-
-    it("should treat a mode the agent never advertised as untrusted", async () => {
-      const connection: any = { setSessionMode: vi.fn().mockResolvedValue({}) };
-
-      await handleAgentModeChange(connection, "sess-unknown", "something-new", modes);
-
-      expect(connection.setSessionMode).toHaveBeenCalledWith({
-        sessionId: "sess-unknown",
-        modeId: "ask",
-      });
-    });
-
-    it("should stop fighting an agent that keeps switching back", async () => {
-      const connection: any = { setSessionMode: vi.fn().mockResolvedValue({}) };
-
-      for (let i = 0; i < 5; i++) {
-        await handleAgentModeChange(connection, "sess-stubborn", "auto", modes);
-      }
-
-      // An unbounded fight would be an endless stream of setSessionMode calls.
-      expect(connection.setSessionMode).toHaveBeenCalledTimes(3);
-      expect(errorSpy.mock.calls.flat().join("\n")).toContain("Giving up after 3 attempts");
-    });
-
-    it("should start counting again once the session is back in a safe mode", async () => {
-      const connection: any = { setSessionMode: vi.fn().mockResolvedValue({}) };
-
-      await handleAgentModeChange(connection, "sess-recovered", "auto", modes);
-      await handleAgentModeChange(connection, "sess-recovered", "ask", modes);
-      for (let i = 0; i < 4; i++) {
-        await handleAgentModeChange(connection, "sess-recovered", "auto", modes);
-      }
-
-      expect(connection.setSessionMode).toHaveBeenCalledTimes(4);
-    });
-
-    it("should do nothing for an agent that offers no modes at all", async () => {
-      const connection: any = { setSessionMode: vi.fn() };
-
-      await handleAgentModeChange(connection, "sess-modeless", "whatever", undefined);
-      await handleAgentModeChange(connection, "sess-modeless", "whatever", { availableModes: [] } as any);
-
-      expect(connection.setSessionMode).not.toHaveBeenCalled();
     });
   });
 
@@ -4991,7 +1941,7 @@ describe("index", () => {
         errorSpy.mockRestore();
       });
 
-      it("cancels turn, sends closeSession if supported, and kills process", async () => {
+      it("sends closeSession if supported, and kills process", async () => {
         const cancelTurn = vi.fn().mockResolvedValue(undefined);
         const closeSessionRpc = vi.fn().mockResolvedValue({});
         const kill = vi.fn();
@@ -5006,7 +1956,6 @@ describe("index", () => {
 
         await closeSession(session);
 
-        expect(cancelTurn).toHaveBeenCalledWith("sess-1");
         expect(closeSessionRpc).toHaveBeenCalledWith({ sessionId: "sess-1" });
         expect(kill).toHaveBeenCalled();
       });
@@ -5026,31 +1975,8 @@ describe("index", () => {
 
         await closeSession(session);
 
-        expect(cancelTurn).toHaveBeenCalledWith("sess-no-close");
         expect(closeSessionRpc).not.toHaveBeenCalled();
         expect(kill).toHaveBeenCalled();
-      });
-
-      it("handles error during cancelTurn gracefully", async () => {
-        const cancelTurn = vi.fn().mockRejectedValue(new Error("cancel failed"));
-        const kill = vi.fn();
-
-        const session: any = {
-          sessionId: "sess-err",
-          acpClient: { cancelTurn },
-          connection: {},
-          initResult: {},
-          process: { kill },
-        };
-
-        await closeSession(session);
-
-        expect(cancelTurn).toHaveBeenCalledWith("sess-err");
-        expect(kill).toHaveBeenCalled();
-        expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("Error cancelling turn while closing session sess-err"),
-          expect.any(Error),
-        );
       });
 
       it("handles error during closeSession RPC gracefully", async () => {
@@ -5114,189 +2040,5 @@ describe("index", () => {
         await expect(closeSession(session)).resolves.not.toThrow();
       });
     });
-
-    describe("closeAllSessions", () => {
-      let errorSpy: any;
-      beforeEach(() => {
-        activeSessions.clear();
-        // Also clears the record of agents spawned by earlier tests, which this
-        // one now reaps.
-        resetIdleSession();
-        errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      });
-      afterEach(() => {
-        activeSessions.clear();
-        resetIdleSession();
-        errorSpy.mockRestore();
-      });
-
-      it("does nothing when activeSessions is empty", async () => {
-        await closeAllSessions();
-        expect(activeSessions.size).toBe(0);
-      });
-
-      it("ends an agent that spawned but never opened a session", async () => {
-        setVerbose(true);
-        // activeSessions only holds agents that got as far as an open session,
-        // so shutting down on it alone left behind the agent still handshaking
-        // — and the one stopped waiting for a login, which is the case most
-        // likely to be interrupted, since it can sit there indefinitely. One
-        // that quits when its stdin closes got away with it; one with an event
-        // loop of its own did not.
-        newSessionHangs.value = true;
-        spawnedAgents.length = 0;
-
-        const opening = getOrCreateSession(
-          "T-Interrupted",
-          ["node", "agent.js"],
-          [],
-          { env: {} } as any,
-          fakeBridge(),
-        );
-        await new Promise((resolve) => setTimeout(resolve, 10));
-
-        // Spawned, and tracked by nothing that shutdown used to look at.
-        expect(spawnedAgents.length).toBe(1);
-        expect(activeSessions.size).toBe(0);
-
-        await closeAllSessions(10);
-
-        expect(spawnedAgents[0].kill).toHaveBeenCalled();
-        expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("never opened a session"),
-        );
-
-        newSessionHangs.value = false;
-        void opening.catch(() => {});
-      });
-
-      it("keeps ending the rest when one refuses to die", async () => {
-        // Shutdown is the last thing that runs; one process that will not go
-        // must not take the others' only chance to go with it.
-        newSessionHangs.value = true;
-        spawnedAgents.length = 0;
-
-        const opening = [
-          getOrCreateSession("T-Stuck-A", ["node", "agent.js"], [], { env: {} } as any, fakeBridge()),
-          getOrCreateSession("T-Stuck-B", ["node", "agent.js"], [], { env: {} } as any, fakeBridge()),
-        ];
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        expect(spawnedAgents.length).toBe(2);
-        spawnedAgents[0].kill.mockImplementation(() => {
-          throw new Error("no such process");
-        });
-
-        await closeAllSessions(10);
-
-        expect(spawnedAgents[1].kill).toHaveBeenCalled();
-        expect(errorSpy).toHaveBeenCalledWith(
-          "[acp] Error ending an agent process:",
-          expect.any(Error),
-        );
-
-        newSessionHangs.value = false;
-        for (const p of opening) void p.catch(() => {});
-      });
-
-      it("does not report a cleanly closed session as one left behind", async () => {
-        // Its process is ended by closeSession; counting it again would report
-        // a leak that is not there.
-        newSessionHangs.value = false;
-        spawnedAgents.length = 0;
-
-        await getOrCreateSession(
-          "T-Clean-Exit",
-          ["node", "agent.js"],
-          [],
-          { env: {} } as any,
-          fakeBridge(),
-        );
-        expect(activeSessions.size).toBe(1);
-
-        await closeAllSessions(10);
-
-        expect(spawnedAgents[0].kill).toHaveBeenCalled();
-        expect(errorSpy).not.toHaveBeenCalledWith(
-          expect.stringContaining("never opened a session"),
-        );
-      });
-
-      it("closes all unique active sessions in parallel and clears map", async () => {
-        setVerbose(true);
-        const cancel1 = vi.fn().mockResolvedValue(undefined);
-        const cancel2 = vi.fn().mockResolvedValue(undefined);
-        const kill1 = vi.fn();
-        const kill2 = vi.fn();
-
-        const session1: any = {
-          sessionId: "s1",
-          acpClient: { cancelTurn: cancel1 },
-          connection: {},
-          initResult: {},
-          process: { kill: kill1 },
-        };
-        const session2: any = {
-          sessionId: "s2",
-          acpClient: { cancelTurn: cancel2 },
-          connection: {},
-          initResult: {},
-          process: { kill: kill2 },
-        };
-
-        activeSessions.set("task-1", session1);
-        activeSessions.set("task-2", session2);
-        activeSessions.set("duplicate-task-1", session1);
-
-        await closeAllSessions();
-
-        expect(activeSessions.size).toBe(0);
-        expect(cancel1).toHaveBeenCalledTimes(1);
-        expect(cancel2).toHaveBeenCalledTimes(1);
-        expect(kill1).toHaveBeenCalledTimes(1);
-        expect(kill2).toHaveBeenCalledTimes(1);
-        expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("Cleanly closing 2 active session(s)..."),
-        );
-      });
-    });
-
-    describe("setupSignalHandlers", () => {
-      it("registers and cleans up SIGINT and SIGTERM handlers", async () => {
-        const signalHandler = vi.fn().mockResolvedValue(undefined);
-        const cleanup = setupSignalHandlers(signalHandler);
-
-        expect(process.listenerCount("SIGINT")).toBeGreaterThan(0);
-        expect(process.listenerCount("SIGTERM")).toBeGreaterThan(0);
-
-        // Emit SIGINT
-        process.emit("SIGINT");
-        expect(signalHandler).toHaveBeenCalledWith("SIGINT");
-
-        // Emit SIGTERM
-        process.emit("SIGTERM");
-        expect(signalHandler).toHaveBeenCalledWith("SIGTERM");
-
-        // Cleanup
-        cleanup();
-      });
-    });
-  });
-});
-
-describe("loginCommandFor", () => {
-  it("names the agent, so nobody has to work the command out", () => {
-    expect(loginCommandFor("antigravity-acp")).toBe(
-      "npx @agentrq/acp-gateway@latest --login --agent antigravity-acp",
-    );
-  });
-
-  it("repeats the command after -- when no registry id named the agent", () => {
-    expect(loginCommandFor(undefined, ["node", "my-agent.js"])).toBe(
-      "npx @agentrq/acp-gateway@latest --login -- node my-agent.js",
-    );
-  });
-
-  it("falls back to the bare command when nothing identifies the agent", () => {
-    expect(loginCommandFor()).toBe("npx @agentrq/acp-gateway@latest --login");
   });
 });

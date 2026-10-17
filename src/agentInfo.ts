@@ -10,7 +10,6 @@
 
 import * as acp from "@agentclientprotocol/sdk";
 import { describeAuthMethods } from "./auth.js";
-import { debug } from "./log.js";
 
 /** ACP marks an optional capability as supported by supplying `{}` for it. */
 function supported(value: unknown): boolean {
@@ -28,54 +27,6 @@ function section(title: string, rows: Array<[string, string]>): string {
   }
   const body = rows.map(([label, value]) => `  ${label.padEnd(width)}  ${value}`);
   return [title, ...body].join("\n");
-}
-
-/** The notification agentrq listens on for which agent is behind the gateway. */
-export const AGENT_NOTIFICATION_METHOD = "notifications/claude/channel/agent";
-
-/**
- * The wire shape agentrq receives. snake_case to match the telemetry, models
- * and commands notifications on the same channel; the REST surface that
- * eventually renders this is camelCase, and the mapping happens there.
- */
-export interface AgentPayload {
-  task_id: string;
-  session_id: string;
-  name: string;
-  title?: string;
-  version?: string;
-}
-
-/**
- * Sends an agent's identity to the workspace.
- *
- * No task is required. The workspace keys this to the MCP connection it arrived
- * on and ignores the task and session ids entirely, so demanding one would only
- * guarantee silence at the moment it matters most — before any task has run,
- * which is exactly when someone is looking at the workspace wondering what is
- * attached to it.
- *
- * Never throws: this is a label for a human, and a workspace that cannot take
- * it right now must not cost the agent anything.
- */
-export async function sendAgentIdentity(
-  bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
-  identity: AgentIdentity,
-  scope: { taskId?: string; sessionId?: string } = {},
-): Promise<void> {
-  const payload: AgentPayload = {
-    task_id: scope.taskId ?? "",
-    session_id: scope.sessionId ?? "",
-    name: identity.name,
-    title: identity.title,
-    version: identity.version,
-  };
-  try {
-    await bridge.sendNotification(AGENT_NOTIFICATION_METHOD, payload);
-    debug(`[acp] Told the workspace it is talking to "${identity.name}"`);
-  } catch (err) {
-    console.error(`[acp] Failed to send agent notification:`, err);
-  }
 }
 
 /** Who an agent says it is. */

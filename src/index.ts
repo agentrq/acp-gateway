@@ -3,99 +3,24 @@
  * index.ts
  *
  * The main entry point for acp-gateway.
- * Orchestrates the bridge between the ACP Agent and the agentrq MCP Server.
+ *
+ * `run` pipes an ACP agent's stdio to AgentRQ's ACP v1 endpoint (see
+ * native.ts); AgentRQ is the ACP client and this process only moves bytes. The
+ * one-shot commands — login, logout, listing models and the like — talk to the
+ * agent here, with no workspace involved.
  */
 
 import { spawn } from "node:child_process";
-import { EventEmitter } from "node:events";
 import { Writable, Readable } from "node:stream";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
-const pkg = JSON.parse(
-  readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
-);
 
-import {
-  loadMcpConfig,
-  pickAgentrqServer,
-  type McpServerConfig,
-  type McpTransport,
-} from "./config.js";
-import { MCPBridge, callTaskAction } from "./mcpClient.js";
-import { BoundedMap, FifoQueue } from "./collections.js";
+import { loadMcpConfig, pickAgentrqServer, type McpServerConfig } from "./config.js";
 import { runNative, type NativeOptions } from "./native.js";
 import { nativeEndpoint, tokenFrom } from "./nativeFrames.js";
-
-/**
- * What the agent said about a transport, if anything.
- *
- * stdio is the one transport every agent must support. For the others the
- * answer is only trustworthy when the agent actually stated it: an agent that
- * advertises no MCP capabilities at all is far more likely to be terse than to
- * be unable to reach an HTTP server, and dropping its servers on that reading
- * would take the workspace's own MCP server away from it.
- */
-function transportSupport(
-  transport: McpTransport,
-  agentCapabilities: acp.AgentCapabilities | null | undefined,
-): "required" | "declared" | "refused" | "unstated" {
-  if (transport === "stdio") return "required";
-  const declared = (agentCapabilities?.mcpCapabilities as Record<string, unknown> | undefined)?.[
-    transport
-  ];
-  if (declared === true) return "declared";
-  if (declared === false) return "refused";
-  return "unstated";
-}
-
-export function mapMcpServers(
-  configs: McpServerConfig[],
-  agentCapabilities?: acp.AgentCapabilities | null,
-): acp.McpServer[] {
-  return configs
-    .filter((cfg) => {
-      const support = transportSupport(cfg.type, agentCapabilities);
-      if (support === "refused") {
-        console.error(
-          `[acp] ⚠️  Not passing MCP server "${cfg.name}" to the agent: it is ${cfg.type}, ` +
-            `and the agent says it does not support that transport. Passing it anyway ` +
-            `risks the agent refusing the whole session.`,
-        );
-        return false;
-      }
-      if (support === "unstated") {
-        debug(
-          `[acp] MCP server "${cfg.name}" is ${cfg.type}, which the agent does not ` +
-            `advertise either way — passing it and letting the agent decide.`,
-        );
-      }
-      return true;
-    })
-    .map((cfg): acp.McpServer => {
-      if (cfg.type === "stdio") {
-        return {
-          name: cfg.name,
-          command: cfg.command!,
-          args: cfg.args ?? [],
-          env: Object.entries(cfg.env || {}).map(([name, value]) => ({ name, value })) as any,
-        };
-      }
-      return {
-        type: cfg.type,
-        name: cfg.name,
-        url: cfg.url!,
-        headers: Object.entries(cfg.headers || {}).map(([name, value]) => ({ name, value })) as any,
-      };
-    });
-}
-import {
-  AgentRQACPClient,
-  DEFAULT_PERMISSION_TIMEOUT_MS,
-  lastModelsForSession,
-  sendModelsNotification,
-} from "./acpClient.js";
+import { LocalACPClient } from "./localClient.js";
 import {
   describeAuthMethods,
   isAuthRequiredError,
@@ -107,228 +32,35 @@ import {
   type LoginOptions,
 } from "./auth.js";
 import { resolveAgentLaunch } from "./agentInstall.js";
-import {
-  agentIdentity,
-  describeAgentInfo,
-  sendAgentIdentity,
-  type AgentIdentity,
-} from "./agentInfo.js";
+import { describeAgentInfo } from "./agentInfo.js";
 import {
   availableKinds,
   describeAgents,
   fetchRegistry,
-  findAgent,
   hostPlatformTarget,
   isAgentUnverified,
   type PlatformTarget,
 } from "./registry.js";
-import {
-  extractTaskIdFromMeta,
-  extractTaskIdFromText,
-} from "./taskIdentity.js";
-import {
-  extractModels,
-  formatModelsText,
-  setSessionModel,
-  type AgentModelsResult,
-} from "./models.js";
-import {
-  MAX_MAX_CONCURRENCY,
-  MIN_MAX_CONCURRENCY,
-  normalizeConcurrency,
-  sendConcurrencyNotification,
-} from "./concurrency.js";
-import {
-  announceFinished,
-  announceTask,
-  debug,
-  followAgentStderr,
-  isVerbose,
-  setVerbose,
-} from "./log.js";
+import { extractModels, formatModelsText } from "./models.js";
+import { MAX_MAX_CONCURRENCY, MIN_MAX_CONCURRENCY, normalizeConcurrency } from "./concurrency.js";
+import { debug, followAgentStderr, isVerbose, setVerbose } from "./log.js";
+import { pkg } from "./version.js";
 
-// Only compared against the next notification for the same task, so the last
-// few hundred tasks are plenty; keeping every task's full text forever is not.
-const lastTaskContent = new BoundedMap<string, string>(200);
+/** How long a tool call waits for a human verdict by default: 30 minutes. */
+export const DEFAULT_PERMISSION_TIMEOUT_MS = 30 * 60 * 1000;
 
-// Cancellations are remembered by *where they fall in the stream of events*
-// rather than as a one-shot flag. agentrq reuses a chat's id as the task id, so
-// a flag that outlived the cancellation it describes would swallow the user's
-// next message on that chat; ordered this way, a task is skipped only when the
-// cancel arrived after it was queued. Wall-clock time is too coarse to order
-// two events in the same millisecond, so this is a plain counter.
-let taskSeq = 0;
-export const nextTaskSeq = (): number => ++taskSeq;
-// A cancel for a task that never runs (a stale id, a task that already
-// finished) leaves an entry behind, so the map is bounded.
-export const cancelledTaskSeq = new BoundedMap<string, number>(200);
-
-/** Records that `taskId` has just been cancelled. */
-export function markTaskCancelled(taskId: string): void {
-  cancelledTaskSeq.set(taskId, nextTaskSeq());
-}
-
-/**
- * Whether a task queued at `queuedSeq` has since been cancelled.
- *
- * Two notifications for the same task id can be queued at once, so the check is
- * against the point each was queued: cancelling the older one must not stop the
- * newer one from running.
- */
-export function isTaskCancelled(
-  taskId: string | undefined,
-  queuedSeq: number,
-): boolean {
-  if (!taskId) return false;
-  const seq = cancelledTaskSeq.get(taskId);
-  return seq !== undefined && seq > queuedSeq;
-}
-
-export interface AgentSession {
+/** An agent spawned for a one-shot command, after its `initialize` handshake. */
+export interface AgentConnection {
   process: any;
   connection: acp.ClientSideConnection;
-  acpClient: AgentRQACPClient;
-  sessionId: string;
+  acpClient: LocalACPClient;
   initResult: acp.InitializeResponse;
-  /** Hands this session to a task, re-keying it and re-attributing its reports. */
-  adopt(taskId: string): void;
 }
 
-/**
- * Where the session opened before any task is filed.
- *
- * It exists so a connected gateway can say what its agent offers — models and
- * slash commands only exist inside a session, and ACP has no way to ask
- * outside one — and it is handed to the first task rather than duplicated.
- */
-export const IDLE_SESSION_KEY = "default";
-
-export const activeSessions = new Map<string, AgentSession>();
-
-/**
- * The startup session while it is still being opened.
- *
- * Opening one can take a long time — an agent that wants authentication stops
- * and waits for a human — and a task arriving in that window would find nothing
- * in `activeSessions` and start a second agent beside the one already coming
- * up. Waiting for the answer costs nothing and is the difference between one
- * agent and two.
- */
-let idleSessionInFlight: Promise<AgentSession> | null = null;
-
-/**
- * The turn in progress for each task, so a second delivery waits for it.
- *
- * ACP gives a session one turn at a time, and this gateway gives a task one
- * session — so two deliveries of a task running at once would put two prompts
- * on one session, where the second is refused or interleaves and the streamed
- * output of both lands in a single reply buffer to be flushed twice.
- *
- * Two deliveries of a task is ordinary, not exotic: agentrq reuses a chat's id
- * as the task id, so two messages sent to the same chat arrive as two tasks
- * with one id, and the repetition guard drops neither because it compares text
- * and the two say different things. They must both reach the agent — losing the
- * second would lose what someone typed — so they are serialised rather than
- * deduplicated. A concurrency of 1 used to serialise them by accident; above 1
- * nothing did.
- */
-const taskTurns = new Map<string, Promise<unknown>>();
-
-/**
- * Runs a task's turn once every earlier turn for that task has finished.
- *
- * A failed turn does not block the next one: a task whose first message errored
- * must still be able to hear the second.
- */
-export async function runTurnForTask(
-  taskId: string | undefined,
-  turn: () => Promise<void>,
-): Promise<void> {
-  // Nothing to serialise against. A delivery with no task id is not a second
-  // message on anything — there is no chat for it to be the second of.
-  if (taskId === undefined) return turn();
-
-  const previous = taskTurns.get(taskId);
-  if (previous) {
-    debug(
-      `[bridge] Task ${taskId} is already mid-turn; waiting for it rather than ` +
-        `prompting the same session twice at once`,
-    );
-  }
-  // `then(turn, turn)` rather than `then(turn)`: the next turn runs whether the
-  // one before it succeeded or threw.
-  const mine = previous ? previous.then(turn, turn) : turn();
-  const settled = mine.catch(() => {});
-  taskTurns.set(taskId, settled);
-  try {
-    await mine;
-  } finally {
-    // Only if nothing has queued behind it, or the chain's tail is dropped and
-    // the next delivery starts beside the one still running.
-    if (taskTurns.get(taskId) === settled) taskTurns.delete(taskId);
-  }
+/** What closing a session needs. */
+export interface ClosableSession extends AgentConnection {
+  sessionId: string;
 }
-
-/** Forgets every in-progress turn. For tests. */
-export function resetTaskTurns(): void {
-  taskTurns.clear();
-}
-
-/**
- * Sessions that have been asked for but do not exist yet, by session key.
- *
- * `activeSessions` only learns about a session once the agent has spawned,
- * handshaken, authenticated and opened it — seconds during which the map says
- * nothing is there. Two deliveries of one task inside that window therefore
- * both missed the cache and both spawned an agent: two processes prompting the
- * same agent for the same task, and only the second reachable afterwards, so
- * the first could never be closed.
- *
- * The workspace can deliver one task twice by pushing it and having it picked
- * up by `getTask` — the repetition guard compares the text, and those two paths
- * word it differently — and a raised concurrency limit is what lets both run at
- * once instead of one after the other.
- */
-const sessionsInFlight = new Map<string, Promise<AgentSession>>();
-
-/**
- * Every agent process this gateway has started and not yet seen exit.
- *
- * `activeSessions` holds only the agents that got as far as an open session,
- * which makes it the wrong thing to reap on the way out: an agent that is still
- * handshaking — or one stopped waiting for a login that is never coming — is in
- * no map at all, so shutdown closed nothing and the process was left behind. An
- * agent that quits when its stdin closes gets away with that; one with an event
- * loop of its own, which is exactly the sort that waits for a login, does not.
- *
- * Spawning is the moment to record it, because every window in which a session
- * is not yet tracked begins there.
- */
-const liveAgentProcesses = new Set<AgentProcessHandle>();
-
-/** The little of a child process that ending one needs. */
-type AgentProcessHandle = { pid?: number; kill: () => unknown };
-
-/** Stops tracking a process that has gone away on its own. */
-function forgetAgentProcess(child: AgentProcessHandle): void {
-  liveAgentProcesses.delete(child);
-}
-
-/** Forgets any in-flight startup session. For tests. */
-export function resetIdleSession(): void {
-  idleSessionInFlight = null;
-  sessionsInFlight.clear();
-  liveAgentProcesses.clear();
-}
-
-/**
- * What closing a session actually needs.
- *
- * Narrower than AgentSession on purpose: `--list-models` opens a session that
- * belongs to no task and closes it again, and it should not have to invent the
- * task bookkeeping it will never use.
- */
-export type ClosableSession = Omit<AgentSession, "adopt">;
 
 /** How long to wait for `session/close` RPC before terminating the session process regardless. */
 export const CLOSE_SESSION_TIMEOUT_MS = 2000;
@@ -347,26 +79,13 @@ export function supportsCloseSession(
 }
 
 /**
- * Cleanly closes an active agent session:
- * 1. Cancels any in-flight prompt turn and pending permissions for the session.
- * 2. Calls `session/close` RPC on the connection if the agent supports it (with timeout).
- * 3. Kills the agent child process.
+ * Cleanly closes an agent session: `session/close` if the agent supports it
+ * (bounded by a timeout), then the agent process itself.
  */
 export async function closeSession(
   session: ClosableSession,
   timeoutMs: number = CLOSE_SESSION_TIMEOUT_MS,
 ): Promise<void> {
-  if (session.acpClient && typeof session.acpClient.cancelTurn === "function") {
-    try {
-      await session.acpClient.cancelTurn(session.sessionId);
-    } catch (err) {
-      console.error(
-        `[acp] Error cancelling turn while closing session ${session.sessionId}:`,
-        err,
-      );
-    }
-  }
-
   if (
     supportsCloseSession(session.initResult?.agentCapabilities) &&
     typeof session.connection?.closeSession === "function"
@@ -405,73 +124,6 @@ export async function closeSession(
 }
 
 /**
- * Cleanly closes all active sessions in parallel and clears the activeSessions map.
- */
-export async function closeAllSessions(
-  timeoutMs: number = CLOSE_SESSION_TIMEOUT_MS,
-): Promise<void> {
-  const sessions = Array.from(new Set(activeSessions.values()));
-  activeSessions.clear();
-  if (sessions.length > 0) {
-    debug(`[acp] Cleanly closing ${sessions.length} active session(s)...`);
-    // Their processes are ended by closeSession; dropping them here keeps the
-    // count below honest about what is actually being left behind.
-    for (const session of sessions) forgetAgentProcess(session.process);
-    await Promise.all(sessions.map((session) => closeSession(session, timeoutMs)));
-  }
-
-  // Whatever is still running never opened a session, so there is no session to
-  // close cleanly and nothing to say goodbye to — only a process to end. This
-  // is the agent that is still handshaking, or the one waiting on a login
-  // nobody is going to give it.
-  const stragglers = Array.from(liveAgentProcesses);
-  liveAgentProcesses.clear();
-  if (stragglers.length === 0) return;
-  debug(
-    `[acp] Ending ${stragglers.length} agent process(es) that never opened a session...`,
-  );
-  for (const child of stragglers) {
-    try {
-      terminateAgentProcess(child);
-    } catch (err) {
-      console.error("[acp] Error ending an agent process:", err);
-    }
-  }
-}
-
-/**
- * Registers signal handlers (SIGINT, SIGTERM) to trigger graceful shutdown.
- * Returns a teardown function to unregister the handlers.
- */
-export function setupSignalHandlers(
-  onSignal: (signal: string) => Promise<void> | void,
-): () => void {
-  const sigintHandler = () => {
-    void onSignal("SIGINT");
-  };
-  const sigtermHandler = () => {
-    void onSignal("SIGTERM");
-  };
-
-  process.on("SIGINT", sigintHandler);
-  process.on("SIGTERM", sigtermHandler);
-
-  return () => {
-    process.off("SIGINT", sigintHandler);
-    process.off("SIGTERM", sigtermHandler);
-  };
-}
-
-/** Login preferences taken from the CLI, consulted whenever an agent demands auth. */
-export const authConfig: { methodId?: string } = {};
-
-/** Model preference taken from the CLI, applied when a session starts. */
-export const modelConfig: { modelId?: string } = {};
-
-/** How long tool calls wait for a human, taken from the CLI at startup. */
-export const permissionConfig: { timeoutMs?: number } = {};
-
-/**
  * Whether a human is sitting in front of this process.
  *
  * Terminal logins hand the agent our own stdio, and the "which login method?"
@@ -482,26 +134,13 @@ export function isInteractiveTerminal(): boolean {
   return Boolean(process.stdin.isTTY && process.stderr.isTTY);
 }
 
-export interface AgentConnection {
-  /** Attributes everything this connection reports to a task. */
-  assignTask?: (taskId: string) => void;
-  process: any;
-  connection: acp.ClientSideConnection;
-  acpClient: AgentRQACPClient;
-  initResult: acp.InitializeResponse;
-}
-
 export interface OpenAgentConnectionOptions {
   acpCmdArgs: string[];
-  mcpBridge: MCPBridge;
   env?: Record<string, string>;
   /** Used in log lines to say which agent process is being talked about. */
   label: string;
   /** Where the agent process runs. Defaults to the gateway's own directory. */
   cwd?: string;
-  taskId?: string;
-  /** Runs when the agent process dies or fails to start. */
-  onExit?: () => void;
 }
 
 /**
@@ -727,12 +366,9 @@ export function shouldPrintBanner(options: Pick<GatewayOptions, "command" | "jso
  */
 export async function openAgentConnection({
   acpCmdArgs,
-  mcpBridge,
   env,
   label,
   cwd,
-  taskId,
-  onExit,
 }: OpenAgentConnectionOptions): Promise<AgentConnection> {
   const [cmd, ...cmdArgs] = acpCmdArgs;
   debug(`[acp] Spawning agent for ${label}: ${cmd} ${cmdArgs.join(" ")}`);
@@ -747,31 +383,20 @@ export async function openAgentConnection({
   });
   const agentStderr = followAgentStderr(agentProcess.stderr);
 
-  // Read through a holder rather than captured directly: a session created
-  // before any task exists is later handed to the first one, and everything it
-  // reports afterwards has to be attributed to that task.
-  let currentTaskId = taskId;
-  const acpClient = new AgentRQACPClient(mcpBridge, () => currentTaskId, {
-    permissionTimeoutMs: permissionConfig.timeoutMs,
-    // A login URL that arrives before any session belongs to whoever asked for
-    // the login, and at a terminal that is the person reading it — so only
-    // offer the terminal prompt when there is a terminal to read it at.
+  const acpClient = new LocalACPClient({
+    // A login URL belongs to whoever asked for the login, and at a terminal
+    // that is the person reading it — so only offer the terminal prompt when
+    // there is a terminal to read it at.
     promptUrlElicitation: isInteractiveTerminal() ? promptUrlElicitationOnTerminal : undefined,
   });
 
   // Guard against unhandled child-process failures. Without these listeners a
-  // crashed agent (e.g. on network loss) leaves a broken stdin pipe; the next
-  // write raises EPIPE as an uncaught error and takes the gateway down with it.
-  // Tracked from here rather than from the open session, so shutdown can still
-  // end an agent that never reached one — see liveAgentProcesses.
-  liveAgentProcesses.add(agentProcess);
-
+  // crashed agent leaves a broken stdin pipe; the next write raises EPIPE as an
+  // uncaught error and takes the gateway down with it.
   agentProcess.on("error", (err: Error) => {
     console.error(`[acp] Agent process error for ${label}:`, err.message);
     showAgentStderr(agentStderr());
-    forgetAgentProcess(agentProcess);
     acpClient.dispose();
-    onExit?.();
   });
   agentProcess.on("exit", (code: number | null, signal: string | null) => {
     const message = `[acp] Agent process for ${label} exited (code=${code}, signal=${signal})`;
@@ -781,11 +406,7 @@ export async function openAgentConnection({
     } else {
       debug(message);
     }
-    forgetAgentProcess(agentProcess);
-    // Nothing will act on these answers now, but the tool calls waiting on them
-    // are holding task-queue slots that would never be given back.
     acpClient.dispose();
-    onExit?.();
   });
   // stdin can emit EPIPE when the child dies mid-write; swallow it so it
   // doesn't surface as an uncaught exception.
@@ -803,9 +424,6 @@ export async function openAgentConnection({
     (_agent) => acpClient,
     stream,
   );
-  // Stopping a turn is only possible once the connection exists, and the
-  // connection is built around the client — so it is handed over afterwards.
-  acpClient.setSessionCanceller((sessionId) => connection.cancel({ sessionId }));
 
   const initResult = await connection.initialize({
     protocolVersion: acp.PROTOCOL_VERSION,
@@ -814,15 +432,9 @@ export async function openAgentConnection({
       version: pkg.version,
     },
     clientCapabilities: {
-      fs: {
-        readTextFile: true,
-        writeTextFile: true,
-      },
       elicitation: {
-        form: {},
         url: {},
       },
-      plan: {},
       // Only claim terminal logins when we can actually hand the agent a
       // terminal; otherwise the agent may offer a method we cannot run.
       auth: {
@@ -850,9 +462,6 @@ export async function openAgentConnection({
     connection,
     acpClient,
     initResult,
-    assignTask: (id: string) => {
-      currentTaskId = id;
-    },
   };
 }
 
@@ -864,7 +473,7 @@ export async function openAgentConnection({
  */
 export async function createSessionWithAuth(
   connection: acp.ClientSideConnection,
-  params: AcpNewSessionParams,
+  params: acp.NewSessionRequest,
   auth: Omit<LoginOptions, "connection">,
 ): Promise<acp.NewSessionResponse> {
   try {
@@ -905,1073 +514,6 @@ export class AuthenticationFailed extends Error {
   }
 }
 
-export async function getOrCreateSession(
-  taskId: string | undefined,
-  acpCmdArgs: string[],
-  configs: McpServerConfig[],
-  agentrqConfig: McpServerConfig,
-  mcpBridge: MCPBridge,
-): Promise<AgentSession> {
-  const sessionKey = taskId || IDLE_SESSION_KEY;
-  const existing = activeSessions.get(sessionKey);
-  if (existing) {
-    return existing;
-  }
-
-  // Someone already asked for this session and is still waiting for it. Join
-  // that wait rather than starting a second agent for the same work — the
-  // caller wants a session for this task, not a session of its own.
-  const pending = sessionsInFlight.get(sessionKey);
-  if (pending) {
-    debug(
-      `[acp] A session for ${taskId ? `task ${taskId}` : "the idle session"} is ` +
-        `already being opened; waiting for it rather than spawning a second agent`,
-    );
-    return pending;
-  }
-
-  const creation = createSession(taskId, sessionKey, acpCmdArgs, configs, agentrqConfig, mcpBridge);
-  sessionsInFlight.set(sessionKey, creation);
-  try {
-    return await creation;
-  } finally {
-    // Only if it is still this attempt's: a session that was adopted and then
-    // re-requested may have registered a newer one under the same key.
-    if (sessionsInFlight.get(sessionKey) === creation) {
-      sessionsInFlight.delete(sessionKey);
-    }
-  }
-}
-
-/** Opens a session, with no regard for whether one is already on its way. */
-async function createSession(
-  taskId: string | undefined,
-  initialSessionKey: string,
-  acpCmdArgs: string[],
-  configs: McpServerConfig[],
-  agentrqConfig: McpServerConfig,
-  mcpBridge: MCPBridge,
-): Promise<AgentSession> {
-  let sessionKey = initialSessionKey;
-
-  // The session made at startup, before any task, is handed to the first task
-  // that arrives rather than left beside a second agent doing the same job. Its
-  // conversation is empty, so there is nothing for the task to inherit but the
-  // process itself.
-  if (taskId) {
-    // Still coming up — wait for it rather than racing it into a second agent.
-    if (idleSessionInFlight) {
-      try {
-        await idleSessionInFlight;
-      } catch {
-        // It failed; this task opens its own below, and reports the failure
-        // itself rather than inheriting a stale one.
-      }
-    }
-    const idle = activeSessions.get(IDLE_SESSION_KEY);
-    if (idle) {
-      idle.adopt(taskId);
-      debug(`[acp] Task ${taskId} took over the session opened at startup`);
-      const lastModels = idle.acpClient.lastModelsFor(idle.sessionId);
-      if (lastModels) {
-        void idle.acpClient.sendModelsToWorkspace(idle.sessionId, lastModels);
-      }
-      return idle;
-    }
-  }
-
-  const [cmd, ...cmdArgs] = acpCmdArgs;
-  const { process: agentProcess, connection, acpClient, initResult, assignTask } =
-    await openAgentConnection({
-      acpCmdArgs,
-      mcpBridge,
-      env: agentrqConfig.env,
-      label: taskId ? `task ${taskId}` : "the idle session",
-      taskId,
-      onExit: () => activeSessions.delete(sessionKey),
-    });
-
-  const newSessionParams: AcpNewSessionParams = {
-    cwd: process.cwd(),
-    mcpServers: mapMcpServers(configs, initResult.agentCapabilities),
-  };
-
-  // From here on the agent is running but nothing is tracking it yet: it only
-  // reaches activeSessions once a session exists, and closeAllSessions can only
-  // close what is in there. So anything that goes wrong in between has to take
-  // the process with it, or it is left running with nothing attached — an agent
-  // that quits when its stdin closes gets away with it, and one with its own
-  // event loop, which is the sort that wants a login, does not.
-  try {
-
-  // An agent that demands authentication stops here and waits, including at
-  // startup — that is the point of starting a session then. A terminal is where
-  // someone can actually answer, and finding out on the first task instead
-  // means a gateway that looked connected all along.
-  //
-  // Headless, `login` refuses rather than blocking on a prompt nobody can see:
-  // it only offers a terminal method to an interactive terminal, and throws a
-  // message naming --auth-method otherwise. openIdleSession logs that and
-  // leaves the gateway up.
-  const sessionResult = await createSessionWithAuth(connection, newSessionParams, {
-    methods: initResult.authMethods,
-    launch: { command: cmd, args: cmdArgs, env: agentrqConfig.env },
-    preferredId: authConfig.methodId,
-    interactive: isInteractiveTerminal(),
-  });
-  debug(
-    `[acp] Created session ${sessionResult.sessionId} for ${taskId ? `task ${taskId}` : "the idle session"}`,
-  );
-
-  // Tell the workspace which agent this actually is. Its MCP client is this
-  // gateway, so without this the workspace can only ever name the bridge.
-  void acpClient.sendAgentToWorkspace(
-    sessionResult.sessionId,
-    agentIdentity(initResult, acpCmdArgs.join(" ")),
-  );
-
-  try {
-    const modelsResult = extractModels(sessionResult.configOptions);
-    if (modelsResult) {
-      await applyModelSelection({
-        connection,
-        acpClient,
-        sessionId: sessionResult.sessionId,
-        known: modelsResult,
-        requested: modelConfig.modelId,
-      });
-    }
-  } catch (err) {
-    console.error(`[acp] Failed to extract or configure models for session ${sessionResult.sessionId}:`, err);
-  }
-
-  await enforceHumanApprovalMode(connection, sessionResult);
-  // The mode is pinned once here, but agents may move themselves back out of
-  // it, so keep watching for the rest of the session's life.
-  acpClient.setModeChangeHandler((changedSessionId, modeId) =>
-    handleAgentModeChange(connection, changedSessionId, modeId, sessionResult.modes),
-  );
-
-  const sessionInfo: AgentSession = {
-    process: agentProcess,
-    connection,
-    acpClient,
-    sessionId: sessionResult.sessionId,
-    initResult,
-    adopt(nextTaskId: string) {
-      activeSessions.delete(sessionKey);
-      sessionKey = nextTaskId;
-      activeSessions.set(sessionKey, sessionInfo);
-      assignTask?.(nextTaskId);
-    },
-  };
-    activeSessions.set(sessionKey, sessionInfo);
-    return sessionInfo;
-  } catch (err) {
-    terminateAgentProcess(agentProcess);
-    throw err;
-  }
-}
-
-/**
- * Finds the active agent session for a given task ID (or returns the single active session if none specified).
- */
-/**
- * Opens a session before any task, so the workspace can say what this agent
- * offers rather than only that something is attached.
- *
- * Models arrive as config options on `session/new` and slash commands as a
- * session notification, so there is no way to learn either without a session —
- * ACP has no question to ask outside one.
- *
- * An agent that demands authentication stops and waits here, which is much of
- * the value of starting a session at all: the terminal someone just typed into
- * is where they can answer.
- *
- * If that login does not happen — refused, or headless where there is nobody to
- * ask — the gateway shuts down rather than carrying on. It would otherwise sit
- * there looking connected, take every task the workspace gave it and fail all
- * of them, which is worse than not running: the workspace would show a live
- * agent while the work quietly went nowhere.
- *
- * Every other failure is survivable and is survived. An agent that could not be
- * spawned may simply have lost a race; it used to fail when the first task
- * arrived and it still does, and turning that into a gateway that refuses to
- * run would be a worse trade than the one this is making.
- *
- * The session is handed to the first task rather than left running beside it —
- * see getOrCreateSession.
- */
-export async function openIdleSession(
-  acpCmdArgs: string[],
-  configs: McpServerConfig[],
-  agentrqConfig: McpServerConfig,
-  mcpBridge: MCPBridge,
-  loginCommand: string = loginCommandFor(),
-  timeoutMs: number = IDLE_SESSION_TIMEOUT_MS,
-): Promise<IdleSessionOutcome> {
-  try {
-    // Cleared when the session itself settles rather than when this returns:
-    // after a timeout the session is still coming, and a task that arrives
-    // meanwhile should still wait for it instead of starting a second agent.
-    idleSessionInFlight = getOrCreateSession(
-      undefined,
-      acpCmdArgs,
-      configs,
-      agentrqConfig,
-      mcpBridge,
-    );
-    const settled = idleSessionInFlight;
-    void settled.catch(() => {}).finally(() => {
-      if (idleSessionInFlight === settled) idleSessionInFlight = null;
-    });
-    // Bounded: nothing reaches the workspace until this settles, so an agent
-    // that spawns and then never answers its handshake would otherwise take the
-    // whole gateway down with it — a worse failure than the one being fixed,
-    // and a new one. On a timeout the gateway carries on; the session may still
-    // arrive, and the first task will adopt it if it does.
-    const timedOut = Symbol("timed out");
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const result = await Promise.race([
-      idleSessionInFlight,
-      new Promise<typeof timedOut>((resolve) => {
-        timer = setTimeout(() => resolve(timedOut), timeoutMs);
-      }),
-    ]);
-    if (timer) clearTimeout(timer);
-
-    if (result === timedOut) {
-      console.error(
-        `[acp] The agent has not opened a session after ${Math.round(timeoutMs / 1000)}s; ` +
-          "carrying on without knowing what it offers.",
-      );
-      return "unknown";
-    }
-    return "ready";
-  } catch (err) {
-    if (err instanceof AuthenticationFailed || isAuthRequiredError(err)) {
-      const remedy =
-        err instanceof AuthenticationFailed && !err.hasLogin
-          ? `It offers no way to log in through acp-gateway, so it is expecting a credential ` +
-            `of its own — an API key in the environment, or whatever its own documentation ` +
-            `asks for. Set that and start acp-gateway again.`
-          : `Log in with:\n\n    ${loginCommand}\n\nthen start acp-gateway again.`;
-      console.error(
-        `\n[acp-gateway] The agent will not start a session until it is authenticated: ` +
-          `${err instanceof Error ? err.message : String(err)}\n` +
-          `Nothing was started. ${remedy}\n` +
-          `Carrying on would leave the workspace showing a live agent that fails every task ` +
-          `it is given.`,
-      );
-      return "unauthenticated";
-    }
-    console.error(
-      "[acp] Could not open a session to learn what the agent offers; " +
-        "the first task will start one:",
-      err instanceof Error ? err.message : String(err),
-    );
-    return "unknown";
-  }
-}
-
-/**
- * The command that logs this agent in, so the message can name it rather than
- * leave someone to work it out.
- *
- * Built from how the gateway itself was started: the registry id when there was
- * one, and otherwise the command after `--`, since that is the only handle on
- * an agent nobody named.
- */
-export function loginCommandFor(
-  agentId?: string,
-  agentCommand: string[] = [],
-): string {
-  const base = "npx @agentrq/acp-gateway@latest --login";
-  if (agentId) return `${base} --agent ${agentId}`;
-  if (agentCommand.length) return `${base} -- ${agentCommand.join(" ")}`;
-  return base;
-}
-
-/**
- * What came of trying to open a session before any task.
- *
- * `ready` means the agent is up and has said what it is — including its own
- * name, so nothing else should name it. `unknown` means the gateway is running
- * but cannot describe its agent. `unauthenticated` means it never will.
- */
-export type IdleSessionOutcome = "ready" | "unknown" | "unauthenticated";
-
-/**
- * How long to wait for an agent to open its first session.
- *
- * Generous because the wait includes starting the agent, and an `npx`
- * distribution downloads its package the first time it is spawned — a cold
- * install of a large one on a slow line is minutes, not seconds. (A registry
- * *binary* is already on disk by now: that download happens while the launch
- * command is being resolved, before any of this.)
- *
- * Erring long costs little. A session that arrives after the deadline is still
- * recorded, still reports what the agent offers, and is still adopted by the
- * first task — the timeout only decides how long the gateway waits before
- * connecting to the workspace without knowing those things yet.
- */
-export const IDLE_SESSION_TIMEOUT_MS = 5 * 60_000;
-
-
-
-export function findActiveSession(taskId?: string): AgentSession | undefined {
-  if (taskId) {
-    const direct = activeSessions.get(taskId);
-    if (direct) return direct;
-    for (const session of activeSessions.values()) {
-      if (session.sessionId === taskId) return session;
-    }
-    // A session opened from a notification that carried no task id is keyed
-    // under IDLE_SESSION_KEY; when it is the only one running, an id-carrying
-    // cancel can only have meant it. Never fall back to a session keyed under a
-    // *different* task id — that would abort an unrelated task.
-    //
-    // The session opened at startup shares that key until a task adopts it, so
-    // this can now match one that has never run anything. That stays correct
-    // either way: if it was reused for a task-less prompt it is the session the
-    // cancel meant, and if it is untouched it has no turn to cancel.
-    const untracked = activeSessions.get(IDLE_SESSION_KEY);
-    if (untracked && activeSessions.size === 1) {
-      return untracked;
-    }
-  } else if (activeSessions.size === 1) {
-    return activeSessions.values().next().value;
-  }
-  return undefined;
-}
-
-/**
- * Switches a session's model and tells the workspace what it ended up as.
- *
- * The one place a model is ever set, reached from two directions: the --model
- * flag as a session opens, and a selection made in the interface while it is
- * running. They were one block until the second existed; keeping two copies of
- * resolve-set-echo would have let the startup path and the runtime path drift
- * into disagreeing about what a failed switch looks like.
- *
- * Whatever happens, the workspace is told something. That is the contract the
- * interface is built on: it marks a chosen model pending and waits for a models
- * notification to settle it, so a switch that quietly failed would leave the
- * picker claiming a model the agent never adopted. Every path below ends in a
- * report — the new list on success, the old one on any failure.
- */
-export async function applyModelSelection({
-  connection,
-  acpClient,
-  sessionId,
-  known,
-  requested,
-  configId,
-}: {
-  connection: acp.ClientSideConnection;
-  acpClient: AgentRQACPClient;
-  sessionId: string;
-  /** What the session last advertised, when that is known. */
-  known?: AgentModelsResult;
-  /** The model asked for, by id or by display name. */
-  requested?: string;
-  /** The config option to write through, when the caller knows it. */
-  configId?: string;
-}): Promise<void> {
-  // Freshest first. `known` was read before the set was attempted, and the agent
-  // may have reported a different list while that call was in flight — echoing
-  // the older snapshot would tell the workspace the session is on a model it has
-  // already left, and, because every report is recorded, would write that stale
-  // list back over the newer one. The cache is preferred over it for that reason,
-  // and `known` stays as the last resort for the startup path, where the session
-  // has not reported anything yet.
-  const echo = (result?: AgentModelsResult) => {
-    const fallback = result ?? acpClient.lastModelsFor(sessionId) ?? known;
-    if (fallback) void acpClient.sendModelsToWorkspace(sessionId, fallback);
-  };
-
-  // Nothing asked for, or already the current model: report and stop. Setting a
-  // model the session is already on would be a needless round trip to the agent
-  // for an answer nobody is waiting on.
-  if (!requested || (known && requested === known.currentModelId)) {
-    echo();
-    return;
-  }
-
-  // Resolved by display name as well as by id, because --model is typed by a
-  // human who may well have copied what the picker showed them. A selection
-  // from the interface always carries an id and matches on the first branch.
-  const target = known?.models.find((m) => m.id === requested || m.name === requested);
-  if (known && !target) {
-    console.error(
-      `[acp] Requested model "${requested}" not found in available models: ${known.models.map((m) => m.id).join(", ")}`,
-    );
-    echo();
-    return;
-  }
-
-  const option = configId ?? known?.configId;
-  if (!option) {
-    console.error(
-      `[acp] Cannot set model "${requested}" for session ${sessionId}: no config option to write it to`,
-    );
-    echo();
-    return;
-  }
-
-  const modelId = target?.id ?? requested;
-  try {
-    const updateRes = await setSessionModel(connection, sessionId, option, modelId);
-    // The agent's own answer is preferred over anything assumed here — it is
-    // what actually took effect. The constructed fallback is for agents that
-    // answer without repeating their config, and marks the chosen model current
-    // rather than leaving the interface with nothing selected.
-    const updated =
-      extractModels(updateRes.configOptions) ??
-      (known
-        ? {
-            ...known,
-            currentModelId: modelId,
-            models: known.models.map((m) => ({ ...m, current: m.id === modelId })),
-          }
-        : undefined);
-    echo(updated);
-  } catch (err) {
-    console.error(`[acp] Failed to set requested model "${requested}":`, err);
-    echo();
-  }
-}
-
-/**
- * Switches model on a session the workspace names, at the workspace's request.
- *
- * The session id on the wire is the agent's own, which is what activeSessions
- * is searched by — findActiveSession already matches on it, and on the task id
- * a session is filed under, so either identifies the same session.
- *
- * A set for a session that has gone still answers, and so does one that names no
- * model. The interface is holding a pending model and only a models notification
- * releases it, so staying silent about either would leave it pending forever;
- * echoing what was last known lets it revert to the truth. That is why the last
- * report outlives the session that produced it — by the time a set arrives for a
- * finished session, the client that served it has exited with its agent, and the
- * bridge is all that is left to answer through.
- */
-export async function handleSetModel(
-  {
-    sessionId,
-    configId,
-    modelId,
-  }: {
-    sessionId?: string;
-    configId?: string;
-    modelId?: string;
-  },
-  /** How a session that has already gone is answered. Absent only in tests. */
-  bridge?: { sendNotification(method: string, params: unknown): Promise<unknown> },
-): Promise<void> {
-  const session = findActiveSession(sessionId);
-
-  // Nothing to switch, but the picker is still waiting on an answer, so give it
-  // the truth rather than nothing: a live session reports through its own client,
-  // and a finished one through whatever was last recorded for it.
-  const revert = async (why: string) => {
-    console.error(`[bridge] ${why}; reporting the last known models instead`);
-    if (session) {
-      const last = session.acpClient.lastModelsFor(session.sessionId);
-      if (last) await session.acpClient.sendModelsToWorkspace(session.sessionId, last);
-      return;
-    }
-    const last = sessionId ? lastModelsForSession(sessionId) : undefined;
-    if (bridge && sessionId && last) {
-      await sendModelsNotification(bridge, sessionId, last);
-    }
-  };
-
-  if (!modelId) {
-    await revert("Received a set_model notification naming no model");
-    return;
-  }
-
-  if (!session) {
-    await revert(
-      `Received set_model for session ${sessionId ?? "(unnamed)"}, but no active session matches it`,
-    );
-    return;
-  }
-
-  debug(
-    `[bridge] Switching session ${session.sessionId} to model "${modelId}"`,
-  );
-  await applyModelSelection({
-    connection: session.connection,
-    acpClient: session.acpClient,
-    sessionId: session.sessionId,
-    known: session.acpClient.lastModelsFor(session.sessionId),
-    requested: modelId,
-    configId,
-  });
-}
-
-/**
- * Applies a concurrency limit the workspace asked for, and reports back the one
- * actually in force.
- *
- * The report is unconditional, which is the whole point of it. Someone moved a
- * control in the interface and is watching to see where it landed; a value that
- * was clamped, or one that was not a number at all, has to come back as the
- * real limit rather than as silence — otherwise the interface goes on showing a
- * number this gateway never adopted.
- */
-export async function handleSetConcurrency(
-  { maxConcurrency }: { maxConcurrency?: unknown },
-  queue: TaskQueue,
-  /** Absent only in tests. */
-  bridge?: { sendNotification(method: string, params: unknown): Promise<unknown> },
-): Promise<void> {
-  const requested = normalizeConcurrency(maxConcurrency);
-
-  // In a finally, so the answer does not depend on applying the change going
-  // well. "Always answered" is the whole design; leaving it as the last
-  // statement made it true only while nothing above it threw.
-  try {
-    if (requested === undefined) {
-      console.error(
-        `[bridge] Received a set_concurrency notification asking for ` +
-          `"${String(maxConcurrency)}", which is not a number of tasks; ` +
-          `keeping the limit at ${queue.getMaxConcurrency()}`,
-      );
-    } else {
-      queue.setMaxConcurrency(requested);
-    }
-  } finally {
-    // Often asked for while the queue's own reports are still going out —
-    // raising the limit starts waiting tasks, and each announces itself. That
-    // is why this is here anyway: the queue says nothing at all when a set
-    // moves no numbers, and a set must always be answered.
-    //
-    // Awaiting it is what makes the answer real. Reports go out one at a time,
-    // and this resolves only once no further report is wanted, so by the time
-    // it returns the workspace has been told the limit that actually took
-    // effect — after, not before, anything the raise set running.
-    if (bridge) await reportConcurrency(bridge, queue);
-  }
-}
-
-/**
- * The report on the wire, if one is, and whether the numbers moved while it flew.
- *
- * Each report is its own HTTP POST, and two in flight at once may be processed
- * in either order — so the workspace would be left showing whichever landed
- * last rather than whichever is true. That cost little while a report followed
- * a human moving a control. It costs a great deal now that one follows every
- * task transition, because `execute` announces a freed slot and then `next()`
- * immediately announces the task that took it: two reports, one tick apart,
- * disagreeing about the same number. Landing them the wrong way round leaves
- * the interface wrong until something else moves — which is the very failure
- * this feature exists to end.
- */
-let reportOnTheWire: Promise<void> | null = null;
-let numbersMovedAgain = false;
-
-/** Forgets any report in flight. For tests. */
-export function resetConcurrencyReports(): void {
-  reportOnTheWire = null;
-  numbersMovedAgain = false;
-}
-
-/**
- * Tells the workspace what the queue's limit is and what it is doing under it.
- *
- * One report at a time, so they arrive in the order they were asked for. A
- * report wanted while one is flying does not queue up behind it: the numbers
- * are read again when the wire is free, so a burst of transitions costs one
- * further report rather than one per transition, and every report carries the
- * state at the moment it was actually sent. Whatever the workspace hears last
- * is therefore the truth, which is the only property that really matters here.
- *
- * Callers may await this and know a report reflecting their change has gone
- * out — `handleSetConcurrency` depends on exactly that.
- */
-export function reportConcurrency(
-  bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
-  queue: TaskQueue,
-): Promise<void> {
-  if (reportOnTheWire) {
-    numbersMovedAgain = true;
-    return reportOnTheWire;
-  }
-  // Assigned from the call rather than after it: `drainConcurrencyReports` runs
-  // as far as its first await before returning, and nothing else can run in
-  // between.
-  return (reportOnTheWire = drainConcurrencyReports(bridge, queue));
-}
-
-/**
- * Sends reports until nobody has asked for another.
- *
- * The slot is cleared in a `finally` inside this function rather than off the
- * returned promise, so that it happens in the same tick the loop ends. Clearing
- * it a microtask later would leave a window where a caller sees a report in
- * flight, sets the flag, and is answered by a loop that has already stopped
- * reading it — a report asked for and never sent.
- *
- * The bridge is whichever caller opened the slot. The gateway has exactly one
- * for its whole life, and a reconnect replaces what is inside it rather than
- * the object, so there is no second bridge for a collapsed report to miss.
- */
-async function drainConcurrencyReports(
-  bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
-  queue: TaskQueue,
-): Promise<void> {
-  try {
-    do {
-      numbersMovedAgain = false;
-      // Read here, not at the call: a collapsed report is worth sending only
-      // because it describes the queue now rather than when it was asked for.
-      await sendConcurrencyNotification(bridge, {
-        maxConcurrency: queue.getMaxConcurrency(),
-        active: queue.getActiveCount(),
-        queued: queue.getQueueLength(),
-      });
-    } while (numbersMovedAgain);
-  } finally {
-    reportOnTheWire = null;
-  }
-}
-
-/**
- * Builds the task queue already able to report itself.
- *
- * Out here rather than inline in `main()` for the reason
- * `registerConcurrencyListeners` is: `main()` spawns processes and never
- * returns, so nothing written inside it can be tested, and wiring that nothing
- * exercises is wiring nobody finds out is wrong.
- *
- * The callback names the queue it is being handed to. That is safe because it
- * only ever runs later, from inside the queue's own methods, by which time the
- * binding exists.
- */
-export function createTaskQueue(
-  maxConcurrency: number,
-  bridge: { sendNotification(method: string, params: unknown): Promise<unknown> },
-  /**
-   * Told when the queue may have room for another task, so the caller can go
-   * and fetch one. Absent where nothing is fetching — the auth commands, and
-   * tests of the reporting on its own.
-   */
-  onCapacity?: () => void,
-): TaskQueue {
-  const queue: TaskQueue = new TaskQueue(
-    maxConcurrency,
-    () => void reportConcurrency(bridge, queue),
-    onCapacity,
-  );
-  return queue;
-}
-
-/**
- * Subscribes the queue to the workspace's concurrency directives.
- *
- * The reconnect subscription is the less obvious half. A reconnect mints a new
- * MCP session and the workspace keys this report to the connection it arrived
- * on — so a workspace that dropped and came back would otherwise go on showing
- * whatever limit it last heard about, which is the boot default for the rest of
- * the gateway's life.
- */
-export function registerConcurrencyListeners(
-  bridge: MCPBridge,
-  queue: TaskQueue,
-): void {
-  bridge.on("setConcurrency", (params: { maxConcurrency?: unknown }) => {
-    handleSetConcurrency(params, queue, bridge).catch((err) => {
-      console.error("[bridge] Error handling concurrency change:", err);
-    });
-  });
-
-  bridge.on("reconnected", () => {
-    void reportConcurrency(bridge, queue);
-  });
-}
-
-/**
- * Handles task cancellation events from the MCP server.
- * Cancels the ACP session/turn and immediately cancels any pending permissions.
- */
-export async function handleTaskCancellation(
-  taskId?: string,
-  reason?: string,
-): Promise<void> {
-  if (taskId) {
-    markTaskCancelled(taskId);
-    const session = findActiveSession(taskId);
-    if (!session) {
-      console.error(
-        `[bridge] Received cancellation for task ${taskId}, but no active session found (queued tasks will be skipped)`,
-      );
-      return;
-    }
-    console.error(
-      `[bridge] Cancelling session ${session.sessionId} for task ${taskId}${reason ? ` (${reason})` : ""}`,
-    );
-    await session.acpClient.cancelTurn(session.sessionId);
-  } else {
-    const session = findActiveSession(undefined);
-    if (session) {
-      console.error(
-        `[bridge] Received cancellation with no taskId${reason ? ` (${reason})` : ""}. Cancelling active session ${session.sessionId}...`,
-      );
-      await session.acpClient.cancelTurn(session.sessionId);
-    } else {
-      console.error(
-        `[bridge] Received cancellation with no taskId${reason ? ` (${reason})` : ""}` +
-          (activeSessions.size === 0
-            ? ", and no sessions are active"
-            : `, but ${activeSessions.size} sessions are active (skipping to avoid aborting unrelated tasks)`),
-      );
-    }
-  }
-}
-
-type AcpNewSessionParams = Parameters<
-  acp.ClientSideConnection["newSession"]
->[0];
-
-// Modes that approve tool calls without asking the user. codex-acp, for
-// example, defaults to an "agent" mode whose reviewer is "auto_review" — an
-// automated Guardian Review that approves on the human's behalf — and also
-// offers an "agent-full-access" mode that never asks at all.
-const AUTO_APPROVING_MODE = /auto|full[\s_-]?access|danger|bypass|yolo|never|always/i;
-// Modes that defer the decision to the human.
-const HUMAN_APPROVAL_MODE = /ask|approval|approve|manual|prompt|review|read[\s_-]?only/i;
-
-function describeMode(mode: acp.SessionMode): string {
-  const kind = (mode._meta as { kind?: unknown } | null | undefined)?.kind;
-  return `${mode.id} ${mode.name} ${typeof kind === "string" ? kind : ""}`;
-}
-
-/**
- * Picks the session mode that routes every tool-call approval to the human.
- *
- * Agents may offer modes that approve on the user's behalf and commonly
- * default to one. In such a mode the agent never sends a permission request,
- * so tool calls — including destructive ones — execute without ever reaching
- * agentrq. Returns the id of a mode that defers to the human, or undefined if
- * the agent offers none.
- */
-export function pickHumanApprovalMode(
-  modes: acp.SessionModeState | null | undefined,
-): string | undefined {
-  const available = modes?.availableModes;
-  if (!available?.length) return undefined;
-
-  const candidates = available.filter((m) => !AUTO_APPROVING_MODE.test(describeMode(m)));
-  const chosen =
-    candidates.find((m) => HUMAN_APPROVAL_MODE.test(describeMode(m))) ?? candidates[0];
-  return chosen?.id;
-}
-
-/**
- * Switches a freshly created session into a mode that requires human approval,
- * so that every non-agentrq tool call reaches the agentrq dashboard rather than
- * being auto-approved inside the agent.
- */
-export async function enforceHumanApprovalMode(
-  connection: acp.ClientSideConnection,
-  sessionResult: { sessionId: string; modes?: acp.SessionModeState | null },
-): Promise<void> {
-  const modes = sessionResult.modes;
-  // Agents that expose no modes have nothing to switch; they either always ask
-  // or their policy is out of the gateway's reach.
-  if (!modes?.availableModes?.length) return;
-
-  const modeId = pickHumanApprovalMode(modes);
-  if (!modeId) {
-    console.error(
-      `[acp] ⚠️  Agent offers no mode that defers approvals to the human ` +
-        `(available: ${modes.availableModes.map((m) => m.id).join(", ")}). ` +
-        `Tool calls may execute without agentrq approval.`,
-    );
-    return;
-  }
-  if (modeId === modes.currentModeId) return;
-
-  try {
-    await connection.setSessionMode({ sessionId: sessionResult.sessionId, modeId });
-    debug(
-      `[acp] Session mode set to "${modeId}" (was "${modes.currentModeId}") so tool calls require agentrq approval`,
-    );
-  } catch (err) {
-    console.error(
-      `[acp] ⚠️  Failed to set session mode to "${modeId}" — tool calls may execute without agentrq approval:`,
-      err,
-    );
-  }
-}
-
-/**
- * How many times the gateway will drag one session back into a mode that asks
- * the human. An agent that keeps switching back is not going to stop, and an
- * unbounded fight with it would be an endless stream of setSessionMode calls.
- */
-const MAX_MODE_REENFORCEMENTS = 3;
-
-/**
- * sessionId → how many times its mode has already been put back. Bounded
- * because sessions end without telling this map.
- */
-const modeReenforcements = new BoundedMap<string, number>(256);
-
-/**
- * Puts a session back into a mode that asks the human, after the agent moved
- * itself out of one.
- *
- * Agents may change modes on their own. If one moves into a mode that approves
- * tool calls on the user's behalf, every later tool call — including
- * destructive ones — executes without ever reaching agentrq, and nothing
- * anywhere says so.
- */
-export async function handleAgentModeChange(
-  connection: acp.ClientSideConnection,
-  sessionId: string,
-  currentModeId: string,
-  modes: acp.SessionModeState | null | undefined,
-): Promise<void> {
-  const available = modes?.availableModes;
-  if (!available?.length) return;
-
-  const mode = available.find((m) => m.id === currentModeId);
-  // A mode the agent never advertised cannot be vouched for either, so it is
-  // treated the same as one that approves on our behalf.
-  if (mode && !AUTO_APPROVING_MODE.test(describeMode(mode))) {
-    modeReenforcements.delete(sessionId);
-    return;
-  }
-
-  const attempts = modeReenforcements.get(sessionId) ?? 0;
-  if (attempts >= MAX_MODE_REENFORCEMENTS) {
-    console.error(
-      `[acp] ⚠️  Agent keeps returning session ${sessionId} to mode "${currentModeId}", ` +
-        `which approves tool calls without asking. Giving up after ` +
-        `${MAX_MODE_REENFORCEMENTS} attempts — tool calls may now execute without ` +
-        `agentrq approval.`,
-    );
-    return;
-  }
-  modeReenforcements.set(sessionId, attempts + 1);
-
-  console.error(
-    `[acp] ⚠️  Agent moved session ${sessionId} into "${currentModeId}", which approves ` +
-      `tool calls without asking. Putting it back.`,
-  );
-  await enforceHumanApprovalMode(connection, {
-    sessionId,
-    modes: { availableModes: available, currentModeId },
-  });
-}
-
-export function createAcpSessionSwitcher(
-  connection: acp.ClientSideConnection,
-  params: AcpNewSessionParams,
-  initialSessionId: string,
-) {
-  let currentSessionId = initialSessionId;
-  const taskSessionMap = new Map<string, string>();
-  const sessionTaskMap = new Map<string, string>();
-
-  return {
-    getSessionId(): string {
-      return currentSessionId;
-    },
-    getTaskIdForSession(sessionId: string): string | undefined {
-      return sessionTaskMap.get(sessionId);
-    },
-    async ensureForTask(taskId: string | undefined): Promise<string> {
-      if (taskId === undefined) {
-        return currentSessionId;
-      }
-
-      const existing = taskSessionMap.get(taskId);
-      if (existing) {
-        currentSessionId = existing;
-        return existing;
-      }
-
-      const next = await connection.newSession(params);
-      currentSessionId = next.sessionId;
-      taskSessionMap.set(taskId, currentSessionId);
-      sessionTaskMap.set(currentSessionId, taskId);
-      debug(
-        `[acp] New ACP session for task ${taskId} (MCP connection unchanged): ${currentSessionId}`,
-      );
-      return currentSessionId;
-    },
-  };
-}
-
-
-export class TaskQueue {
-  private activeTasks = 0;
-  private queue = new FifoQueue<() => Promise<void>>();
-
-  /**
-   * @param onChange Told whenever the number running or waiting moves, so
-   *   somebody can report it. The queue has no idea who is listening — it holds
-   *   no bridge and knows nothing about notifications — because what it owes the
-   *   interface is the fact that its numbers moved, not the delivery of that
-   *   fact. Absent only in tests, matching `handleSetConcurrency`'s `bridge?`.
-   */
-  constructor(
-    private maxConcurrency: number,
-    private onChange?: () => void,
-    private onCapacity?: () => void,
-  ) {}
-
-  /**
-   * Says the numbers moved, and survives a listener that cannot take the news.
-   *
-   * Guarded because this is called from `execute`, including from its `finally`:
-   * a listener that threw there would replace the task's own error with its own,
-   * losing what actually went wrong, and one that threw on the way in would stop
-   * the task before it started. Running tasks is this class's job; telling an
-   * interface about them is a courtesy, and a courtesy must not be able to break
-   * the job.
-   */
-  private announce(): void {
-    try {
-      this.onChange?.();
-    } catch (err) {
-      console.error("[queue] Error reporting the queue's state:", err);
-    }
-  }
-
-  /**
-   * Says there may be room for another task, and survives a listener that
-   * cannot take the news.
-   *
-   * Separate from `announce` because the two answer different questions. A
-   * report of the numbers goes out whenever they move, including when a task
-   * *starts* and the gateway has less room than before; this one fires only
-   * where room may have appeared — a task finished, or the limit went up — and
-   * it is what lets the gateway go and ask the workspace for more work.
-   *
-   * Guarded for the same reason `announce` is: filling the queue is a courtesy
-   * to whoever is waiting, and a courtesy must not be able to break the task
-   * that just finished.
-   */
-  private offerCapacity(): void {
-    // Only when there is actually room. Both callers reach here on moves that
-    // may leave none — a task finishing into a backlog that immediately
-    // refills its slot, a limit *lowered* under work already running — and
-    // "there may be room" is a message about the queue, not about the move.
-    if (this.activeTasks >= this.maxConcurrency || this.queue.length > 0) return;
-    try {
-      this.onCapacity?.();
-    } catch (err) {
-      console.error("[queue] Error offering the queue's free capacity:", err);
-    }
-  }
-
-  async run(taskFn: () => Promise<void>): Promise<void> {
-    if (this.activeTasks < this.maxConcurrency) {
-      await this.execute(taskFn);
-    } else {
-      await new Promise<void>((resolve, reject) => {
-        this.queue.push(async () => {
-          try {
-            await taskFn();
-            resolve();
-          } catch (err) {
-            reject(err);
-            throw err;
-          }
-        });
-        // Nothing started, but something is now waiting — which is exactly the
-        // state a full gateway is in, and the one worth seeing.
-        this.announce();
-      });
-    }
-  }
-
-  private async execute(taskFn: () => Promise<void>): Promise<void> {
-    this.activeTasks++;
-    // Before the task is awaited rather than after, or the report would not go
-    // out until the work it is announcing had already finished.
-    this.announce();
-    try {
-      await taskFn();
-    } finally {
-      this.activeTasks--;
-      // Before `next()`, so this says a slot came free; whatever `next()` then
-      // starts announces itself. The other order would report the same settled
-      // state twice and never show the gap.
-      this.announce();
-      this.next();
-      // After `next()`, so that whatever was already waiting here has taken its
-      // slot back before anyone is told there is one going spare.
-      this.offerCapacity();
-    }
-  }
-
-  /**
-   * Starts as many waiting tasks as the limit now has room for.
-   *
-   * A loop rather than a single task, because this is also what runs when the
-   * limit is raised: going from 1 to 4 with three tasks waiting has to start
-   * all three, and starting one and waiting for it to finish would make a raise
-   * take effect one task at a time. `execute` counts the task as active before
-   * it yields, so the condition is re-read against a number that already
-   * includes everything this loop has started.
-   */
-  private next() {
-    while (!this.queue.isEmpty && this.activeTasks < this.maxConcurrency) {
-      // Non-null: the loop condition has just established the queue is not empty.
-      const nextTask = this.queue.shift()!;
-      this.execute(nextTask).catch((err) => {
-        console.log("[queue] Error executing queued task:", err);
-      });
-    }
-  }
-
-  public getActiveCount(): number {
-    return this.activeTasks;
-  }
-
-  public getQueueLength(): number {
-    return this.queue.length;
-  }
-
-  public getMaxConcurrency(): number {
-    return this.maxConcurrency;
-  }
-
-  /**
-   * Changes how many tasks may run at once, while tasks are running.
-   *
-   * Lowering the limit never interrupts anything: a task that has already been
-   * handed to the agent keeps its turn, and the queue simply stops handing out
-   * new ones until enough have finished. So a limit lowered below the number
-   * currently running is honoured going forward rather than retroactively —
-   * killing work already in flight is not what "run fewer at once" means.
-   */
-  public setMaxConcurrency(maxConcurrency: number): void {
-    if (maxConcurrency === this.maxConcurrency) return;
-    const previous = this.maxConcurrency;
-    this.maxConcurrency = maxConcurrency;
-    console.error(
-      `[queue] Concurrency limit ${previous} -> ${maxConcurrency} ` +
-        `(${this.activeTasks} running, ${this.queue.length} queued)`,
-    );
-    this.next();
-    // A raise with nothing waiting internally starts nothing, and used to end
-    // there: the gateway sat at one task with room for three because the two
-    // it could have run were still sitting in the workspace, unasked for.
-    // (A lowered limit reaches here too, and leaves no room to offer.)
-    this.offerCapacity();
-  }
-}
-
-/** What the gateway was asked to do, beyond bridging tasks. */
 export type GatewayCommand =
   | "run"
   | "login"
@@ -2018,12 +560,7 @@ export interface GatewayOptions {
    * for a gateway run from somewhere other than the workspace it belongs to.
    */
   mcpJsonPath?: string;
-  /**
-   * Native mode: AgentRQ speaks this ACP version itself, and the gateway only
-   * pipes the agent's stdio to it. Unset is classic mode.
-   */
-  acpVersion?: 1 | 2;
-  /** The native endpoint, when it cannot be worked out from .mcp.json. */
+  /** The ACP endpoint, when it cannot be worked out from .mcp.json. */
   acpUrl?: string;
   /** Tokens that are not gateway options — the agent command, when no `--` was used. */
   rest: string[];
@@ -2181,11 +718,13 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
         }
         break;
       case "--acp-version":
-        if (value !== "1" && value !== "2") {
-          console.error("[acp-gateway] --acp-version must be 1 or 2");
+        // ACP v1 is the only protocol the gateway speaks. The flag is still
+        // read, so launch scripts written when it chose between modes keep
+        // working with `--acp-version 1`.
+        if (value !== "1") {
+          console.error("[acp-gateway] --acp-version must be 1, the only version supported");
           process.exit(1);
         }
-        options.acpVersion = Number(value) as 1 | 2;
         i++;
         break;
       case "--acp-url":
@@ -2263,7 +802,7 @@ export async function resolveAgentCommand(
   options: GatewayOptions,
   explicitCommand: string[],
   fetchImpl: typeof fetch = fetch,
-): Promise<{ command: string[]; env?: Record<string, string>; identity?: AgentIdentity }> {
+): Promise<{ command: string[]; env?: Record<string, string> }> {
   if (!options.agentId) return { command: explicitCommand };
 
   const registry = await fetchRegistry(options.registryUrl, fetchImpl);
@@ -2278,15 +817,7 @@ export async function resolveAgentCommand(
     `[registry] Running "${options.agentId}" via ${spec.kind}: ${spec.command} ${spec.args.join(" ")}`,
   );
 
-  // What the registry says this agent is. Known now, before it has been
-  // started, which is the only reason a workspace can name it while the
-  // gateway is idle — the agent itself does not speak until a task arrives.
-  const entry = findAgent(registry, options.agentId);
-  const identity: AgentIdentity | undefined = entry
-    ? { name: entry.name || entry.id, version: entry.version }
-    : undefined;
-
-  return { command: [spec.command, ...spec.args], env: spec.env, identity };
+  return { command: [spec.command, ...spec.args], env: spec.env };
 }
 
 /**
@@ -2322,9 +853,9 @@ export function assertAgentRunnable(command: string, usedRegistryId: boolean): v
 
 /**
  * Commands that only deal with the agent itself. None of them hands the agent
- * a workspace or reports to one, so none should refuse to run for want of a
- * .mcp.json — `--list-models` is how someone picks a model, and `--login` how
- * someone signs the agent in, before they have set a workspace up at all.
+ * a workspace or reports to one, so none needs a .mcp.json — `--list-models` is
+ * how someone picks a model, and `--login` how someone signs the agent in,
+ * before they have set a workspace up at all.
  */
 export const WORKSPACE_OPTIONAL_COMMANDS: ReadonlySet<GatewayCommand> = new Set([
   "list-models",
@@ -2334,71 +865,33 @@ export const WORKSPACE_OPTIONAL_COMMANDS: ReadonlySet<GatewayCommand> = new Set(
   "logout",
 ]);
 
-/** The workspace a command runs against: its servers, and the one to report to. */
+/**
+ * The workspace's MCP config: every server in it, which the agent is handed in
+ * each session it opens, and the AgentRQ one among them.
+ */
 export interface Workspace {
   configs: McpServerConfig[];
   agentrqConfig: McpServerConfig;
-  mcpBridge: MCPBridge;
 }
 
 /**
- * Stands in for the workspace when there is none.
+ * Finds the AgentRQ server a command reports to: its URL and token are where
+ * the ACP endpoint comes from.
  *
- * Whatever the agent asks of it fails, which the ACP client already treats as
- * the workspace being unreachable: a stray elicitation is cancelled rather than
- * left waiting on a panel nobody has. A url elicitation at a terminal still
- * reaches the person there, since that never goes near the workspace.
- *
- * Notifications are dropped instead. Nobody waits on them, and the agent sends
- * some on its own — its slash commands, its models — so failing them would only
- * print an error for something that was never going to arrive anywhere.
- */
-export function createDetachedBridge(): MCPBridge {
-  const bridge: any = new EventEmitter();
-  bridge.callTool = async () => {
-    throw new Error("No agentrq workspace is configured");
-  };
-  bridge.sendNotification = async (method: string) => {
-    debug(`[acp] No agentrq workspace is configured, dropping ${method}`);
-  };
-  bridge.getSessionId = () => undefined;
-  bridge.getServerName = () => undefined;
-  bridge.getAdvertisedTools = () => undefined;
-  bridge.close = async () => {};
-  return bridge as MCPBridge;
-}
-
-/**
- * Finds the workspace a command needs.
- *
- * Anything that runs tasks needs one, and fails without it. A command that only
- * deals with the agent itself does not go looking for one: a .mcp.json that is
- * missing, or broken, has nothing to do with which models the agent offers or
- * whether it is logged in.
- * `--mcp-json` is still honoured there, since someone named it on purpose — to
- * have a login the agent asks for show up in that workspace, say.
- *
- * Except by `--list-models`, which never reaches the workspace at all: the
- * workspace counts whatever connects to it as its agent, so a listing that did
- * would get in the way of the agent about to be started for real.
+ * A command that only deals with the agent itself does not go looking for
+ * one: a .mcp.json that is missing, or broken, has nothing to do with which
+ * models the agent offers or whether it is logged in.
  */
 export function loadWorkspace(
   command: GatewayCommand,
   mcpJsonPath: string | undefined,
   startDir: string = process.cwd(),
 ): Workspace {
-  if (WORKSPACE_OPTIONAL_COMMANDS.has(command) && mcpJsonPath === undefined) {
-    return {
-      configs: [],
-      agentrqConfig: { name: "none", type: "http", env: {} },
-      mcpBridge: createDetachedBridge(),
-    };
+  if (WORKSPACE_OPTIONAL_COMMANDS.has(command)) {
+    return { configs: [], agentrqConfig: { name: "none", type: "http", env: {} } };
   }
   const configs = loadMcpConfig(startDir, mcpJsonPath);
-  const agentrqConfig = pickAgentrqServer(configs);
-  const mcpBridge =
-    command === "list-models" ? createDetachedBridge() : new MCPBridge(agentrqConfig);
-  return { configs, agentrqConfig, mcpBridge };
+  return { configs, agentrqConfig: pickAgentrqServer(configs) };
 }
 
 /**
@@ -2434,8 +927,7 @@ export function makeIsolatedDir(): { dir: string; remove: () => void } {
 export async function runAgentCommand(
   command: Exclude<GatewayCommand, "run">,
   acpCmdArgs: string[],
-  agentrqConfig: McpServerConfig,
-  mcpBridge: MCPBridge,
+  env: Record<string, string> | undefined,
   authMethodId?: string,
   json = false,
 ): Promise<void> {
@@ -2445,8 +937,7 @@ export async function runAgentCommand(
   try {
     agent = await openAgentConnection({
       acpCmdArgs,
-      mcpBridge,
-      env: agentrqConfig.env,
+      env,
       label: command,
       cwd: isolated?.dir,
     });
@@ -2475,16 +966,16 @@ export async function runAgentCommand(
     }
 
     if (command === "list-models") {
-      const newSessionParams: AcpNewSessionParams = {
+      const newSessionParams: acp.NewSessionRequest = {
         cwd: isolated!.dir,
-        mcpServers: mapMcpServers([], agentCapabilities),
+        mcpServers: [],
       };
       const sessionResult = await createSessionWithAuth(
         agent.connection,
         newSessionParams,
         {
           methods: authMethods,
-          launch: { command: cmd, args: cmdArgs, env: agentrqConfig.env },
+          launch: { command: cmd, args: cmdArgs, env },
           preferredId: authMethodId,
           interactive: isInteractiveTerminal(),
         },
@@ -2558,7 +1049,7 @@ export async function runAgentCommand(
     await login({
       connection,
       methods: authMethods,
-      launch: { command: cmd, args: cmdArgs, env: agentrqConfig.env },
+      launch: { command: cmd, args: cmdArgs, env },
       preferredId: authMethodId,
       interactive: isInteractiveTerminal(),
     });
@@ -2569,28 +1060,28 @@ export async function runAgentCommand(
 }
 
 /**
- * What native mode runs with, from the gateway's own options and the
+ * What the ACP bridge runs with, from the gateway's own options and the
  * workspace's AgentRQ entry. A string is the reason it cannot run.
  */
 export function nativeOptionsFor(
   options: GatewayOptions,
   acpCmdArgs: string[],
-  agentrqConfig: McpServerConfig,
+  { configs, agentrqConfig }: Workspace,
   cwd: string = process.cwd(),
+  interactive: boolean = isInteractiveTerminal(),
 ): NativeOptions | string {
   const token = tokenFrom(agentrqConfig);
-  if (!token) return "native mode needs the workspace token from .mcp.json";
+  if (!token) return "acp-gateway needs the workspace token from .mcp.json";
   if (!agentrqConfig.url && !options.acpUrl) {
-    return "native mode needs the AgentRQ URL from .mcp.json, or --acp-url";
+    return "acp-gateway needs the AgentRQ URL from .mcp.json, or --acp-url";
   }
   let endpoint: string;
   try {
-    endpoint = nativeEndpoint(agentrqConfig.url ?? "", options.acpVersion ?? 1, options.acpUrl);
+    endpoint = nativeEndpoint(agentrqConfig.url ?? "", options.acpUrl);
   } catch {
-    return `native mode cannot work out the AgentRQ endpoint from "${agentrqConfig.url}"; pass --acp-url`;
+    return `acp-gateway cannot work out the AgentRQ endpoint from "${agentrqConfig.url}"; pass --acp-url`;
   }
   return {
-    version: options.acpVersion ?? 1,
     acpCmdArgs,
     env: agentrqConfig.env,
     endpoint,
@@ -2602,18 +1093,27 @@ export function nativeOptionsFor(
     permissionTimeoutMinutes: Math.round(options.permissionTimeoutMs / 60_000),
     authMethodId: options.authMethodId,
     cwd: path.resolve(cwd),
+    // Every session the agent opens gets them, as under the MCP bridge: the
+    // agent's own tools are configured here, not in AgentRQ.
+    mcpServers: configs,
+    // AgentRQ never runs a terminal login itself. With a terminal here — a
+    // shell, or agentrqd's browser terminal — the bridge runs it instead of
+    // stopping.
+    login: interactive
+      ? () => runAgentCommand("login", acpCmdArgs, agentrqConfig.env, options.authMethodId)
+      : undefined,
   };
 }
 
-/** Runs native mode in place of the MCP bridge, or says why it cannot and exits 1. */
+/** Runs the ACP bridge, or says why it cannot and exits 1. */
 export async function startNativeMode(
   options: GatewayOptions,
   acpCmdArgs: string[],
-  agentrqConfig: McpServerConfig,
+  workspace: Workspace,
   run: (o: NativeOptions) => Promise<void> = runNative,
   exit: (code: number) => void = process.exit.bind(process),
 ): Promise<void> {
-  const native = nativeOptionsFor(options, acpCmdArgs, agentrqConfig);
+  const native = nativeOptionsFor(options, acpCmdArgs, workspace);
   if (typeof native === "string") {
     console.error(`[acp-gateway] ${native}`);
     return exit(1);
@@ -2636,7 +1136,9 @@ USAGE
   acp-gateway [options] --agent <registry-id>
 
   The agent is either a command you supply after \`--\`, or an id from the ACP
-  registry. Everything after \`--\` is passed to the agent untouched.
+  registry. Everything after \`--\` is passed to the agent untouched. Its ACP
+  stream is piped to AgentRQ's ACP v1 endpoint, which speaks ACP itself.
+  Needs Node 22 or newer.
 
 AGENT
   --agent <registry-id>       Run an agent from the ACP registry, installing it
@@ -2678,21 +1180,15 @@ BRIDGE
                               gateway from outside its workspace. Any filename;
                               a directory means the .mcp.json inside it. Its
                               servers win where the names collide.
-  --acp-version <1|2>         Native mode: pipe the agent's ACP stream to AgentRQ,
-                              which speaks ACP version 1 or 2 itself
-                              (/api/acp/v1 or /api/acp/v2), instead of
-                              translating it here. Needs Node 22 or newer.
-  --acp-url <url>             The native endpoint, when it cannot be worked out
+  --acp-url <url>             The ACP endpoint, when it cannot be worked out
                               from .mcp.json.
 
 OTHER
-  --verbose                   Print everything: connections, notifications,
-                              sessions, file access, tool calls, the agent's
-                              own logs and its answer as it streams. Without
-                              it, only each task asked of it, permission
-                              requests, how each task ended, and errors — and
-                              commands that print something and exit print
-                              only that.
+  --verbose                   Print everything: the connection to AgentRQ, the
+                              agent's own logs, and what the one-shot commands
+                              exchange with the agent. Without it, only
+                              warnings and errors — and commands that print
+                              something and exit print only that.
   --help, -h                  Show this help. Exits.
 
 EXAMPLES
@@ -2705,13 +1201,12 @@ EXAMPLES
   acp-gateway --login -- gemini --acp            Log in before running anything
   acp-gateway --max-concurrency 4 -- gemini --acp
   acp-gateway --mcp-json ~/work/.mcp.json -- gemini --acp
-  acp-gateway --acp-version 1 --agent codex-acp  Let AgentRQ speak ACP itself
 
 The workspace comes from .mcp.json, searched for in the current directory and up
-to three directories above it. --mcp-json names one directly, wherever it lives
-and whatever it is called. --list-models, --agent-info, --list-auth-methods,
---login and --logout do not need a workspace, and only read one named with
---mcp-json.`;
+to three directories above it; only its AgentRQ URL and token are used.
+--mcp-json names one directly, wherever it lives and whatever it is called.
+--list-models, --agent-info, --list-auth-methods, --login and --logout do not
+need a workspace.`;
 }
 
 export function printHelp(): void {
@@ -2730,7 +1225,7 @@ async function main() {
   const explicitCommand =
     cmdStartIndex !== -1 ? args.slice(cmdStartIndex + 1) : options.rest;
 
-  const { maxConcurrency, command, authMethodId } = options;
+  const { command } = options;
   setVerbose(options.verbose);
 
   if (command === "help") {
@@ -2754,609 +1249,79 @@ async function main() {
 
   if (shouldPrintBanner(options)) console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
 
-  // 1. Load MCP Config — optional for the commands that only ask the agent
-  // about itself.
-  const { configs, agentrqConfig, mcpBridge } = loadWorkspace(command, options.mcpJsonPath);
+  await runGateway(options, explicitCommand);
+}
 
-  // 2. Work out what actually starts the agent — a registry id, or the command
-  // the user gave.
-  // These failures are all things the user can act on — an unknown registry
-  // id, no build for this platform, an unverifiable download, a mistyped
-  // command — so they get a sentence rather than a stack trace.
-  const fail = (err: unknown): never => {
+/**
+ * Everything `main` does once it knows there is an agent to deal with: find
+ * the workspace, work out the agent's command, then either run a one-shot
+ * command against it or bridge it to AgentRQ.
+ *
+ * Out here rather than in `main` so it can be tested; `main` reads the real
+ * process arguments and never returns.
+ */
+export async function runGateway(
+  options: GatewayOptions,
+  explicitCommand: string[],
+  deps: {
+    resolve?: typeof resolveAgentCommand;
+    agentCommand?: typeof runAgentCommand;
+    bridge?: typeof startNativeMode;
+    exit?: (code: number) => void;
+    startDir?: string;
+  } = {},
+): Promise<void> {
+  const {
+    resolve = resolveAgentCommand,
+    agentCommand = runAgentCommand,
+    bridge = startNativeMode,
+    exit = process.exit.bind(process),
+    startDir = process.cwd(),
+  } = deps;
+
+  // These failures are all things the user can act on — a missing .mcp.json,
+  // an unknown registry id, no build for this platform, an unverifiable
+  // download, a mistyped command — so they get a sentence rather than a stack
+  // trace.
+  const fail = (err: unknown): void => {
     console.error(`[acp-gateway] ${err instanceof Error ? err.message : err}`);
-    return process.exit(1);
+    exit(1);
   };
 
-  const resolved = await resolveAgentCommand(options, explicitCommand).catch(fail);
-  const acpCmdArgs = resolved.command;
+  let workspace: Workspace;
+  let resolved: Awaited<ReturnType<typeof resolveAgentCommand>>;
   try {
-    assertAgentRunnable(acpCmdArgs[0], Boolean(options.agentId));
+    // Optional for the commands that only ask the agent about itself.
+    workspace = loadWorkspace(options.command, options.mcpJsonPath, startDir);
+    resolved = await resolve(options, explicitCommand);
+    assertAgentRunnable(resolved.command[0], Boolean(options.agentId));
   } catch (err) {
-    fail(err);
+    return fail(err);
   }
+  const acpCmdArgs = resolved.command;
+  const { agentrqConfig } = workspace;
   if (resolved.env) {
     // The registry entry's env is part of how that agent must be launched, so
-    // it travels with the command into every session spawned from it.
+    // it travels with the command.
     agentrqConfig.env = { ...agentrqConfig.env, ...resolved.env };
   }
 
-  authConfig.methodId = authMethodId;
-  modelConfig.modelId = options.modelId;
-  permissionConfig.timeoutMs = options.permissionTimeoutMs;
-
-  // What running a task fetched from the workspace takes, in the shape the
-  // gateway's own path uses: a command to open a session from.
-  const taskRunDeps: TaskRunDeps = {
-    acpCmdArgsOrConnection: acpCmdArgs,
-    configsOrSessionSwitcher: configs,
-    agentrqConfigOrAcpClient: agentrqConfig,
-  };
-
-  // Auth commands talk to the agent and exit; they never start bridging tasks.
-  // They run before the bridge connects, so a first-time login still works when
-  // the workspace is unreachable — `callTool` connects on demand if the login
-  // actually needs to reach agentrq.
-  if (command !== "run") {
-    try {
-      await runAgentCommand(command, acpCmdArgs, agentrqConfig, mcpBridge, authMethodId, options.json);
-    } finally {
-      await mcpBridge.close();
-    }
-    process.exit(0);
+  if (options.command === "run") {
+    return bridge(options, acpCmdArgs, workspace);
   }
-
-  // Native mode: AgentRQ is the ACP client, and this process only pipes bytes.
-  // None of the MCP bridge below is used.
-  if (options.acpVersion) return startNativeMode(options, acpCmdArgs, agentrqConfig);
-
-  // After the auth commands, which must not go fetching tasks while someone
-  // logs in. After the bridge, because the queue now reports itself to it — and
-  // fills itself from it: the answer to having room is to go and ask the
-  // workspace for more work, or a limit of three runs one task and waits with
-  // the other two still sitting in the workspace because nothing ever asked.
-  const taskQueue = createSelfFillingTaskQueue(maxConcurrency, mcpBridge, taskRunDeps);
-
-  let cleanupPromise: Promise<void> | null = null;
-  const cleanup = async (signal?: string) => {
-    if (cleanupPromise) return cleanupPromise;
-    cleanupPromise = (async () => {
-      if (signal) {
-        console.error(
-          `\n[acp-gateway] Received ${signal}, closing active sessions and shutting down...`,
-        );
-      }
-      try {
-        await closeAllSessions();
-      } catch (err) {
-        console.error("[acp-gateway] Error closing active sessions:", err);
-      }
-      try {
-        await mcpBridge.close();
-      } catch (err) {
-        console.error("[acp-gateway] Error closing MCP bridge:", err);
-      }
-    })();
-    return cleanupPromise;
-  };
-
-  const removeSignalHandlers = setupSignalHandlers(async (signal) => {
-    await cleanup(signal);
-    process.exit(0);
-  });
-
-  try {
-    // Bridge: MCP -> ACP
-    // When the MCP server sends a notification to 'notifications/claude/channel',
-    // it contains a new task content.
-    mcpBridge.on("task", ({ content, meta }) => {
-      const taskId = extractTaskIdFromMeta(meta);
-      if (taskId) {
-        if (lastTaskContent.get(taskId) === content) {
-          debug(`[bridge] Dropping repetitive task notification for ${taskId}`);
-          return;
-        }
-        lastTaskContent.set(taskId, content);
-      }
-      announceTask(content, taskId);
-      const queuedSeq = nextTaskSeq();
-      // Behind any turn already running for this task, and behind it *before*
-      // asking for a queue slot: one session takes one turn at a time, and two
-      // messages on one chat arrive as two deliveries of one task. Waiting
-      // inside a slot would hold a share of the concurrency limit while doing
-      // nothing at all — enough messages on one chat would hold every slot and
-      // stop the gateway running anything else.
-      runTurnForTask(taskId, () =>
-        taskQueue.run(async () => {
-          if (isTaskCancelled(taskId, queuedSeq)) {
-            console.error(
-              `[bridge] Task ${taskId} was cancelled before execution started, skipping`,
-            );
-            return;
-          }
-          try {
-            const sessionInfo = await getOrCreateSession(
-              taskId,
-              acpCmdArgs,
-              configs,
-              agentrqConfig,
-              mcpBridge,
-            );
-            // Checked again here as well as above: waiting for the turn ahead
-            // of this one is another window in which a cancel can land.
-            if (isTaskCancelled(taskId, queuedSeq)) {
-              console.error(
-                `[bridge] Task ${taskId} was cancelled during session setup, cancelling session`,
-              );
-              await sessionInfo.acpClient.cancelTurn(sessionInfo.sessionId);
-              return;
-            }
-            const result = await sessionInfo.connection.prompt({
-              sessionId: sessionInfo.sessionId,
-              prompt: [{ type: "text", text: content }],
-            });
-
-            await sessionInfo.acpClient.flushReply(sessionInfo.sessionId);
-            await sessionInfo.acpClient.reportStopReason(
-              sessionInfo.sessionId,
-              result.stopReason,
-            );
-            announceFinished(taskId, result.stopReason);
-          } catch (err) {
-            console.error("[acp] Error during prompt execution:", err);
-          }
-        }),
-      ).catch((err) => {
-        console.error("[bridge] Error queuing task:", err);
-      });
-    });
-
-    // Listen for task cancellation events from the MCP bridge
-    mcpBridge.on("cancel", ({ taskId, reason }: { taskId?: string; reason?: string }) => {
-      handleTaskCancellation(taskId, reason).catch((err) => {
-        console.error("[bridge] Error handling task cancellation:", err);
-      });
-    });
-
-    mcpBridge.on(
-      "setModel",
-      (params: { sessionId?: string; configId?: string; modelId?: string }) => {
-        handleSetModel(params, mcpBridge).catch((err) => {
-          console.error("[bridge] Error handling model selection:", err);
-        });
-      },
-    );
-
-    registerConcurrencyListeners(mcpBridge, taskQueue);
-
-    // Everything above is listening; nothing below can be missed.
-    //
-    // The agent comes up before the workspace is told anything, so a task can
-    // never be handed to a gateway whose agent is not ready — or, if it needs a
-    // login nobody can give it, to one that will never be ready. Awaited for
-    // that reason: whatever the workspace learns next, it learns about an agent
-    // that already exists.
-    //
-    // The handlers above are registered first because opening that session
-    // sends notifications, and sending one opens the connection. A task pushed
-    // between the connection opening and something listening for it is a task
-    // dropped on the floor.
-    const idle = await openIdleSession(
-      acpCmdArgs,
-      configs,
-      agentrqConfig,
-      mcpBridge,
-      loginCommandFor(options.agentId, explicitCommand),
-    );
-    if (idle === "unauthenticated") {
-      // Nothing to unwind: the agent was terminated where it was spawned, and
-      // the workspace connection below has not been opened yet.
-      removeSignalHandlers();
-      process.exit(1);
-    }
-
-    await mcpBridge.connect();
-
-    // Said before any task runs, because that is when a human looking at the
-    // workspace wants to know how much work it will take at once — and because
-    // the control cannot be rendered at all until the workspace knows both the
-    // current limit and that this gateway is one that will act on a change.
-    void reportConcurrency(mcpBridge, taskQueue);
-
-    // Only when the agent has not spoken for itself. A session that came up
-    // already reported the agent's own name, title and version from its
-    // handshake, and the registry's entry is a coarser answer to the same
-    // question — sending it after would replace what the agent said about
-    // itself with what an index says about it, dropping the title and swapping
-    // the running version for a published one.
-    if (idle !== "ready" && resolved.identity) {
-      void sendAgentIdentity(mcpBridge, resolved.identity);
-    }
-
-    // Initial fill: every slot the limit allows, not just the first. A gateway
-    // that comes up to a workspace with work waiting should start as much of it
-    // as it is allowed to run.
-    //
-    // Not awaited for the work itself — this resolves once the slots are filled,
-    // and the tasks in them run on past it.
-    await drainPendingTasks(mcpBridge, taskQueue, { ...taskRunDeps, taskQueue });
-
-    // Keep the process alive
-    await new Promise(() => { });
-  } catch (error) {
-    console.error("[acp-gateway] Error:", error);
-  } finally {
-    removeSignalHandlers();
-    await cleanup();
-    process.exit(0);
-  }
-}
-
-/** A task the workspace handed over, and where it fell in the stream of events. */
-export interface PendingTask {
-  /** What the agent is to be prompted with, exactly as the workspace worded it. */
-  text: string;
-  taskId?: string;
-  /**
-   * Stamped when the task was taken, not when it starts: a cancel that arrives
-   * while the session is still being opened has to stop it just the same.
-   */
-  queuedSeq: number;
-}
-
-/**
- * Everything running a fetched task needs, in either of the two shapes callers
- * pass it — an agent command to open a session from, or a connection and
- * session switcher already open.
- */
-export interface TaskRunDeps {
-  acpCmdArgsOrConnection: string[] | acp.ClientSideConnection;
-  configsOrSessionSwitcher:
-    | McpServerConfig[]
-    | ReturnType<typeof createAcpSessionSwitcher>
-    | unknown;
-  agentrqConfigOrAcpClient: McpServerConfig | AgentRQACPClient;
-  taskQueue?: TaskQueue;
-  acpCmdArgs?: string[];
-  configs?: McpServerConfig[];
-  agentrqConfig?: McpServerConfig;
-}
-
-/**
- * What one ask of the workspace turned up.
- *
- * Three different kinds of nothing, because a caller filling slots has to
- * treat them differently: an empty workspace means stop, a task dropped as a
- * repeat means this slot is still free and the next task may fill it, and a
- * workspace that could not be asked means stop and let the bridge's own
- * reconnection sort it out rather than hammer it.
- */
-export type FetchOutcome =
-  | { status: "task"; task: PendingTask }
-  | { status: "empty" }
-  | { status: "skipped" }
-  | { status: "failed" };
-
-/**
- * Takes the next not-started task off the workspace.
- *
- * `getTask` with no task id dequeues one task, so this is one task per call —
- * which is exactly why the gateway has to call it again to fill a second slot.
- *
- * Never throws: a workspace that cannot be reached is an outcome like any
- * other here, and the caller is in the middle of filling slots.
- */
-export async function fetchNextTask(
-  mcpBridge: MCPBridge,
-): Promise<FetchOutcome> {
-  debug("[bridge] Checking for next task via MCP server...");
-  // Stamped before the fetch, so a cancel that arrives while `getTask` is in
-  // flight (or while the session is being opened) still stops the task.
-  const queuedSeq = nextTaskSeq();
-  try {
-    const result = await callTaskAction(mcpBridge, "get");
-
-    if (result.isError) {
-      console.error("[mcp] Error getting next task:", result.content);
-      return { status: "failed" };
-    }
-
-    const contentBlock = result.content as Array<{
-      type: string;
-      text?: string;
-    }>;
-    const content = contentBlock[0] as { type: string; text: string };
-    if (
-      !content ||
-      !content.text ||
-      content.text.includes("no pending tasks exist")
-    ) {
-      debug("[bridge] No pending tasks available.");
-      return { status: "empty" };
-    }
-
-    const text = content.text;
-    const taskId = extractTaskIdFromText(text);
-    if (taskId) {
-      if (lastTaskContent.get(taskId) === text) {
-        debug(`[bridge] Dropping repetitive checked task for ${taskId}`);
-        return { status: "skipped" };
-      }
-      lastTaskContent.set(taskId, text);
-    }
-    announceTask(text, taskId);
-    return { status: "task", task: { text, taskId, queuedSeq } };
-  } catch (err) {
-    console.error("[bridge] Failed to check for next task:", err);
-    return { status: "failed" };
-  }
-}
-
-/**
- * Hands a fetched task to the agent, through the queue and behind any turn the
- * task already has running.
- *
- * Resolves when the agent is done with it, so a caller that wants to fill the
- * *next* slot must not wait for this one.
- */
-export async function startPendingTask(
-  task: PendingTask,
-  mcpBridge: MCPBridge,
-  deps: TaskRunDeps,
-): Promise<void> {
-  const { text, taskId, queuedSeq } = task;
-  const runFn = async () => {
-    if (isTaskCancelled(taskId, queuedSeq)) {
-      console.error(
-        `[bridge] Task ${taskId} was cancelled before execution started, skipping`,
-      );
-      return;
-    }
-    let connectionToUse: acp.ClientSideConnection | undefined;
-    let acpClientToUse: AgentRQACPClient | undefined;
-    let sessionIdToUse: string | undefined;
-
-    let actualAcpCmdArgs: string[] = [];
-    let actualConfigs: McpServerConfig[] = [];
-    let actualAgentrqConfig: McpServerConfig | undefined;
-
-    if (Array.isArray(deps.acpCmdArgsOrConnection)) {
-      actualAcpCmdArgs = deps.acpCmdArgsOrConnection;
-      actualConfigs = deps.configsOrSessionSwitcher as McpServerConfig[];
-      actualAgentrqConfig = deps.agentrqConfigOrAcpClient as McpServerConfig;
-    } else {
-      connectionToUse = deps.acpCmdArgsOrConnection as acp.ClientSideConnection;
-      acpClientToUse = deps.agentrqConfigOrAcpClient as AgentRQACPClient;
-      const switcher = deps.configsOrSessionSwitcher as any;
-      if (switcher && typeof switcher.ensureForTask === "function") {
-        sessionIdToUse = await switcher.ensureForTask(taskId);
-      }
-      actualAcpCmdArgs = deps.acpCmdArgs || [];
-      actualConfigs = deps.configs || [];
-      actualAgentrqConfig = deps.agentrqConfig;
-    }
-
-    if (!connectionToUse) {
-      const sessionInfo = await getOrCreateSession(
-        taskId,
-        actualAcpCmdArgs,
-        actualConfigs,
-        actualAgentrqConfig!,
-        mcpBridge,
-      );
-      connectionToUse = sessionInfo.connection;
-      sessionIdToUse = sessionInfo.sessionId;
-      acpClientToUse = sessionInfo.acpClient;
-    }
-
-    // Spawning the agent and opening the session takes seconds; a cancel
-    // that lands in that window has no turn to stop yet, so check again
-    // before handing the agent the work.
-    if (isTaskCancelled(taskId, queuedSeq)) {
-      console.error(
-        `[bridge] Task ${taskId} was cancelled during session setup, cancelling session`,
-      );
-      await acpClientToUse?.cancelTurn(sessionIdToUse);
-      return;
-    }
-
-    const promptResult = await connectionToUse.prompt({
-      sessionId: sessionIdToUse!,
-      prompt: [{ type: "text", text }],
-    });
-
-    await acpClientToUse!.flushReply(sessionIdToUse!);
-    await acpClientToUse!.reportStopReason(sessionIdToUse!, promptResult.stopReason);
-    announceFinished(taskId, promptResult.stopReason);
-  };
-
-  // Serialised against any turn already running for this task, for the
-  // reason runTurnForTask records: this path and the push notification can
-  // both be handed the same task, and word it differently enough that the
-  // repetition guard drops neither.
-  //
-  // Outside the queue slot rather than inside it, so a delivery that is
-  // only waiting for the turn ahead of it is not also holding a share of
-  // the concurrency limit while it waits.
-  await runTurnForTask(taskId, () =>
-    deps.taskQueue ? deps.taskQueue.run(runFn) : runFn(),
+  // One-shot commands talk to the agent and exit.
+  await agentCommand(
+    options.command,
+    acpCmdArgs,
+    agentrqConfig.env,
+    options.authMethodId,
+    options.json,
   );
+  exit(0);
 }
-
-/** How many more tasks the queue could start right now. */
-export function freeSlots(queue: TaskQueue): number {
-  return Math.max(
-    0,
-    queue.getMaxConcurrency() - queue.getActiveCount() - queue.getQueueLength(),
-  );
-}
-
-/**
- * The drain in progress, if one is, and whether room appeared while it ran.
- *
- * One drain at a time, for the same reason there is one concurrency report at
- * a time: every trigger for this — a task finishing, a limit being raised —
- * can land while a drain is already waiting on `getTask`, and a second drain
- * started there would be asking the workspace for the task the first one is
- * about to be handed.
- *
- * The flag is what keeps collapsing them from losing one. A slot that came
- * free during a fetch is real, and the drain that swallowed the news may
- * already have decided the workspace was empty — so the news is answered once
- * that drain finishes rather than dropped.
- */
-let drainOnTheWire: Promise<void> | null = null;
-let capacityMovedAgain = false;
-
-/** Forgets any drain in flight. For tests. */
-export function resetPendingTaskDrain(): void {
-  drainOnTheWire = null;
-  capacityMovedAgain = false;
-}
-
-/**
- * How many repeats in a row the drain will take before it stops asking.
- *
- * A repeat has been dequeued and dropped, so the slot it should have filled is
- * still free and the task behind it may well fill it — but a workspace handing
- * back the same task forever must not hold the gateway in a fetch loop.
- */
-export const MAX_SKIPPED_FETCHES = 3;
-
-/**
- * How often the self-filling queue checks for work on its own while idle.
- *
- * The event-driven path above covers a task finishing and freeing a slot, but
- * a queue with nothing active has no such event to wait for — a workspace
- * empty at startup, or one that drained to empty and stayed there, would
- * otherwise never be asked again. This is the fallback for exactly that gap,
- * not a replacement for the event-driven check.
- */
-export const IDLE_TASK_POLL_INTERVAL_MS = 40_000;
-
-/**
- * Fills every free slot the queue has with work from the workspace.
- *
- * The gateway used to ask for exactly one task, once, at startup — which was
- * the whole story while it could only run one. Above that, three tasks waiting
- * in a workspace and three slots here meant one task running and two slots
- * idle, because nothing ever went back to ask for the second and third.
- *
- * Fetches are sequential and the runs are not: `getTask` dequeues a task, so
- * two fetches in flight at once are two chances to be handed the same one,
- * while waiting for a task to *finish* before fetching the next would defeat
- * the point entirely. So each task is started and left to run, and the next
- * fetch goes out immediately behind it.
- *
- * Stops as soon as the workspace says it has nothing — the run that frees the
- * next slot brings us back here anyway.
- */
-export function drainPendingTasks(
-  mcpBridge: MCPBridge,
-  queue: TaskQueue,
-  deps: TaskRunDeps,
-): Promise<void> {
-  if (drainOnTheWire) {
-    capacityMovedAgain = true;
-    return drainOnTheWire;
-  }
-  // The slot is cleared from a `.finally` on the promise rather than from
-  // inside `pullUntilFull`. An async function that never reaches an `await` —
-  // which is exactly what a drain with no free slot is — runs to completion
-  // before its promise is ever handed back, so a clear written inside it would
-  // happen *before* the assignment below and leave a settled promise sitting
-  // in the slot for the rest of the process. Every later drain would then find
-  // the slot occupied and quietly fetch nothing, which is this whole feature
-  // switching itself off. `.finally` cannot beat the assignment: it settles a
-  // microtask later at the earliest.
-  const drain = pullUntilFull(mcpBridge, queue, deps).finally(() => {
-    drainOnTheWire = null;
-  });
-  drainOnTheWire = drain;
-  return drain;
-}
-
-/** Fetches and starts tasks until the queue is full or the workspace is empty. */
-async function pullUntilFull(
-  mcpBridge: MCPBridge,
-  queue: TaskQueue,
-  deps: TaskRunDeps,
-): Promise<void> {
-  do {
-    // Read at the top of each pass: room that appears while this one is
-    // mid-fetch is answered by the next pass rather than lost, and joining a
-    // drain already running is what set it.
-    capacityMovedAgain = false;
-    // Tasks started but waiting on an earlier turn for their own chat. They
-    // have taken no slot and will not until that turn ends, so the queue still
-    // reads as having room — and without counting them the loop fetches
-    // against that same room over and over, emptying the workspace into this
-    // process where nothing else can hand the work to anyone else.
-    let parked = 0;
-    let skipped = 0;
-    while (freeSlots(queue) - parked > 0) {
-      const outcome = await fetchNextTask(mcpBridge);
-      if (outcome.status === "empty" || outcome.status === "failed") break;
-      if (outcome.status === "skipped") {
-        // Dropped as a repeat of something already running: the slot is still
-        // free, so try what is behind it rather than abandoning the slot.
-        if (++skipped >= MAX_SKIPPED_FETCHES) break;
-        continue;
-      }
-      skipped = 0;
-      const { task } = outcome;
-      const heldBefore = queue.getActiveCount() + queue.getQueueLength();
-      // Deliberately not awaited: this task is running now, and the slot
-      // beside it is what this loop is here to fill.
-      void startPendingTask(task, mcpBridge, { ...deps, taskQueue: queue }).catch(
-        (err) => {
-          console.error(
-            `[bridge] Error running task ${task.taskId ?? "(unnamed)"}:`,
-            err,
-          );
-        },
-      );
-      // `run` takes its slot before it yields, so a queue that did not move is
-      // a task parked behind a turn rather than one holding a slot.
-      if (queue.getActiveCount() + queue.getQueueLength() === heldBefore) parked++;
-    }
-  } while (capacityMovedAgain);
-}
-
-/**
- * Builds a queue that goes and fetches its own work.
- *
- * Out here rather than inline in `main()` for the reason `createTaskQueue`
- * records: `main()` spawns processes and never returns, so wiring written
- * inside it is wiring nothing exercises. And this is wiring worth exercising —
- * it is the whole of "a gateway with room for three tasks runs three tasks".
- *
- * The callback names the queue it is being handed to, which is safe for the
- * same reason `createTaskQueue`'s is: it only ever runs later, from inside the
- * queue's own methods.
- */
-export function createSelfFillingTaskQueue(
-  maxConcurrency: number,
-  mcpBridge: MCPBridge,
-  deps: Omit<TaskRunDeps, "taskQueue">,
-): TaskQueue {
-  const queue: TaskQueue = createTaskQueue(maxConcurrency, mcpBridge, () => {
-    void drainPendingTasks(mcpBridge, queue, { ...deps, taskQueue: queue });
-  });
-  // Only while idle: a task running (or waiting) will itself free a slot and
-  // trigger the check above, so a tick that found active work would just be
-  // asking the workspace something the event-driven path already has covered.
-  setInterval(() => {
-    if (queue.getActiveCount() > 0) return;
-    void drainPendingTasks(mcpBridge, queue, { ...deps, taskQueue: queue });
-  }, IDLE_TASK_POLL_INTERVAL_MS).unref();
-  return queue;
-}
-
 
 if (process.env.NODE_ENV !== "test") {
-  // Keep the gateway alive across transient failures. The MCP transport has its
-  // own reconnect logic (mcpClient.ts), so a stray rejected promise or async
+  // The bridge reconnects on its own, so a stray rejected promise or async
   // error from a dropped connection should be logged, not fatal. Without these
   // nets, Node terminates the process on the first unhandled rejection.
   process.on("unhandledRejection", (reason) => {
@@ -3366,8 +1331,8 @@ if (process.env.NODE_ENV !== "test") {
     console.error("[acp-gateway] Uncaught exception (continuing):", err);
   });
 
-  // A rejection from main() itself means startup failed before the bridge was
-  // established — that is genuinely fatal, so exit.
+  // A rejection from main() itself means startup failed — that is genuinely
+  // fatal, so exit.
   main().catch((err) => {
     console.error("[fatal]", err);
     process.exit(1);

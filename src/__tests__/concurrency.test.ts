@@ -1,11 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
-  CONCURRENCY_NOTIFICATION_METHOD,
   MAX_MAX_CONCURRENCY,
   MIN_MAX_CONCURRENCY,
-  SET_CONCURRENCY_NOTIFICATION_METHOD,
   normalizeConcurrency,
-  sendConcurrencyNotification,
 } from "../concurrency.js";
 
 describe("concurrency", () => {
@@ -17,17 +14,6 @@ describe("concurrency", () => {
 
   afterEach(() => {
     errorSpy.mockRestore();
-  });
-
-  describe("notification methods", () => {
-    it("sits on the same channel as the rest of the workspace directives", () => {
-      expect(SET_CONCURRENCY_NOTIFICATION_METHOD).toBe(
-        "notifications/claude/channel/set_concurrency",
-      );
-      expect(CONCURRENCY_NOTIFICATION_METHOD).toBe(
-        "notifications/claude/channel/concurrency",
-      );
-    });
   });
 
   describe("normalizeConcurrency", () => {
@@ -67,96 +53,6 @@ describe("concurrency", () => {
       expect(normalizeConcurrency(Infinity)).toBeUndefined();
       expect(normalizeConcurrency({})).toBeUndefined();
       expect(normalizeConcurrency(true)).toBeUndefined();
-    });
-  });
-
-  describe("sendConcurrencyNotification", () => {
-    it("reports the limit, the queue under it, and the range on offer", async () => {
-      const bridge = { sendNotification: vi.fn().mockResolvedValue(undefined) };
-
-      await sendConcurrencyNotification(bridge, {
-        maxConcurrency: 4,
-        active: 2,
-        queued: 3,
-      });
-
-      expect(bridge.sendNotification).toHaveBeenCalledWith(
-        CONCURRENCY_NOTIFICATION_METHOD,
-        expect.objectContaining({
-          maxConcurrency: 4,
-          active: 2,
-          queued: 3,
-          min: MIN_MAX_CONCURRENCY,
-          max: MAX_MAX_CONCURRENCY,
-        }),
-      );
-    });
-
-    it("spells every field one way, with no snake_case twin to keep in step", async () => {
-      const bridge = { sendNotification: vi.fn().mockResolvedValue(undefined) };
-
-      await sendConcurrencyNotification(bridge, {
-        maxConcurrency: 4,
-        active: 0,
-        queued: 0,
-      });
-
-      expect(Object.keys(bridge.sendNotification.mock.calls[0][1]).sort()).toEqual([
-        "active",
-        "canSet",
-        "max",
-        "maxConcurrency",
-        "min",
-        "queued",
-        "sessionId",
-        "taskId",
-      ]);
-    });
-
-    it("declares that it will act on being told to change, so old gateways stay read-only", async () => {
-      const bridge = { sendNotification: vi.fn().mockResolvedValue(undefined) };
-
-      await sendConcurrencyNotification(bridge, {
-        maxConcurrency: 1,
-        active: 0,
-        queued: 0,
-      });
-
-      expect(bridge.sendNotification.mock.calls[0][1]).toMatchObject({ canSet: true });
-    });
-
-    it("sends empty task and session ids, which the workspace ignores", async () => {
-      const bridge = { sendNotification: vi.fn().mockResolvedValue(undefined) };
-
-      await sendConcurrencyNotification(bridge, {
-        maxConcurrency: 2,
-        active: 0,
-        queued: 0,
-      });
-
-      expect(bridge.sendNotification.mock.calls[0][1]).toMatchObject({
-        taskId: "",
-        sessionId: "",
-      });
-    });
-
-    it("never throws when the workspace cannot take the update", async () => {
-      const bridge = {
-        sendNotification: vi.fn().mockRejectedValue(new Error("socket closed")),
-      };
-
-      await expect(
-        sendConcurrencyNotification(bridge, {
-          maxConcurrency: 2,
-          active: 1,
-          queued: 0,
-        }),
-      ).resolves.toBeUndefined();
-
-      expect(errorSpy).toHaveBeenCalledWith(
-        "[bridge] Failed to send concurrency notification:",
-        expect.any(Error),
-      );
     });
   });
 });
