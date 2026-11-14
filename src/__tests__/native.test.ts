@@ -1480,4 +1480,100 @@ describe("runNative", () => {
     write.mockRestore();
     void resolveAsk;
   });
+
+  it("cancels an in-flight OAuth relay prompt immediately when the agent exits", async () => {
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    let capturedSignal: AbortSignal | undefined;
+    const askUntil = vi.fn(
+      (_q: string, signal: AbortSignal) =>
+        new Promise<string>((_resolve, reject) => {
+          capturedSignal = signal;
+          signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+
+    const t = await start({ askUntil });
+    t.ws().open();
+    t.ws().welcome({ connectionId: "AB" });
+
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "auth-exit",
+        method: "authenticate",
+        params: { methodId: "google-login" },
+      }),
+    );
+    t.children[0].stderr.write(
+      "Open: https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A43123%2Fcb\n",
+    );
+    await flush();
+    expect(askUntil).toHaveBeenCalledTimes(1);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    // Agent exits before respawn delay completes: auth prompt must abort immediately, not stay open during backoff.
+    t.children[0].emit("exit", 1, null);
+    await flush();
+    expect(capturedSignal?.aborted).toBe(true);
+    write.mockRestore();
+  });
+
+  it("bounds remembered tool call titles with LRU eviction", async () => {
+    const t = await connected();
+
+    for (let i = 0; i < 1024; i++) {
+      t.children[0].stdout.write(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: "s-1",
+            update: { sessionUpdate: "tool_call", toolCallId: `tc-${i}`, title: `Tool ${i}` },
+          },
+        }) + "\n",
+      );
+    }
+    // Refresh tc-0 so tc-1 becomes the least-recently-used entry, then insert a 1025th entry.
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "s-1",
+          update: { sessionUpdate: "tool_call_update", toolCallId: "tc-0", title: "Refreshed Tool 0" },
+        },
+      }) + "\n",
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "s-1",
+          update: { sessionUpdate: "tool_call", toolCallId: "tc-1024", title: "Tool 1024" },
+        },
+      }) + "\n",
+    );
+
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "perm-evicted",
+        method: "session/request_permission",
+        params: { sessionId: "s-1", toolCall: { toolCallId: "tc-1" } },
+      }) + "\n",
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "perm-kept",
+        method: "session/request_permission",
+        params: { sessionId: "s-1", toolCall: { toolCallId: "tc-0" } },
+      }) + "\n",
+    );
+    await flush();
+
+    expect(printed()).toContain("🔐 ACP Permission requested: Unknown Tool (ID: tc-1)");
+    expect(printed()).toContain("🔐 ACP Permission requested: Refreshed Tool 0 (ID: tc-0)");
+  });
 });
