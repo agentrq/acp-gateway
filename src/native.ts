@@ -18,6 +18,7 @@ import {
   LineSplitter,
   MAX_LINE_BYTES,
   ReplayRing,
+  SESSION_OPEN_METHODS,
   STDERR_TAIL_LINES,
   abandonedAnswer,
   backoffMs,
@@ -63,6 +64,7 @@ const RESPAWN_WINDOW_MS = 5 * 60_000;
 /** Closes in a row without a welcome before the preflight is asked again. */
 const PREFLIGHT_AFTER_CLOSES = 5;
 const PREFLIGHT_TIMEOUT_MS = 15_000;
+const SESSION_OPEN_WARN_MS = 15_000;
 const HIGH_WATER = 8 * 1024 * 1024;
 const LOW_WATER = 1024 * 1024;
 const DRAIN_POLL_MS = 50;
@@ -201,9 +203,17 @@ export async function runNative(o: NativeOptions): Promise<void> {
   const promptTasks = new Map<string, string | undefined>();
   /** Agent-side request id → method id for in-flight `authenticate` requests from AgentRQ. */
   const authRequests = new Map<string, string>();
+  /** Agent-side request id → tracking state for in-flight `session/new`, `session/load`, `session/resume`, `session/fork`. */
+  const sessionOpenRequests = new Map<
+    string,
+    { method: string; startedAt: number; stalled: boolean; sawStderr: boolean; timer: ReturnType<typeof setTimeout> }
+  >();
   let authAbort: AbortController | undefined;
   let authRelaying: Promise<void> | undefined;
   let authStderrBuf = "";
+  let authPromptDetected = false;
+  let sessionStderrBuf = "";
+  let sessionStderrStreaming = false;
   /** Tool call id → human-readable title remembered from `session/update` notifications. */
   const toolCallTitles = new Map<string, string>();
   /** The agent's requests AgentRQ has not answered, by id: method. */
@@ -228,10 +238,49 @@ export async function runNative(o: NativeOptions): Promise<void> {
     authRequests.clear();
     authStderrBuf = "";
     authRelaying = undefined;
+    authPromptDetected = false;
     if (authAbort) {
       authAbort.abort();
       authAbort = undefined;
     }
+  };
+
+  const clearSessionOpenWatch = () => {
+    for (const entry of sessionOpenRequests.values()) {
+      clearTimeout(entry.timer);
+      timers.delete(entry.timer);
+    }
+    sessionOpenRequests.clear();
+    sessionStderrBuf = "";
+    sessionStderrStreaming = false;
+  };
+
+  const finishSessionOpen = (key: string) => {
+    const entry = sessionOpenRequests.get(key);
+    if (!entry) return undefined;
+    sessionOpenRequests.delete(key);
+    clearTimeout(entry.timer);
+    timers.delete(entry.timer);
+    return entry;
+  };
+
+  const tidySessionOpenWatch = () => {
+    if (sessionOpenRequests.size > 0) return;
+    sessionStderrBuf = "";
+    sessionStderrStreaming = false;
+    if (authRequests.size === 0) clearAuthWatch();
+  };
+
+  const flushSessionStderr = () => {
+    if (!sessionStderrBuf) return;
+    process.stderr.write(sessionStderrBuf);
+    if (!sessionStderrBuf.endsWith("\n")) process.stderr.write("\n");
+    const lines = sessionStderrBuf
+      .split("\n")
+      .map((l) => l.replace(/\r$/, ""))
+      .filter((l) => l.length > 0);
+    if (lines.length > 0) sendControl({ agentrqBridge: "stderr", lines });
+    sessionStderrBuf = "";
   };
 
   const clearDrainPoll = () => {
@@ -253,6 +302,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
     if (stopped) return;
     stopped = true;
     clearAuthWatch();
+    clearSessionOpenWatch();
     for (const t of timers) clearTimeout(t);
     timers.clear();
     clearInterval(ackTimer);
@@ -340,6 +390,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
     closingSessions.clear();
     promptTasks.clear();
     clearAuthWatch();
+    clearSessionOpenWatch();
     toolCallTitles.clear();
     agentRequests.clear();
     sessionsInUse.clear();
@@ -356,11 +407,33 @@ export async function runNative(o: NativeOptions): Promise<void> {
     let partial = "";
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
-      if (isVerbose() || authRequests.size > 0) process.stderr.write(chunk);
-      if (authRequests.size > 0 && (o.login !== undefined || o.askUntil !== undefined) && !authRelaying && authAbort) {
+      if (isVerbose() || authRequests.size > 0 || sessionStderrStreaming) {
+        process.stderr.write(chunk);
+      } else if (sessionOpenRequests.size > 0) {
+        sessionStderrBuf = (sessionStderrBuf + chunk).slice(-AGENT_STDERR_TAIL_LENGTH);
+      }
+      for (const entry of sessionOpenRequests.values()) entry.sawStderr = true;
+      if ((authRequests.size > 0 || sessionOpenRequests.size > 0) && !authPromptDetected) {
         authStderrBuf = (authStderrBuf + chunk).slice(-AGENT_STDERR_TAIL_LENGTH);
         const redirect = findLoopbackRedirect(authStderrBuf.slice(0, authStderrBuf.lastIndexOf("\n") + 1));
-        if (redirect) authRelaying = relayLoopbackRedirect(redirect, authAbort.signal, o.askUntil);
+        if (redirect) {
+          authPromptDetected = true;
+          if (authRequests.size === 0) {
+            if (!isVerbose() && !sessionStderrStreaming) {
+              sessionStderrStreaming = true;
+              flushSessionStderr();
+            }
+            const hint =
+              o.login !== undefined || o.askUntil !== undefined
+                ? "[auth] The agent started browser sign-in during session setup; waiting for sign-in..."
+                : "[auth] The agent started browser sign-in during session setup, but no interactive terminal is attached; run `acp-gateway --login` to re-authenticate.";
+            console.error(hint);
+            sendControl({ agentrqBridge: "stderr", lines: [hint] });
+          }
+          if ((o.login !== undefined || o.askUntil !== undefined) && authAbort) {
+            authRelaying = relayLoopbackRedirect(redirect, authAbort.signal, o.askUntil);
+          }
+        }
       }
       const parts = (partial + chunk).split("\n");
       partial = parts.pop() ?? "";
@@ -485,7 +558,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
       if (authRequests.has(idKey)) {
         const methodId = authRequests.get(idKey);
         authRequests.delete(idKey);
-        if (authRequests.size === 0) clearAuthWatch();
+        if (authRequests.size === 0 && sessionOpenRequests.size === 0) clearAuthWatch();
         if (shape.error !== undefined) {
           console.error(
             `[auth] Authentication failed (${methodId}): ${shape.error.message ?? shape.error.code ?? "unknown"}`,
@@ -493,6 +566,20 @@ export async function runNative(o: NativeOptions): Promise<void> {
         } else {
           console.error(`[auth] Logged in with "${methodId}".`);
         }
+      }
+      const open = finishSessionOpen(idKey);
+      if (open) {
+        if (shape.error !== undefined) {
+          flushSessionStderr();
+          const msg = `[acp-gateway] ${open.method} failed: ${shape.error.message ?? shape.error.code ?? "unknown"}`;
+          console.error(msg);
+          sendControl({ agentrqBridge: "stderr", lines: [msg] });
+        } else if (open.stalled) {
+          console.error(
+            `[acp-gateway] ${open.method} completed after ${Math.max(1, Math.round((now() - open.startedAt) / 1000))} s.`,
+          );
+        }
+        tidySessionOpenWatch();
       }
       if (promptTasks.has(idKey)) {
         const taskId = promptTasks.get(idKey);
@@ -556,6 +643,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
     closingSessions.clear();
     promptTasks.clear();
     clearAuthWatch();
+    clearSessionOpenWatch();
     const stdin = agent.child.stdin;
     for (const [id, method] of agentRequests) stdin?.write(abandonedAnswer(id, method) + "\n");
     agentRequests.clear();
@@ -624,12 +712,18 @@ export async function runNative(o: NativeOptions): Promise<void> {
         sessionsInUse.add(activeSession);
       }
     }
-    if (epoch > 0 && shape?.method === "$/cancel_request" && shape.params?.requestId !== undefined) {
-      const agentReqId = `${epoch}:${shape.params.requestId}`;
+    if (shape?.method === "$/cancel_request" && shape.params?.requestId !== undefined) {
+      const agentReqId = epoch > 0 ? `${epoch}:${shape.params.requestId}` : String(shape.params.requestId);
       promptTasks.delete(agentReqId);
-      frame = withRequestId(frame, agentReqId);
-    } else if (epoch === 0 && shape?.method === "$/cancel_request" && shape.params?.requestId !== undefined) {
-      promptTasks.delete(String(shape.params.requestId));
+      const open = finishSessionOpen(agentReqId);
+      if (open) {
+        flushSessionStderr();
+        const msg = `[acp-gateway] ${open.method} was cancelled while waiting on the agent.`;
+        console.error(msg);
+        sendControl({ agentrqBridge: "stderr", lines: [msg] });
+        tidySessionOpenWatch();
+      }
+      if (epoch > 0) frame = withRequestId(frame, agentReqId);
     }
     if (shape?.method !== undefined && shape.id !== undefined) {
       if (shape.method === "initialize") {
@@ -647,9 +741,39 @@ export async function runNative(o: NativeOptions): Promise<void> {
       const agentId = epoch > 0 ? `${epoch}:${shape.id}` : shape.id;
       if (shape.method === "authenticate") {
         const methodId = typeof shape.params?.methodId === "string" && shape.params.methodId ? shape.params.methodId : "default";
-        if (authRequests.size === 0) authAbort = new AbortController();
+        if (!authAbort) authAbort = new AbortController();
         authRequests.set(String(agentId), methodId);
         console.error(`[auth] The agent requires authentication (${methodId}); waiting for sign-in...`);
+      } else if (SESSION_OPEN_METHODS.has(shape.method)) {
+        const key = String(agentId);
+        const method = shape.method;
+        if (!authAbort) authAbort = new AbortController();
+        const entry = {
+          method,
+          startedAt: now(),
+          stalled: false,
+          sawStderr: false,
+          timer: undefined as unknown as ReturnType<typeof setTimeout>,
+        };
+        const timer = setTimeout(() => {
+          timers.delete(timer);
+          entry.stalled = true;
+          sessionStderrStreaming = true;
+          flushSessionStderr();
+          const elapsedSec = Math.max(1, Math.round((now() - entry.startedAt) / 1000));
+          const msg =
+            `[acp-gateway] ${entry.method} is still waiting on the agent after ${elapsedSec} s` +
+            (authPromptDetected
+              ? " (waiting for browser sign-in)."
+              : entry.sawStderr
+                ? "."
+                : " (no output on stderr; if the agent is stuck on login, run `acp-gateway --login` or pass --verbose).");
+          console.error(msg);
+          sendControl({ agentrqBridge: "stderr", lines: [msg] });
+        }, SESSION_OPEN_WARN_MS);
+        timers.add(timer);
+        entry.timer = timer;
+        sessionOpenRequests.set(key, entry);
       }
       if (isPrompt) {
         promptTasks.set(String(agentId), promptTaskId);
@@ -849,6 +973,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
     generation++;
     clearDrainPoll();
     clearAuthWatch();
+    clearSessionOpenWatch();
     console.error(`[acp-gateway] The agent exited (code=${code}, signal=${signal}).`);
     sendControl({ agentrqBridge: "stderr", lines: stderrTail(a.stderr) });
     sendControl({ agentrqBridge: "exit", code, signal });

@@ -1576,4 +1576,201 @@ describe("runNative", () => {
     expect(printed()).toContain("🔐 ACP Permission requested: Unknown Tool (ID: tc-1)");
     expect(printed()).toContain("🔐 ACP Permission requested: Refreshed Tool 0 (ID: tc-0)");
   });
+
+  it("surfaces loopback OAuth stderr during session/new and relays when interactive", async () => {
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    let capturedSignal: AbortSignal | undefined;
+    const askUntil = vi.fn(
+      (_q: string, signal: AbortSignal) =>
+        new Promise<string>((_resolve, reject) => {
+          capturedSignal = signal;
+          signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+
+    const t = await start({ askUntil });
+    t.ws().open();
+    t.ws().welcome({ connectionId: "AB" });
+
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-1", method: "session/new", params: { mcpServers: [] } }));
+    await flush();
+
+    // Partial chunk before newline is buffered silently rather than leaking partial lines prematurely
+    t.children[0].stderr.write("Open the following link to authenticate: https://accounts.google.com/o/oauth2/v2/auth?");
+    await flush();
+    expect(write).not.toHaveBeenCalled();
+
+    // Completing the line flushes buffered stderr, forwards to AgentRQ, and starts OAuth relay
+    t.children[0].stderr.write("redirect_uri=http%3A%2F%2F127.0.0.1%3A43123%2Fcb\n");
+    await flush();
+    expect(write).toHaveBeenCalledWith(
+      "Open the following link to authenticate: https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A43123%2Fcb\n",
+    );
+    expect(printed()).toContain("[auth] The agent started browser sign-in during session setup; waiting for sign-in...");
+    expect(askUntil).toHaveBeenCalledTimes(1);
+    expect(capturedSignal?.aborted).toBe(false);
+    expect(t.ws().controls()).toEqual([
+      {
+        agentrqBridge: "stderr",
+        lines: [
+          "Open the following link to authenticate: https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A43123%2Fcb",
+        ],
+      },
+      {
+        agentrqBridge: "stderr",
+        lines: ["[auth] The agent started browser sign-in during session setup; waiting for sign-in..."],
+      },
+    ]);
+
+    // Subsequent stderr streams straight through while session/new is still waiting
+    write.mockClear();
+    t.children[0].stderr.write("waiting for browser...\n");
+    await flush();
+    expect(write).toHaveBeenCalledWith("waiting for browser...\n");
+
+    // Completing session/new aborts the relay prompt and stops stderr forwarding
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "snew-1", result: { sessionId: "s-1" } }) + "\n");
+    await flush();
+    expect(capturedSignal?.aborted).toBe(true);
+
+    write.mockClear();
+    t.children[0].stderr.write("quiet after session/new\n");
+    await flush();
+    expect(write).not.toHaveBeenCalled();
+
+    write.mockRestore();
+  });
+
+  it("warns when session/new triggers headless browser OAuth and reports stall timer", async () => {
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const t = await connected();
+
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-h", method: "session/new", params: { mcpServers: [] } }));
+    t.children[0].stderr.write(
+      "Open: https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A43124%2F\n",
+    );
+    await flush();
+
+    expect(printed()).toContain(
+      "[auth] The agent started browser sign-in during session setup, but no interactive terminal is attached; run `acp-gateway --login` to re-authenticate.",
+    );
+
+    // Extra chunk does not duplicate the warning; advancing 15s reports waiting for browser sign-in
+    t.children[0].stderr.write("still waiting...\n");
+    vi.advanceTimersByTime(15_000);
+    await flush();
+
+    expect(printed()).toContain("[acp-gateway] session/new is still waiting on the agent after 15 s (waiting for browser sign-in).");
+    expect(t.ws().controls()).toContainEqual({
+      agentrqBridge: "stderr",
+      lines: ["[acp-gateway] session/new is still waiting on the agent after 15 s (waiting for browser sign-in)."],
+    });
+
+    write.mockRestore();
+  });
+
+  it("warns on silent session/new stalls, logs completion, and handles verbose OAuth detection", async () => {
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const t = await connected();
+
+    // Silent stall: no stderr output for 15s
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-silent", method: "session/new", params: { mcpServers: [] } }));
+    vi.advanceTimersByTime(15_000);
+    await flush();
+
+    expect(printed()).toContain(
+      "[acp-gateway] session/new is still waiting on the agent after 15 s (no output on stderr; if the agent is stuck on login, run `acp-gateway --login` or pass --verbose).",
+    );
+
+    vi.advanceTimersByTime(5_000);
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "snew-silent", result: { sessionId: "s-2" } }) + "\n");
+    await flush();
+    expect(printed()).toContain("[acp-gateway] session/new completed after 20 s.");
+
+    // Stall after non-OAuth stderr (partial line without trailing newline)
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-log", method: "session/load", params: { sessionId: "s-2", mcpServers: [] } }));
+    t.children[0].stderr.write("loading history...\r\n");
+    t.children[0].stderr.write("still loading");
+    vi.advanceTimersByTime(15_000);
+    await flush();
+    expect(write).toHaveBeenCalledWith("loading history...\r\nstill loading");
+    expect(write).toHaveBeenCalledWith("\n");
+    expect(printed()).toContain("[acp-gateway] session/load is still waiting on the agent after 15 s.");
+
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "snew-log", result: {} }) + "\n");
+    await flush();
+
+    // Under --verbose, OAuth detection does not double-flush already streamed stderr
+    setVerbose(true);
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-v", method: "session/new", params: { mcpServers: [] } }));
+    t.children[0].stderr.write(
+      "Open: https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A43125%2F\n",
+    );
+    await flush();
+    expect(printed()).toContain("no interactive terminal is attached");
+
+    write.mockRestore();
+  });
+
+  it("flushes stderr when session/new fails or is cancelled across epochs and stays quiet on fast opens", async () => {
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const t = await connected();
+
+    // Fast clean session/new writes debug stderr silently and clears its buffer
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-ok", method: "session/new", params: { mcpServers: [] } }));
+    t.children[0].stderr.write("harmless init\n");
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "snew-ok", result: { sessionId: "s-ok" } }) + "\n");
+    await flush();
+    expect(write).not.toHaveBeenCalled();
+
+    // Failed session/new flushes its buffered stderr and reports error message/code/unknown
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-err1", method: "session/new", params: { mcpServers: [] } }));
+    t.children[0].stderr.write("token expired\n");
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "snew-err1", error: { code: -32000, message: "auth failed" } }) + "\n");
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-err2", method: "session/new", params: { mcpServers: [] } }));
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "snew-err2", error: { code: -32603 } }) + "\n");
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-err3", method: "session/new", params: { mcpServers: [] } }));
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "snew-err3", error: {} }) + "\n");
+    await flush();
+
+    expect(write).toHaveBeenCalledWith("token expired\n");
+    expect(printed()).toContain("[acp-gateway] session/new failed: auth failed");
+    expect(printed()).toContain("[acp-gateway] session/new failed: -32603");
+    expect(printed()).toContain("[acp-gateway] session/new failed: unknown");
+
+    // Overlapping authenticate + session/new keeps watch alive until both finish
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "auth-ov", method: "authenticate", params: { methodId: "oauth" } }));
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-ov", method: "session/new", params: { mcpServers: [] } }));
+    t.children[0].stderr.write(
+      "Open: https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A43126%2F\n",
+    );
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "auth-ov", result: {} }) + "\n");
+    await flush();
+    expect(printed()).not.toContain("during session setup");
+
+    // Cancelling an epoch=0 session/new flushes stderr and suppresses later stall warning
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: "snew-ov" } }));
+    await flush();
+    expect(printed()).toContain("[acp-gateway] session/new was cancelled while waiting on the agent.");
+
+    // Unrelated response/cancel does not fail, and epoch > 0 cancel rewrites & clears watch
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: "unknown" } }));
+    t.ws().drop(4001);
+    vi.advanceTimersByTime(1000);
+    t.ws().open();
+    t.ws().welcome();
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: 7, method: "session/new", params: { mcpServers: [] } }));
+    // Second concurrent session/new tests tidySessionOpenWatch while another remains open
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: 8, method: "session/new", params: { mcpServers: [] } }));
+    t.children[0].stderr.write("\r\n");
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "1:8", result: { sessionId: "s-8" } }) + "\n");
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: 7 } }));
+    vi.advanceTimersByTime(15_000);
+    await flush();
+
+    expect(printed()).not.toContain("still waiting on the agent");
+
+    write.mockRestore();
+  });
 });
+
