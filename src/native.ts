@@ -67,6 +67,7 @@ const HIGH_WATER = 8 * 1024 * 1024;
 const LOW_WATER = 1024 * 1024;
 const DRAIN_POLL_MS = 50;
 const WS_OPEN = 1;
+const MAX_TOOL_CALL_TITLES = 1024;
 
 /** The part of a WebSocket the bridge uses; the built-in one in production, a fake in tests. */
 export interface BridgeSocket {
@@ -453,7 +454,11 @@ export async function runNative(o: NativeOptions): Promise<void> {
         typeof update.title === "string" &&
         update.title
       ) {
+        toolCallTitles.delete(update.toolCallId);
         toolCallTitles.set(update.toolCallId, update.title);
+        if (toolCallTitles.size > MAX_TOOL_CALL_TITLES) {
+          toolCallTitles.delete(toolCallTitles.keys().next().value!);
+        }
       }
     }
     if (shape?.method === "$/cancel_request" && shape.params?.requestId !== undefined) {
@@ -843,6 +848,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
   const onAgentExit = (a: Agent, code: number | null, signal: string | null) => {
     generation++;
     clearDrainPoll();
+    clearAuthWatch();
     console.error(`[acp-gateway] The agent exited (code=${code}, signal=${signal}).`);
     sendControl({ agentrqBridge: "stderr", lines: stderrTail(a.stderr) });
     sendControl({ agentrqBridge: "exit", code, signal });
