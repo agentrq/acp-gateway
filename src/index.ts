@@ -1187,9 +1187,10 @@ BRIDGE
 OTHER
   --verbose                   Print everything: the connection to AgentRQ, the
                               agent's own logs, and what the one-shot commands
-                              exchange with the agent. Without it, only
-                              warnings and errors — and commands that print
-                              something and exit print only that.
+                              exchange with the agent. Without it, only task
+                              and permission summaries, warnings and errors —
+                              and commands that print something and exit print
+                              only that.
   --help, -h                  Show this help. Exits.
 
 EXAMPLES

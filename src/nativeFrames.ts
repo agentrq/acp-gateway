@@ -267,6 +267,7 @@ export interface RpcShape {
   method?: string;
   params?: Record<string, unknown>;
   result?: unknown;
+  error?: { code?: number; message?: string };
   isResponse: boolean;
 }
 
@@ -287,7 +288,8 @@ export function rpcShape(frame: string): RpcShape | undefined {
   const id = typeof m.id === "string" || typeof m.id === "number" ? m.id : undefined;
   const method = typeof m.method === "string" ? m.method : undefined;
   const params = m.params && typeof m.params === "object" && !Array.isArray(m.params) ? m.params : undefined;
-  return { id, method, params, result: m.result, isResponse: method === undefined && id !== undefined };
+  const error = m.error && typeof m.error === "object" && !Array.isArray(m.error) ? m.error : undefined;
+  return { id, method, params, result: m.result, error, isResponse: method === undefined && id !== undefined };
 }
 
 /** The requests that carry the directory a session runs in. */
@@ -333,6 +335,9 @@ export function abandonedAnswer(id: string | number, method: string): string {
   });
 }
 
+const TASK_HEADER_PREFIX =
+  /^\s*(?:\[(?:Task|Reply to task|Response to task)\s+([A-Za-z0-9_-]+)\]|\[Task reassigned to agent\]\s+([A-Za-z0-9_-]+))\s*/i;
+
 /**
  * The AgentRQ task a prompt is for, from the header AgentRQ starts every task
  * message with: `[Task <id>]`, `[Reply to task <id>]`, `[Response to task
@@ -342,10 +347,26 @@ export function abandonedAnswer(id: string | number, method: string): string {
 export function taskIdOf(prompt: unknown): string | undefined {
   const first = Array.isArray(prompt) ? prompt[0] : undefined;
   const text = first && typeof first === "object" && typeof first.text === "string" ? first.text : "";
-  const m =
-    /^\s*\[(?:Task|Reply to task|Response to task)\s+([A-Za-z0-9_-]+)\]/i.exec(text) ??
-    /^\s*\[Task reassigned to agent\]\s+([A-Za-z0-9_-]+)/i.exec(text);
-  return m?.[1];
+  const m = TASK_HEADER_PREFIX.exec(text);
+  return m?.[1] ?? m?.[2];
+}
+
+/**
+ * Extracts the human-readable text of a `session/prompt` request's `prompt`
+ * array, stripping a leading `[Task <id>]` header if present so `announceTask`
+ * does not repeat the task id twice.
+ */
+export function promptTextOf(prompt: unknown): string {
+  if (!Array.isArray(prompt)) return "";
+  const parts: string[] = [];
+  for (const item of prompt) {
+    if (item && typeof item === "object" && typeof item.text === "string") {
+      parts.push(item.text);
+    }
+  }
+  const combined = parts.join("\n").trim();
+  const stripped = combined.replace(TASK_HEADER_PREFIX, "").trim();
+  return stripped || combined;
 }
 
 /** The frame with its `params.sessionId` replaced. */

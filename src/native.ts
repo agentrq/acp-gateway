@@ -25,6 +25,7 @@ import {
   encodeControl,
   isControl,
   preflightUrl,
+  promptTextOf,
   respawnDelayMs,
   prepareSessionRequest,
   rpcShape,
@@ -35,8 +36,13 @@ import {
   upgradeHeaders,
   type Control,
 } from "./nativeFrames.js";
+import {
+  findLoopbackRedirect,
+  relayLoopbackRedirect,
+  type AbortableAsker,
+} from "./auth.js";
 import { needsShell, spawnArgsFor, spawnTarget, terminateAgentProcess } from "./index.js";
-import { debug, isVerbose } from "./log.js";
+import { AGENT_STDERR_TAIL_LENGTH, announceFinished, announceTask, debug, isVerbose } from "./log.js";
 import { pkg } from "./version.js";
 
 /** Close codes after which reconnecting cannot help: version mismatch, a terminal login, policy. */
@@ -102,6 +108,8 @@ export interface NativeOptions {
    * with AgentRQ's instructions instead.
    */
   login?: () => Promise<void>;
+  /** Reads a line at the terminal until aborted, for relaying a loopback OAuth redirect. */
+  askUntil?: AbortableAsker;
   /** The servers from .mcp.json, handed to every session the agent opens. */
   mcpServers?: McpServerConfig[];
   /** `process.versions.node`, for the Node 22 check. */
@@ -188,6 +196,15 @@ export async function runNative(o: NativeOptions): Promise<void> {
   let pendingInitServerId: string | number | undefined;
   /** Agent-side request id → agent session id for in-flight `session/close` or `session/delete`. */
   const closingSessions = new Map<string, string>();
+  /** Agent-side request id → task id for in-flight `session/prompt` requests. */
+  const promptTasks = new Map<string, string | undefined>();
+  /** Agent-side request id → method id for in-flight `authenticate` requests from AgentRQ. */
+  const authRequests = new Map<string, string>();
+  let authAbort: AbortController | undefined;
+  let authRelaying: Promise<void> | undefined;
+  let authStderrBuf = "";
+  /** Tool call id → human-readable title remembered from `session/update` notifications. */
+  const toolCallTitles = new Map<string, string>();
   /** The agent's requests AgentRQ has not answered, by id: method. */
   const agentRequests = new Map<string | number, string>();
   /** Sessions AgentRQ has used on this connection, cancelled when the agent is kept past it. */
@@ -205,6 +222,16 @@ export async function runNative(o: NativeOptions): Promise<void> {
   const exits: number[] = [];
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let drainPoll: ReturnType<typeof setInterval> | undefined;
+
+  const clearAuthWatch = () => {
+    authRequests.clear();
+    authStderrBuf = "";
+    authRelaying = undefined;
+    if (authAbort) {
+      authAbort.abort();
+      authAbort = undefined;
+    }
+  };
 
   const clearDrainPoll = () => {
     if (drainPoll !== undefined) {
@@ -224,6 +251,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
   const stop = (code: number) => {
     if (stopped) return;
     stopped = true;
+    clearAuthWatch();
     for (const t of timers) clearTimeout(t);
     timers.clear();
     clearInterval(ackTimer);
@@ -309,6 +337,9 @@ export async function runNative(o: NativeOptions): Promise<void> {
     initRequestId = undefined;
     pendingInitServerId = undefined;
     closingSessions.clear();
+    promptTasks.clear();
+    clearAuthWatch();
+    toolCallTitles.clear();
     agentRequests.clear();
     sessionsInUse.clear();
     taskSessions.clear();
@@ -324,7 +355,12 @@ export async function runNative(o: NativeOptions): Promise<void> {
     let partial = "";
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
-      if (isVerbose()) process.stderr.write(chunk);
+      if (isVerbose() || authRequests.size > 0) process.stderr.write(chunk);
+      if (authRequests.size > 0 && (o.login !== undefined || o.askUntil !== undefined) && !authRelaying && authAbort) {
+        authStderrBuf = (authStderrBuf + chunk).slice(-AGENT_STDERR_TAIL_LENGTH);
+        const redirect = findLoopbackRedirect(authStderrBuf.slice(0, authStderrBuf.lastIndexOf("\n") + 1));
+        if (redirect) authRelaying = relayLoopbackRedirect(redirect, authAbort.signal, o.askUntil);
+      }
       const parts = (partial + chunk).split("\n");
       partial = parts.pop() ?? "";
       a.stderr.push(...parts.map((l) => l.replace(/\r$/, "")));
@@ -409,14 +445,63 @@ export async function runNative(o: NativeOptions): Promise<void> {
       const original = requestIds.get(String(shape.params.requestId));
       if (original !== undefined) line = withRequestId(line, original);
     }
+    if (shape?.method === "session/update") {
+      const update = shape.params?.update as Record<string, unknown> | undefined;
+      if (
+        (update?.sessionUpdate === "tool_call" || update?.sessionUpdate === "tool_call_update") &&
+        typeof update.toolCallId === "string" &&
+        typeof update.title === "string" &&
+        update.title
+      ) {
+        toolCallTitles.set(update.toolCallId, update.title);
+      }
+    }
     if (shape?.method === "$/cancel_request" && shape.params?.requestId !== undefined) {
       agentRequests.delete(shape.params.requestId as string | number);
     } else if (shape?.method !== undefined && shape.id !== undefined) {
       agentRequests.set(shape.id, shape.method);
+      if (shape.method === "session/request_permission") {
+        const tc = shape.params?.toolCall as { toolCallId?: string; title?: string; name?: string } | undefined;
+        const toolCallId = typeof tc?.toolCallId === "string" ? tc.toolCallId : undefined;
+        const rawTitle =
+          (typeof tc?.title === "string" && tc.title) ||
+          (typeof tc?.name === "string" && tc.name) ||
+          (toolCallId ? toolCallTitles.get(toolCallId) : undefined) ||
+          "Unknown Tool";
+        console.error(`🔐 ACP Permission requested: ${rawTitle}${toolCallId ? ` (ID: ${toolCallId})` : ""}`);
+        console.error("⌛ Waiting for human approval in the agentrq dashboard...");
+      } else if (shape.method === "elicitation/create") {
+        const mode = typeof shape.params?.mode === "string" ? shape.params.mode : "form";
+        const message = typeof shape.params?.message === "string" ? shape.params.message : "";
+        console.error(`[acp] Elicitation requested (mode=${mode}): ${message}`);
+      }
     } else if (shape?.isResponse) {
-      const closedSession = closingSessions.get(String(shape.id));
+      const idKey = String(shape.id);
+      if (authRequests.has(idKey)) {
+        const methodId = authRequests.get(idKey);
+        authRequests.delete(idKey);
+        if (authRequests.size === 0) clearAuthWatch();
+        if (shape.error !== undefined) {
+          console.error(
+            `[auth] Authentication failed (${methodId}): ${shape.error.message ?? shape.error.code ?? "unknown"}`,
+          );
+        } else {
+          console.error(`[auth] Logged in with "${methodId}".`);
+        }
+      }
+      if (promptTasks.has(idKey)) {
+        const taskId = promptTasks.get(idKey);
+        promptTasks.delete(idKey);
+        const res = shape.result as { stopReason?: string } | undefined;
+        if (typeof res?.stopReason === "string") {
+          announceFinished(taskId, res.stopReason);
+        } else if (shape.error !== undefined) {
+          announceFinished(taskId, `error (${shape.error.message ?? shape.error.code ?? "unknown"})`);
+        }
+      }
+      const closedSession = closingSessions.get(idKey);
       if (closedSession !== undefined) {
-        closingSessions.delete(String(shape.id));
+        closingSessions.delete(idKey);
         const srv = toServerSession.get(closedSession);
         if (srv !== undefined) {
           toServerSession.delete(closedSession);
@@ -424,7 +509,13 @@ export async function runNative(o: NativeOptions): Promise<void> {
         }
       }
       if (shape.id === initRequestId) {
-        if (shape.result !== undefined) agent.initResult = shape.result;
+        if (shape.result !== undefined) {
+          agent.initResult = shape.result;
+          const info = (shape.result as { agentInfo?: { name?: string; title?: string; version?: string } })?.agentInfo;
+          const label = info?.title || info?.name || o.agentId || o.acpCmdArgs[0];
+          const ver = info?.version ? ` v${info.version}` : "";
+          console.error(`[acp-gateway] Agent ready${label ? `: ${label}${ver}` : ""}`);
+        }
         initRequestId = undefined;
         if (pendingInitServerId !== undefined) {
           const id = pendingInitServerId;
@@ -433,10 +524,10 @@ export async function runNative(o: NativeOptions): Promise<void> {
         }
       }
       if (epoch > 0) {
-        const original = requestIds.get(String(shape.id));
+        const original = requestIds.get(idKey);
         // An answer to a request of a connection that is gone: nobody asked.
         if (original === undefined) return debug(`[native] Dropped the agent's answer to an earlier connection's request ${shape.id}`);
-        requestIds.delete(String(shape.id));
+        requestIds.delete(idKey);
         line = JSON.stringify({ ...JSON.parse(line), id: original });
       }
     }
@@ -458,6 +549,8 @@ export async function runNative(o: NativeOptions): Promise<void> {
     requestIds.clear();
     pendingInitServerId = undefined;
     closingSessions.clear();
+    promptTasks.clear();
+    clearAuthWatch();
     const stdin = agent.child.stdin;
     for (const [id, method] of agentRequests) stdin?.write(abandonedAnswer(id, method) + "\n");
     agentRequests.clear();
@@ -486,19 +579,32 @@ export async function runNative(o: NativeOptions): Promise<void> {
     if (++unacked >= ACK_EVERY) sendAck();
     let frame = prepareSessionRequest(data, o.cwd, sessionMcpServers());
     const shape = rpcShape(frame);
-    if (shape?.isResponse) agentRequests.delete(shape.id!);
+    if (shape?.isResponse) {
+      const answeredMethod = agentRequests.get(shape.id!);
+      agentRequests.delete(shape.id!);
+      if (answeredMethod === "session/request_permission") {
+        const outcome = (shape.result as { outcome?: { outcome?: string; optionId?: string } } | undefined)?.outcome;
+        if (outcome?.outcome === "selected" && outcome.optionId) {
+          console.error(`✅ Permission verdict received: ${outcome.optionId}`);
+        } else if (outcome?.outcome) {
+          console.error(`✅ Permission verdict received: ${outcome.outcome}`);
+        }
+      }
+    }
     let closingSession: string | undefined;
+    let promptTaskId: string | undefined;
+    const isPrompt = shape?.method === "session/prompt";
     const sessionId = shape?.params?.sessionId;
     if (typeof sessionId === "string") {
-      if (shape!.method === "session/prompt") {
-        const taskId = taskIdOf(shape!.params!.prompt);
-        const kept = taskId === undefined ? undefined : taskSessions.get(taskId);
+      if (isPrompt) {
+        promptTaskId = taskIdOf(shape!.params!.prompt);
+        const kept = promptTaskId === undefined ? undefined : taskSessions.get(promptTaskId);
         if (epoch > 0 && kept !== undefined && kept !== sessionId && !toAgentSession.has(sessionId)) {
-          debug(`[native] Task ${taskId} carries on in its session ${kept} (AgentRQ calls it ${sessionId})`);
+          debug(`[native] Task ${promptTaskId} carries on in its session ${kept} (AgentRQ calls it ${sessionId})`);
           toAgentSession.set(sessionId, kept);
           toServerSession.set(kept, sessionId);
         }
-        if (taskId !== undefined) taskSessions.set(taskId, toAgentSession.get(sessionId) ?? sessionId);
+        if (promptTaskId !== undefined) taskSessions.set(promptTaskId, toAgentSession.get(sessionId) ?? sessionId);
       }
       const agentSide = toAgentSession.get(sessionId);
       const activeSession = agentSide ?? sessionId;
@@ -514,7 +620,11 @@ export async function runNative(o: NativeOptions): Promise<void> {
       }
     }
     if (epoch > 0 && shape?.method === "$/cancel_request" && shape.params?.requestId !== undefined) {
-      frame = withRequestId(frame, `${epoch}:${shape.params.requestId}`);
+      const agentReqId = `${epoch}:${shape.params.requestId}`;
+      promptTasks.delete(agentReqId);
+      frame = withRequestId(frame, agentReqId);
+    } else if (epoch === 0 && shape?.method === "$/cancel_request" && shape.params?.requestId !== undefined) {
+      promptTasks.delete(String(shape.params.requestId));
     }
     if (shape?.method !== undefined && shape.id !== undefined) {
       if (shape.method === "initialize") {
@@ -530,6 +640,16 @@ export async function runNative(o: NativeOptions): Promise<void> {
         initRequestId = epoch > 0 ? `${epoch}:${shape.id}` : shape.id;
       }
       const agentId = epoch > 0 ? `${epoch}:${shape.id}` : shape.id;
+      if (shape.method === "authenticate") {
+        const methodId = typeof shape.params?.methodId === "string" && shape.params.methodId ? shape.params.methodId : "default";
+        if (authRequests.size === 0) authAbort = new AbortController();
+        authRequests.set(String(agentId), methodId);
+        console.error(`[auth] The agent requires authentication (${methodId}); waiting for sign-in...`);
+      }
+      if (isPrompt) {
+        promptTasks.set(String(agentId), promptTaskId);
+        announceTask(promptTextOf(shape.params?.prompt), promptTaskId);
+      }
       if (closingSession !== undefined) {
         closingSessions.set(String(agentId), closingSession);
       }
@@ -559,6 +679,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
           }
           ring.ack(acked);
         } else if (agentFresh) {
+          console.error("[acp-gateway] Connected to AgentRQ; waiting for tasks...");
           replay = ring.after(0) ?? [];
         } else {
           keepAgent();

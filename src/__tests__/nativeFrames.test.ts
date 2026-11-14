@@ -18,6 +18,7 @@ import {
   headerSafeCwd,
   rpcShape,
   prepareSessionRequest,
+  promptTextOf,
   abandonedAnswer,
   taskIdOf,
   withSessionId,
@@ -258,10 +259,17 @@ describe("rpcShape", () => {
       method: "session/new",
       params: { cwd: "/" },
       result: undefined,
+      error: undefined,
       isResponse: false,
     });
     expect(rpcShape('{"method":"session/update","params":[1]}')).toMatchObject({ params: undefined, isResponse: false });
     expect(rpcShape('{"id":"a","result":{"x":1}}')).toMatchObject({ id: "a", result: { x: 1 }, isResponse: true });
+    expect(rpcShape('{"id":"b","error":{"code":-32000,"message":"boom"}}')).toMatchObject({
+      id: "b",
+      error: { code: -32000, message: "boom" },
+      isResponse: true,
+    });
+    expect(rpcShape('{"id":"c","error":[1]}')).toMatchObject({ id: "c", error: undefined, isResponse: true });
     expect(rpcShape('{"id":{},"error":{}}')).toMatchObject({ id: undefined, isResponse: false });
   });
 
@@ -330,7 +338,7 @@ describe("abandonedAnswer", () => {
   });
 });
 
-describe("taskIdOf", () => {
+describe("taskIdOf and promptTextOf", () => {
   const p = (text: string) => [{ type: "text", text }];
 
   it("reads the task from AgentRQ's message headers", () => {
@@ -346,6 +354,16 @@ describe("taskIdOf", () => {
     expect(taskIdOf([{ type: "image" }])).toBeUndefined();
     expect(taskIdOf([])).toBeUndefined();
     expect(taskIdOf(undefined)).toBeUndefined();
+  });
+
+  it("extracts prompt text and strips leading task header", () => {
+    expect(promptTextOf(p("[Task 0kU6mhKzQ6j]\nRemove legacy"))).toBe("Remove legacy");
+    expect(promptTextOf(p("[Task reassigned to agent] 0kAbc"))).toBe("[Task reassigned to agent] 0kAbc");
+    expect(promptTextOf([{ type: "text", text: "Hello" }, { type: "image" }, { type: "text", text: "World" }])).toBe(
+      "Hello\nWorld",
+    );
+    expect(promptTextOf("not an array")).toBe("");
+    expect(promptTextOf([null])).toBe("");
   });
 });
 

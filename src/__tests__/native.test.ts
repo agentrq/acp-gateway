@@ -1173,4 +1173,311 @@ describe("runNative", () => {
     await flush();
     expect(t.exit).not.toHaveBeenCalled();
   });
+
+  it("prints non-verbose summaries for connection, agent readiness, tasks, permissions, elicitations, and turn completion", async () => {
+    const t = await connected();
+    expect(printed()).toContain("[acp-gateway] Connected to AgentRQ; waiting for tasks...");
+
+    // 1. Agent initialization summary
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "init-1", method: "initialize", params: {} }));
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "init-1",
+        result: { agentInfo: { title: "Gemini CLI", version: "1.2.3" } },
+      }) + "\n",
+    );
+    await flush();
+    expect(printed()).toContain("[acp-gateway] Agent ready: Gemini CLI v1.2.3");
+
+    // 2. Incoming task prompt announcement
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "session/prompt",
+        params: {
+          sessionId: "s-1",
+          prompt: [{ type: "text", text: "[Task 0lzWBUu5TV2]\nShare summaries when not in verbose mode" }],
+        },
+      }),
+    );
+    expect(printed()).toContain("[task 0lzWBUu5TV2] Share summaries when not in verbose mode");
+
+    // 3. Tool call title remembered from session/update + permission request + verdict
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "s-1",
+          update: { sessionUpdate: "tool_call", toolCallId: "tc-1", title: "Run npm test" },
+        },
+      }) + "\n",
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "perm-1",
+        method: "session/request_permission",
+        params: {
+          sessionId: "s-1",
+          toolCall: { toolCallId: "tc-1" },
+          options: [{ optionId: "allow-once", kind: "allow_once", name: "Allow" }],
+        },
+      }) + "\n",
+    );
+    await flush();
+    expect(printed()).toContain("🔐 ACP Permission requested: Run npm test (ID: tc-1)");
+    expect(printed()).toContain("⌛ Waiting for human approval in the agentrq dashboard...");
+
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "perm-1",
+        result: { outcome: { outcome: "selected", optionId: "allow-once" } },
+      }),
+    );
+    expect(printed()).toContain("✅ Permission verdict received: allow-once");
+
+    // Permission request with explicit title, explicit name, no toolCallId, and cancelled outcome
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "perm-title",
+        method: "session/request_permission",
+        params: {
+          sessionId: "s-1",
+          toolCall: { title: "Explicit Title" },
+        },
+      }) + "\n",
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "perm-2",
+        method: "session/request_permission",
+        params: {
+          sessionId: "s-1",
+          toolCall: { name: "WriteFile" },
+        },
+      }) + "\n",
+    );
+    await flush();
+    expect(printed()).toContain("🔐 ACP Permission requested: Explicit Title");
+    expect(printed()).toContain("🔐 ACP Permission requested: WriteFile");
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "perm-2",
+        result: { outcome: { outcome: "cancelled" } },
+      }),
+    );
+    expect(printed()).toContain("✅ Permission verdict received: cancelled");
+
+    // Permission request with fallback Unknown Tool and response without outcome
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "perm-3",
+        method: "session/request_permission",
+        params: { sessionId: "s-1" },
+      }) + "\n",
+    );
+    await flush();
+    expect(printed()).toContain("🔐 ACP Permission requested: Unknown Tool");
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "perm-3", result: {} }));
+
+    // 4. Elicitation request (with explicit mode/message and with defaults)
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "elicit-1",
+        method: "elicitation/create",
+        params: { sessionId: "s-1", mode: "url", message: "Authenticate with GitHub" },
+      }) + "\n",
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "elicit-2",
+        method: "elicitation/create",
+        params: { sessionId: "s-1" },
+      }) + "\n",
+    );
+    await flush();
+    expect(printed()).toContain("[acp] Elicitation requested (mode=url): Authenticate with GitHub");
+    expect(printed()).toContain("[acp] Elicitation requested (mode=form): ");
+
+    // 5. Turn completion summary
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 10,
+        result: { stopReason: "end_turn" },
+      }) + "\n",
+    );
+    await flush();
+    expect(printed()).toContain("[task 0lzWBUu5TV2] Finished: end_turn");
+  });
+
+  it("handles prompt error responses, cancelled prompts, and fallback agent labels", async () => {
+    const t = await start({ agentId: "", acpCmdArgs: [""] });
+    t.ws().open();
+    t.ws().welcome({ connectionId: "AB" });
+
+    // Initialize with empty agentInfo and empty agentId/acpCmdArgs fallback
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) + "\n");
+    await flush();
+    expect(printed()).toContain("[acp-gateway] Agent ready");
+
+    // Prompt that errors with message, code, or unknown
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 20,
+        method: "session/prompt",
+        params: { sessionId: "s-1", prompt: [{ type: "text", text: "plain task" }] },
+      }),
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 20,
+        error: { code: -32603, message: "rate limited" },
+      }) + "\n",
+    );
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 21,
+        method: "session/prompt",
+        params: { sessionId: "s-1", prompt: [{ type: "text", text: "second task" }] },
+      }),
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 21,
+        error: { code: -32001 },
+      }) + "\n",
+    );
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 22,
+        method: "session/prompt",
+        params: { sessionId: "s-1", prompt: [{ type: "text", text: "third task" }] },
+      }),
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 22,
+        error: {},
+      }) + "\n",
+    );
+    // Prompt that returns neither stopReason nor error, or is cancelled via $/cancel_request
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 23,
+        method: "session/prompt",
+        params: { sessionId: "s-1", prompt: [{ type: "text", text: "fourth task" }] },
+      }),
+    );
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 23, result: {} }) + "\n");
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 24,
+        method: "session/prompt",
+        params: { sessionId: "s-1", prompt: [{ type: "text", text: "cancelled task" }] },
+      }),
+    );
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: 24 } }));
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 24, result: { stopReason: "cancelled" } }) + "\n");
+    await flush();
+
+    expect(printed()).toContain("[task] Finished: error (rate limited)");
+    expect(printed()).toContain("[task] Finished: error (-32001)");
+    expect(printed()).toContain("[task] Finished: error (unknown)");
+    expect(printed()).not.toContain("Finished: cancelled");
+  });
+
+  it("streams the agent's stderr during authenticate and relays a loopback OAuth redirect when interactive", async () => {
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    let resolveAsk!: (s: string) => void;
+    const askUntil = vi.fn(
+      (_q: string, signal: AbortSignal) =>
+        new Promise<string>((resolve, reject) => {
+          resolveAsk = resolve;
+          signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+
+    const t = await start({ askUntil });
+    t.ws().open();
+    t.ws().welcome({ connectionId: "AB" });
+
+    // AgentRQ sends an authenticate request
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "auth-1",
+        method: "authenticate",
+        params: { methodId: "google-login" },
+      }),
+    );
+    expect(printed()).toContain("[auth] The agent requires authentication (google-login); waiting for sign-in...");
+
+    // While authenticate is in flight, agent stderr is forwarded even without --verbose
+    const oauthLine =
+      "Open the following link: https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A43123%2Foauth-callback\n";
+    t.children[0].stderr.write(oauthLine);
+    await flush();
+    expect(write).toHaveBeenCalledWith(oauthLine);
+    expect(printed()).toContain("Signing in from a browser on another computer?");
+    expect(askUntil).toHaveBeenCalledTimes(1);
+
+    // Additional stderr chunk while already relaying does not start a second relay
+    t.children[0].stderr.write("still waiting...\n");
+    await flush();
+    expect(askUntil).toHaveBeenCalledTimes(1);
+
+    // Agent finishes authentication on its own (or after redirect), aborting askUntil
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "auth-1", result: {} }) + "\n");
+    await flush();
+    expect(printed()).toContain('[auth] Logged in with "google-login".');
+
+    // Once authenticate is complete, stderr is no longer forwarded in non-verbose mode
+    write.mockClear();
+    t.children[0].stderr.write("quiet again\n");
+    await flush();
+    expect(write).not.toHaveBeenCalled();
+
+    // Authenticate with default methodId and error responses (message, code, unknown)
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "auth-2", method: "authenticate", params: {} }));
+    t.ws().receive(
+      JSON.stringify({ jsonrpc: "2.0", id: "auth-3", method: "authenticate", params: { methodId: "oauth" } }),
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({ jsonrpc: "2.0", id: "auth-2", error: { code: -32000, message: "denied" } }) + "\n",
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({ jsonrpc: "2.0", id: "auth-3", error: { code: -32001 } }) + "\n",
+    );
+    t.ws().receive(
+      JSON.stringify({ jsonrpc: "2.0", id: "auth-4", method: "authenticate", params: { methodId: "oauth" } }),
+    );
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "auth-4", error: {} }) + "\n");
+    await flush();
+    expect(printed()).toContain("[auth] Authentication failed (default): denied");
+    expect(printed()).toContain("[auth] Authentication failed (oauth): -32001");
+    expect(printed()).toContain("[auth] Authentication failed (oauth): unknown");
+
+    write.mockRestore();
+    void resolveAsk;
+  });
 });
