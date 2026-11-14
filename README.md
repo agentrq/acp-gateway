@@ -35,7 +35,7 @@ npm install -g @agentrq/acp-gateway
 
 ## Current Version
 
-`0.4.3`
+`0.4.4`
 
 ## Usage
 
