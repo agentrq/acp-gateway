@@ -1405,4 +1405,79 @@ describe("runNative", () => {
     expect(printed()).toContain("[task] Finished: error (unknown)");
     expect(printed()).not.toContain("Finished: cancelled");
   });
+
+  it("streams the agent's stderr during authenticate and relays a loopback OAuth redirect when interactive", async () => {
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    let resolveAsk!: (s: string) => void;
+    const askUntil = vi.fn(
+      (_q: string, signal: AbortSignal) =>
+        new Promise<string>((resolve, reject) => {
+          resolveAsk = resolve;
+          signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+
+    const t = await start({ askUntil });
+    t.ws().open();
+    t.ws().welcome({ connectionId: "AB" });
+
+    // AgentRQ sends an authenticate request
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "auth-1",
+        method: "authenticate",
+        params: { methodId: "google-login" },
+      }),
+    );
+    expect(printed()).toContain("[auth] The agent requires authentication (google-login); waiting for sign-in...");
+
+    // While authenticate is in flight, agent stderr is forwarded even without --verbose
+    const oauthLine =
+      "Open the following link: https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A43123%2Foauth-callback\n";
+    t.children[0].stderr.write(oauthLine);
+    await flush();
+    expect(write).toHaveBeenCalledWith(oauthLine);
+    expect(printed()).toContain("Signing in from a browser on another computer?");
+    expect(askUntil).toHaveBeenCalledTimes(1);
+
+    // Additional stderr chunk while already relaying does not start a second relay
+    t.children[0].stderr.write("still waiting...\n");
+    await flush();
+    expect(askUntil).toHaveBeenCalledTimes(1);
+
+    // Agent finishes authentication on its own (or after redirect), aborting askUntil
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "auth-1", result: {} }) + "\n");
+    await flush();
+    expect(printed()).toContain('[auth] Logged in with "google-login".');
+
+    // Once authenticate is complete, stderr is no longer forwarded in non-verbose mode
+    write.mockClear();
+    t.children[0].stderr.write("quiet again\n");
+    await flush();
+    expect(write).not.toHaveBeenCalled();
+
+    // Authenticate with default methodId and error responses (message, code, unknown)
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "auth-2", method: "authenticate", params: {} }));
+    t.ws().receive(
+      JSON.stringify({ jsonrpc: "2.0", id: "auth-3", method: "authenticate", params: { methodId: "oauth" } }),
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({ jsonrpc: "2.0", id: "auth-2", error: { code: -32000, message: "denied" } }) + "\n",
+    );
+    t.children[0].stdout.write(
+      JSON.stringify({ jsonrpc: "2.0", id: "auth-3", error: { code: -32001 } }) + "\n",
+    );
+    t.ws().receive(
+      JSON.stringify({ jsonrpc: "2.0", id: "auth-4", method: "authenticate", params: { methodId: "oauth" } }),
+    );
+    t.children[0].stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "auth-4", error: {} }) + "\n");
+    await flush();
+    expect(printed()).toContain("[auth] Authentication failed (default): denied");
+    expect(printed()).toContain("[auth] Authentication failed (oauth): -32001");
+    expect(printed()).toContain("[auth] Authentication failed (oauth): unknown");
+
+    write.mockRestore();
+    void resolveAsk;
+  });
 });
