@@ -1772,5 +1772,114 @@ describe("runNative", () => {
 
     write.mockRestore();
   });
+
+  it("aborts OAuth relay and stops stderr forwarding when $/cancel_request cancels authenticate", async () => {
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    let capturedSignal: AbortSignal | undefined;
+    const askUntil = vi.fn(
+      (_q: string, signal: AbortSignal) =>
+        new Promise<string>((_resolve, reject) => {
+          capturedSignal = signal;
+          signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+
+    const t = await connected({ askUntil });
+    t.ws().receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "auth-cancel",
+        method: "authenticate",
+        params: { methodId: "google-login" },
+      }),
+    );
+    t.children[0].stderr.write(
+      "Open: https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A43127%2Fcb\n",
+    );
+    await flush();
+    expect(askUntil).toHaveBeenCalledTimes(1);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: "auth-cancel" } }));
+    await flush();
+    expect(capturedSignal?.aborted).toBe(true);
+
+    write.mockClear();
+    t.children[0].stderr.write("after cancel\n");
+    await flush();
+    expect(write).not.toHaveBeenCalled();
+
+    write.mockRestore();
+  });
+
+  it("clears OAuth relay and session stall watches before terminal login and ignores replaced-agent stderr", async () => {
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    let capturedSignal: AbortSignal | undefined;
+    const askUntil = vi.fn(
+      (_q: string, signal: AbortSignal) =>
+        new Promise<string>((_resolve, reject) => {
+          capturedSignal = signal;
+          signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+    let finishLogin!: () => void;
+    const login = vi.fn(() => new Promise<void>((r) => (finishLogin = r)));
+
+    const t = await connected({ askUntil, login });
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-login", method: "session/new", params: { mcpServers: [] } }));
+    t.children[0].stderr.write(
+      "Open: https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A43128%2Fcb\n",
+    );
+    await flush();
+    expect(capturedSignal?.aborted).toBe(false);
+
+    // Server sends auth_required and closes socket: logInAndRestart must abort relay & clear stall timers before awaiting login.
+    t.ws().receive(JSON.stringify({ agentrqBridge: "error", code: "auth_required", message: "sign in" }));
+    t.ws().drop(4002);
+    await flush();
+
+    expect(login).toHaveBeenCalledTimes(1);
+    expect(capturedSignal?.aborted).toBe(true);
+
+    // Late stderr from the killed agent and elapsed 15s timer while login() is running must be ignored.
+    write.mockClear();
+    t.children[0].stderr.write("late dying stderr\n");
+    vi.advanceTimersByTime(15_000);
+    await flush();
+
+    expect(write).not.toHaveBeenCalled();
+    expect(printed()).not.toContain("still waiting on the agent");
+
+    finishLogin();
+    await flush();
+    expect(t.children).toHaveLength(2);
+
+    write.mockRestore();
+  });
+
+  it("ignores late stderr from a replaced agent after a bridge restart", async () => {
+    const write = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const t = await connected();
+
+    t.ws().receive(JSON.stringify({ agentrqBridge: "restart", reason: "upgrade" }));
+    vi.advanceTimersByTime(0);
+    t.ws().open();
+    t.ws().welcome();
+    expect(t.children).toHaveLength(2);
+
+    // Open a session on the new agent, then emit late OAuth stderr on the replaced child: must not touch the new agent.
+    t.ws().receive(JSON.stringify({ jsonrpc: "2.0", id: "snew-2", method: "session/new", params: { mcpServers: [] } }));
+    write.mockClear();
+    t.children[0].stderr.write(
+      "Open: https://accounts.google.com/o/oauth2/v2/auth?redirect_uri=http%3A%2F%2F127.0.0.1%3A43129%2Fcb\n",
+    );
+    await flush();
+
+    expect(write).not.toHaveBeenCalled();
+    expect(printed()).not.toContain("started browser sign-in");
+
+    write.mockRestore();
+  });
 });
+
 
