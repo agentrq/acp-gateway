@@ -292,8 +292,13 @@ export function rpcShape(frame: string): RpcShape | undefined {
   return { id, method, params, result: m.result, error, isResponse: method === undefined && id !== undefined };
 }
 
-/** The requests that carry the directory a session runs in. */
-const CWD_METHODS: ReadonlySet<string> = new Set(["session/new", "session/load", "session/resume", "session/fork"]);
+/** The requests that open a session and carry the directory a session runs in. */
+export const SESSION_OPEN_METHODS: ReadonlySet<string> = new Set([
+  "session/new",
+  "session/load",
+  "session/resume",
+  "session/fork",
+]);
 
 /**
  * Fills in a request that opens a session with what only this process knows.
@@ -309,7 +314,7 @@ const CWD_METHODS: ReadonlySet<string> = new Set(["session/new", "session/load",
 export function prepareSessionRequest(frame: string, cwd: string, servers: readonly unknown[] = []): string {
   if (!frame.includes("session/")) return frame;
   const shape = rpcShape(frame);
-  if (!shape?.method || !CWD_METHODS.has(shape.method) || !shape.params) return frame;
+  if (!shape?.method || !SESSION_OPEN_METHODS.has(shape.method) || !shape.params) return frame;
   const m = JSON.parse(frame);
   m.params.cwd = cwd;
   if (servers.length > 0) {
