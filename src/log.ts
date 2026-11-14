@@ -25,6 +25,37 @@ export function debug(...args: unknown[]): void {
   if (verbose) console.error(...args);
 }
 
+/** How much of an incoming task is shown in the one-line summary. */
+export const TASK_PREVIEW_LENGTH = 200;
+
+/**
+ * Formats the one-line summary printed whenever AgentRQ hands over a task.
+ *
+ * Line breaks and runs of spaces are collapsed so the summary stays on one
+ * line, and long prompts are cut off rather than filling the terminal.
+ */
+export function describeAsk(text: string, taskId?: string): string {
+  const singleLine = text.replace(/\s+/g, " ").trim();
+  const preview =
+    singleLine.length > TASK_PREVIEW_LENGTH
+      ? `${singleLine.slice(0, TASK_PREVIEW_LENGTH)}…`
+      : singleLine;
+  const tag = taskId ? `task ${taskId}` : "task";
+  return `[${tag}] ${preview}`;
+}
+
+export function announceTask(text: string, taskId?: string): void {
+  console.error(`\n${describeAsk(text, taskId)}`);
+}
+
+export function announceFinished(
+  taskId: string | undefined,
+  stopReason: string,
+): void {
+  const tag = taskId ? `task ${taskId}` : "task";
+  console.error(`[${tag}] Finished: ${stopReason}`);
+}
+
 /** How much of an agent's stderr is kept to explain a failure, in characters. */
 export const AGENT_STDERR_TAIL_LENGTH = 8 * 1024;
 

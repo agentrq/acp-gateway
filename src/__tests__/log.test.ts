@@ -2,7 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { PassThrough } from "node:stream";
 import {
   AGENT_STDERR_TAIL_LENGTH,
+  TASK_PREVIEW_LENGTH,
+  announceFinished,
+  announceTask,
   debug,
+  describeAsk,
   followAgentStderr,
   isVerbose,
   setVerbose,
@@ -40,6 +44,41 @@ describe("log", () => {
       setVerbose(false);
       debug("hidden");
       expect(errorSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("describeAsk", () => {
+    it("names the task id when one is given", () => {
+      expect(describeAsk("Fix the build", "42")).toBe("[task 42] Fix the build");
+    });
+
+    it("leaves out the id when none is given", () => {
+      expect(describeAsk("Fix the build")).toBe("[task] Fix the build");
+    });
+
+    it("collapses line breaks and whitespace onto one line", () => {
+      expect(describeAsk("  first line\n\n  second\tline  ", "7")).toBe(
+        "[task 7] first line second line",
+      );
+    });
+
+    it("cuts off prompts longer than the preview limit", () => {
+      const long = "a".repeat(TASK_PREVIEW_LENGTH + 50);
+      expect(describeAsk(long, "1")).toBe(`[task 1] ${"a".repeat(TASK_PREVIEW_LENGTH)}…`);
+    });
+  });
+
+  describe("announceTask and announceFinished", () => {
+    it("prints the task summary and completion even without --verbose", () => {
+      announceTask("Deploy staging", "99");
+      announceFinished("99", "end_turn");
+      announceFinished(undefined, "cancelled");
+
+      expect(errorSpy.mock.calls).toEqual([
+        ["\n[task 99] Deploy staging"],
+        ["[task 99] Finished: end_turn"],
+        ["[task] Finished: cancelled"],
+      ]);
     });
   });
 });
