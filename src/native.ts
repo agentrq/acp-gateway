@@ -30,6 +30,7 @@ import {
   rpcShape,
   stderrTail,
   taskIdOf,
+  withRequestId,
   withSessionId,
   upgradeHeaders,
   type Control,
@@ -394,16 +395,21 @@ export async function runNative(o: NativeOptions): Promise<void> {
   };
 
   const onAgentLine = (line: string) => {
-    if (Buffer.byteLength(line) > MAX_LINE_BYTES) return dropLine("a line over 16 MiB", true);
     if (isControl(line)) return dropLine("a line that looks like a bridge control frame");
     const shape = rpcShape(line);
     const serverSide = toServerSession.get(shape?.params?.sessionId as string);
     if (serverSide !== undefined) line = withSessionId(line, serverSide);
-    if (shape?.method !== undefined && shape.id !== undefined) {
+    if (epoch > 0 && shape?.params?.requestId !== undefined) {
+      const original = requestIds.get(String(shape.params.requestId));
+      if (original !== undefined) line = withRequestId(line, original);
+    }
+    if (shape?.method === "$/cancel_request" && shape.params?.requestId !== undefined) {
+      agentRequests.delete(shape.params.requestId as string | number);
+    } else if (shape?.method !== undefined && shape.id !== undefined) {
       agentRequests.set(shape.id, shape.method);
     } else if (shape?.isResponse) {
       if (shape.id === initRequestId) {
-        agent.initResult = shape.result;
+        if (shape.result !== undefined) agent.initResult = shape.result;
         initRequestId = undefined;
       }
       if (epoch > 0) {
@@ -430,7 +436,6 @@ export async function runNative(o: NativeOptions): Promise<void> {
     unacked = 0;
     epoch++;
     requestIds.clear();
-    initRequestId = undefined;
     const stdin = agent.child.stdin;
     for (const [id, method] of agentRequests) stdin?.write(abandonedAnswer(id, method) + "\n");
     agentRequests.clear();
@@ -473,14 +478,21 @@ export async function runNative(o: NativeOptions): Promise<void> {
         if (taskId !== undefined) taskSessions.set(taskId, toAgentSession.get(sessionId) ?? sessionId);
       }
       const agentSide = toAgentSession.get(sessionId);
+      const activeSession = agentSide ?? sessionId;
       if (agentSide !== undefined) {
-        sessionId = agentSide;
         frame = withSessionId(frame, agentSide);
       }
-      if (shape!.method === "session/close") {
-        for (const [task, s] of taskSessions) if (s === sessionId) taskSessions.delete(task);
+      if (shape!.method === "session/close" || shape!.method === "session/delete") {
+        for (const [task, s] of taskSessions) if (s === activeSession) taskSessions.delete(task);
+        toServerSession.delete(activeSession);
+        for (const [srv, ag] of toAgentSession) if (ag === activeSession) toAgentSession.delete(srv);
+        sessionsInUse.delete(activeSession);
+      } else {
+        sessionsInUse.add(activeSession);
       }
-      sessionsInUse.add(sessionId as string);
+    }
+    if (epoch > 0 && shape?.method === "$/cancel_request" && shape.params?.requestId !== undefined) {
+      frame = withRequestId(frame, `${epoch}:${shape.params.requestId}`);
     }
     if (shape?.method !== undefined && shape.id !== undefined) {
       if (shape.method === "initialize") {
@@ -507,7 +519,8 @@ export async function runNative(o: NativeOptions): Promise<void> {
         attempt = 0;
         let replay: string[] | undefined;
         if (c.resumed) {
-          replay = ring.after(c.received ?? 0);
+          const acked = c.received ?? 0;
+          replay = ring.after(acked);
           if (replay === undefined) {
             // The server kept the connection, but what it missed is gone here:
             // start a new one, which keeps the agent.
@@ -515,6 +528,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
             connectionId = undefined;
             return reconnectNow();
           }
+          ring.ack(acked);
         } else if (agentFresh) {
           replay = ring.after(0) ?? [];
         } else {
@@ -570,6 +584,8 @@ export async function runNative(o: NativeOptions): Promise<void> {
       agentInstance: agent.instance,
     });
     ready = false;
+    fatal = undefined;
+    loginNeeded = false;
     let welcomed = false;
     let s: BridgeSocket;
     try {
@@ -601,6 +617,8 @@ export async function runNative(o: NativeOptions): Promise<void> {
 
   /** Drops the current socket on purpose and opens a fresh one straight away. */
   const reconnectNow = () => {
+    clearDrainPoll();
+    agent.child.stdout?.resume();
     const s = socket;
     socket = undefined;
     ready = false;

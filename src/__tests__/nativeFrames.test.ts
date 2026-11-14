@@ -21,6 +21,7 @@ import {
   abandonedAnswer,
   taskIdOf,
   withSessionId,
+  withRequestId,
 } from "../nativeFrames.js";
 
 describe("LineSplitter", () => {
@@ -46,6 +47,16 @@ describe("LineSplitter", () => {
     expect(s.push("ghi")).toEqual([]);
     expect(s.push("jkl\nnext\n")).toEqual(["next"]);
     expect(s.push("more\n")).toEqual(["more"]);
+  });
+
+  it("drops a completed line that exceeds maxLength in a single chunk or via multi-byte UTF-8", () => {
+    const onOversize = vi.fn();
+    const s = new LineSplitter(4, onOversize);
+    expect(s.push("ok\ntoolong\nend\n")).toEqual(["ok", "end"]);
+    expect(onOversize).toHaveBeenCalledTimes(1);
+    // Two 3-byte UTF-8 characters = 6 bytes > 4 bytes
+    expect(s.push("文档\nok2\n")).toEqual(["ok2"]);
+    expect(onOversize).toHaveBeenCalledTimes(2);
   });
 
   it("does not call onOversize multiple times across multiple oversized chunks without newlines", () => {
@@ -110,6 +121,12 @@ describe("ReplayRing", () => {
     expect(r.after(4)).toEqual(["f5"]);
   });
 
+  it("ignores an ack beyond total frames sent", () => {
+    const r = filled(3);
+    r.ack(99);
+    expect(r.after(0)).toEqual(["f1", "f2", "f3"]);
+  });
+
   it("refuses a count it never sent", () => {
     expect(filled(2).after(3)).toBeUndefined();
     expect(filled(2).after(-1)).toBeUndefined();
@@ -124,9 +141,10 @@ describe("ReplayRing", () => {
     expect(r.after(REPLAY_MAX_FRAMES + 2)).toBeUndefined();
   });
 
-  it("overflows on bytes as well as frames", () => {
+  it("overflows on UTF-8 bytes as well as frames", () => {
     const r = new ReplayRing();
-    r.push("x".repeat(REPLAY_MAX_BYTES));
+    // "é" is 1 UTF-16 code unit (.length === 1) but 2 UTF-8 bytes.
+    r.push("é".repeat(REPLAY_MAX_BYTES / 2));
     expect(r.resumable).toBe(true);
     r.push("y");
     expect(r.resumable).toBe(false);
@@ -163,8 +181,9 @@ describe("endpoints and tokens", () => {
     expect(nativeEndpoint("http://localhost:3911/mcp/0kAbc?token=t#x")).toBe("ws://localhost:3911/api/acp/v1");
   });
 
-  it("an explicit --acp-url wins", () => {
+  it("an explicit --acp-url wins and is validated as a URL", () => {
     expect(nativeEndpoint("https://h/", "wss://elsewhere/acp")).toBe("wss://elsewhere/acp");
+    expect(() => nativeEndpoint("https://h/", "not a url")).toThrow();
   });
 
   it("turns the endpoint back into http for the preflight", () => {
@@ -255,7 +274,7 @@ describe("rpcShape", () => {
 
 describe("prepareSessionRequest", () => {
   it("puts the given directory into requests that open a session, even when none was sent", () => {
-    for (const method of ["session/new", "session/load", "session/resume"]) {
+    for (const method of ["session/new", "session/load", "session/resume", "session/fork"]) {
       const out = prepareSessionRequest(JSON.stringify({ id: 1, method, params: { cwd: "/srv", mcpServers: [] } }), "/mine");
       expect(JSON.parse(out).params).toEqual({ cwd: "/mine", mcpServers: [] });
     }
@@ -330,11 +349,18 @@ describe("taskIdOf", () => {
   });
 });
 
-describe("withSessionId", () => {
+describe("withSessionId and withRequestId", () => {
   it("replaces only the session id", () => {
     expect(JSON.parse(withSessionId('{"id":1,"params":{"sessionId":"a","x":1}}', "b"))).toEqual({
       id: 1,
       params: { sessionId: "b", x: 1 },
+    });
+  });
+
+  it("replaces only the requestId in params", () => {
+    expect(JSON.parse(withRequestId('{"method":"$/cancel_request","params":{"requestId":7,"x":1}}', "1:7"))).toEqual({
+      method: "$/cancel_request",
+      params: { requestId: "1:7", x: 1 },
     });
   });
 });

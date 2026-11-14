@@ -176,15 +176,19 @@ function searchForMcpJson(startDir: string): McpServerConfig[] {
  * more now that the file is not necessarily called .mcp.json.
  */
 function toServers(parsed: McpJson, source: string): McpServerConfig[] {
-  const servers: McpServerConfig[] = Object.entries(parsed.mcpServers ?? {}).map(
+  const raw =
+    parsed && typeof parsed.mcpServers === "object" && parsed.mcpServers && !Array.isArray(parsed.mcpServers)
+      ? parsed.mcpServers
+      : {};
+  const servers: McpServerConfig[] = Object.entries(raw).map(
     ([name, cfg]) => ({
       name,
-      type: readTransport(name, cfg.type, cfg.url, source),
-      url: cfg.url,
-      command: cfg.command,
-      args: cfg.args,
-      env: cfg.env,
-      headers: cfg.headers,
+      type: readTransport(name, cfg?.type, cfg?.url, source),
+      url: cfg?.url,
+      command: cfg?.command,
+      args: cfg?.args,
+      env: cfg?.env,
+      headers: cfg?.headers,
     }),
   );
   servers.forEach((server) => assertUsable(server, source));

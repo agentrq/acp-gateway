@@ -100,11 +100,11 @@ describe("LocalACPClient", () => {
     );
   });
 
-  it("closes the terminal prompt when the agent finishes the login itself", async () => {
+  it("closes the terminal prompt and returns accept when the agent finishes the login itself", async () => {
     let signal: AbortSignal | undefined;
     const prompt = vi.fn(({ signal: s }: { signal: AbortSignal }) => {
       signal = s;
-      return new Promise<any>((resolve) => s.addEventListener("abort", () => resolve({ action: "accept" })));
+      return new Promise<any>((resolve) => s.addEventListener("abort", () => resolve({ action: "cancel" })));
     });
     const client = new LocalACPClient({ promptUrlElicitation: prompt as any });
 
@@ -113,7 +113,20 @@ describe("LocalACPClient", () => {
 
     await expect(answer).resolves.toEqual({ action: "accept" });
     expect(signal?.aborted).toBe(true);
+    expect(signal?.reason).toBe("complete");
     expect(errorSpy).toHaveBeenCalledWith("[auth] The agent reports this login as finished.");
+  });
+
+  it("still returns accept when completeElicitation aborts a prompt that rejects", async () => {
+    const prompt = vi.fn(({ signal }: { signal: AbortSignal }) => {
+      return new Promise<any>((_, reject) => signal.addEventListener("abort", () => reject(new Error("aborted"))));
+    });
+    const client = new LocalACPClient({ promptUrlElicitation: prompt as any });
+
+    const answer = client.createElicitation(urlRequest("e3-err"));
+    await client.completeElicitation({ elicitationId: "e3-err" } as any);
+
+    await expect(answer).resolves.toEqual({ action: "accept" });
   });
 
   it("ignores a completion for an elicitation it is not waiting on", async () => {

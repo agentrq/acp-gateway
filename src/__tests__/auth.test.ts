@@ -251,6 +251,26 @@ describe("auth", () => {
       });
       expect(close).toHaveBeenCalled();
     });
+
+    it("accepts and writes a newline when aborted with reason 'complete'", async () => {
+      const writeSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      const close = vi.fn();
+      const ctrl = new AbortController();
+      createInterfaceMock.mockReturnValue({
+        question: vi.fn(() => {
+          ctrl.abort("complete");
+          return Promise.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        }),
+        close,
+      } as any);
+
+      await expect(promptUrlElicitationOnTerminal({ ...request, signal: ctrl.signal })).resolves.toEqual({
+        action: "accept",
+      });
+      expect(writeSpy).toHaveBeenCalledWith("\n");
+      expect(close).toHaveBeenCalled();
+      writeSpy.mockRestore();
+    });
   });
 
   describe("runTerminalAuth", () => {

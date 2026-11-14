@@ -390,6 +390,55 @@ describe("runNative", () => {
     expect(t.ws().data()).toEqual(['{"jsonrpc":"2.0","id":5,"result":{"protocolVersion":1}}']);
   });
 
+  it("remembers an initialize answer that arrives after a fresh reconnect, and ignores an error answer", async () => {
+    const t = await connected();
+    t.ws().receive('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}');
+    await flush();
+    // Agent answers initialize with an error first — must not be cached as initResult.
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"busy"}}\n');
+    await flush();
+
+    // Send another initialize, then reconnect before the agent answers it.
+    t.ws().receive('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}');
+    await flush();
+    freshReconnect(t);
+    await flush();
+    // Now the agent answers id 1 from before the reconnect.
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}\n');
+    await flush();
+
+    t.ws().receive('{"jsonrpc":"2.0","id":9,"method":"initialize","params":{}}');
+    await flush();
+    expect(t.ws().data()).toContain('{"jsonrpc":"2.0","id":9,"result":{"protocolVersion":1}}');
+  });
+
+  it("rewrites params.requestId across epochs for $/cancel_request and elicitation/create", async () => {
+    const t = await initialized();
+    freshReconnect(t);
+    await flush();
+    t.children[0].written.length = 0;
+
+    t.ws().receive('{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"S1"}}');
+    await flush();
+    expect(JSON.parse(t.children[0].written[0]).id).toBe("1:4");
+
+    // Agent sends elicitation/create scoped to request "1:4" -> AgentRQ sees requestId 4.
+    t.children[0].stdout.write(
+      '{"jsonrpc":"2.0","id":20,"method":"elicitation/create","params":{"requestId":"1:4","mode":"url","message":"hi","url":"https://x"}}\n',
+    );
+    await flush();
+    expect(JSON.parse(t.ws().data()[0]).params.requestId).toBe(4);
+
+    // AgentRQ sends $/cancel_request for requestId 4 -> agent receives "1:4".
+    t.ws().receive('{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":4}}');
+    await flush();
+    expect(JSON.parse(t.children[0].written[1])).toEqual({
+      jsonrpc: "2.0",
+      method: "$/cancel_request",
+      params: { requestId: "1:4" },
+    });
+  });
+
   it("carries a task's conversation on in its own session after the agent is kept", async () => {
     const t = await connected();
     const prompt = (id: number, sessionId: string, text: string) =>
@@ -416,19 +465,26 @@ describe("runNative", () => {
     await flush();
     expect(t.ws().data().map((f) => JSON.parse(f).params.sessionId)).toEqual(["S2", "S3"]);
 
-    // Once AgentRQ closes it, the task starts afresh in whatever session it opens next.
+    // Once AgentRQ closes it, the task starts afresh in whatever session it opens next,
+    // and the closed session is not cancelled on a later reconnect.
     t.children[0].written.length = 0;
     t.ws().receive('{"jsonrpc":"2.0","id":5,"method":"session/close","params":{"sessionId":"S2"}}');
-    t.ws().receive(prompt(6, "S5", "[Task T1] again"));
+    t.ws().receive('{"jsonrpc":"2.0","id":6,"method":"session/delete","params":{"sessionId":"S4"}}');
+    t.ws().receive(prompt(7, "S5", "[Task T1] again"));
     await flush();
-    expect(sent().map((m) => m.params.sessionId)).toEqual(["S1", "S5"]);
+    expect(sent().map((m) => m.params.sessionId)).toEqual(["S1", "S4", "S5"]);
+
+    t.children[0].written.length = 0;
+    freshReconnect(t);
+    await flush();
+    expect(sent().map((m) => m.params.sessionId)).toEqual(["S3", "S5"]);
   });
 
-  it("forgets the agent's requests AgentRQ has answered", async () => {
+  it("forgets the agent's requests AgentRQ has answered or the agent has cancelled", async () => {
     const t = await initialized();
     t.ws().receive('{"jsonrpc":"2.0","id":7,"result":{"outcome":{"outcome":"selected","optionId":"allow"}}}');
     t.ws().receive('{"jsonrpc":"2.0","id":8,"result":{"action":"accept"}}');
-    t.ws().receive('{"jsonrpc":"2.0","id":9,"result":{"content":""}}');
+    t.children[0].stdout.write('{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":9}}\n');
     await flush();
     t.children[0].written.length = 0;
     freshReconnect(t);

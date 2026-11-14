@@ -97,6 +97,18 @@ describe("config", () => {
       expect(() => loadMcpConfig("/dummy")).toThrow("Could not find .mcp.json");
     });
 
+    it("should handle null JSON or array mcpServers or non-object server entry", () => {
+      vi.mocked(resolve).mockImplementation((...args: string[]) => args.join("/"));
+      vi.mocked(readFileSync).mockReturnValue("null");
+      expect(() => loadMcpConfig("/dummy")).toThrow("Could not find .mcp.json");
+
+      vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ mcpServers: [] }));
+      expect(() => loadMcpConfig("/dummy")).toThrow("Could not find .mcp.json");
+
+      vi.mocked(readFileSync).mockReturnValue(JSON.stringify({ mcpServers: { bad: null } }));
+      expect(() => loadMcpConfig("/dummy")).toThrow(/MCP server "bad" in \/dummy\/\.mcp\.json is stdio but has no command/);
+    });
+
     it("should infer type based on url presence", () => {
       vi.mocked(resolve).mockImplementation((...args: string[]) => args.join("/"));
       vi.mocked(readFileSync).mockReturnValue(JSON.stringify({
