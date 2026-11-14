@@ -184,6 +184,10 @@ export async function runNative(o: NativeOptions): Promise<void> {
   const requestIds = new Map<string, string | number>();
   /** AgentRQ's `initialize`, sent on to the agent and not yet answered. */
   let initRequestId: string | number | undefined;
+  /** The active connection's `initialize` id waiting on an earlier connection's in-flight `initialize`. */
+  let pendingInitServerId: string | number | undefined;
+  /** Agent-side request id → agent session id for in-flight `session/close` or `session/delete`. */
+  const closingSessions = new Map<string, string>();
   /** The agent's requests AgentRQ has not answered, by id: method. */
   const agentRequests = new Map<string | number, string>();
   /** Sessions AgentRQ has used on this connection, cancelled when the agent is kept past it. */
@@ -303,6 +307,8 @@ export async function runNative(o: NativeOptions): Promise<void> {
     epoch = 0;
     requestIds.clear();
     initRequestId = undefined;
+    pendingInitServerId = undefined;
+    closingSessions.clear();
     agentRequests.clear();
     sessionsInUse.clear();
     taskSessions.clear();
@@ -408,9 +414,23 @@ export async function runNative(o: NativeOptions): Promise<void> {
     } else if (shape?.method !== undefined && shape.id !== undefined) {
       agentRequests.set(shape.id, shape.method);
     } else if (shape?.isResponse) {
+      const closedSession = closingSessions.get(String(shape.id));
+      if (closedSession !== undefined) {
+        closingSessions.delete(String(shape.id));
+        const srv = toServerSession.get(closedSession);
+        if (srv !== undefined) {
+          toServerSession.delete(closedSession);
+          toAgentSession.delete(srv);
+        }
+      }
       if (shape.id === initRequestId) {
         if (shape.result !== undefined) agent.initResult = shape.result;
         initRequestId = undefined;
+        if (pendingInitServerId !== undefined) {
+          const id = pendingInitServerId;
+          pendingInitServerId = undefined;
+          return toServer(JSON.stringify({ ...JSON.parse(line), id }));
+        }
       }
       if (epoch > 0) {
         const original = requestIds.get(String(shape.id));
@@ -436,6 +456,8 @@ export async function runNative(o: NativeOptions): Promise<void> {
     unacked = 0;
     epoch++;
     requestIds.clear();
+    pendingInitServerId = undefined;
+    closingSessions.clear();
     const stdin = agent.child.stdin;
     for (const [id, method] of agentRequests) stdin?.write(abandonedAnswer(id, method) + "\n");
     agentRequests.clear();
@@ -465,7 +487,8 @@ export async function runNative(o: NativeOptions): Promise<void> {
     let frame = prepareSessionRequest(data, o.cwd, sessionMcpServers());
     const shape = rpcShape(frame);
     if (shape?.isResponse) agentRequests.delete(shape.id!);
-    let sessionId = shape?.params?.sessionId;
+    let closingSession: string | undefined;
+    const sessionId = shape?.params?.sessionId;
     if (typeof sessionId === "string") {
       if (shape!.method === "session/prompt") {
         const taskId = taskIdOf(shape!.params!.prompt);
@@ -484,9 +507,8 @@ export async function runNative(o: NativeOptions): Promise<void> {
       }
       if (shape!.method === "session/close" || shape!.method === "session/delete") {
         for (const [task, s] of taskSessions) if (s === activeSession) taskSessions.delete(task);
-        toServerSession.delete(activeSession);
-        for (const [srv, ag] of toAgentSession) if (ag === activeSession) toAgentSession.delete(srv);
         sessionsInUse.delete(activeSession);
+        closingSession = activeSession;
       } else {
         sessionsInUse.add(activeSession);
       }
@@ -501,12 +523,19 @@ export async function runNative(o: NativeOptions): Promise<void> {
         if (agent.initResult !== undefined) {
           return toServer(JSON.stringify({ jsonrpc: "2.0", id: shape.id, result: agent.initResult }));
         }
+        if (initRequestId !== undefined) {
+          pendingInitServerId = shape.id;
+          return;
+        }
         initRequestId = epoch > 0 ? `${epoch}:${shape.id}` : shape.id;
       }
+      const agentId = epoch > 0 ? `${epoch}:${shape.id}` : shape.id;
+      if (closingSession !== undefined) {
+        closingSessions.set(String(agentId), closingSession);
+      }
       if (epoch > 0) {
-        const id = `${epoch}:${shape.id}`;
-        requestIds.set(id, shape.id);
-        frame = JSON.stringify({ ...JSON.parse(frame), id });
+        requestIds.set(agentId as string, shape.id);
+        frame = JSON.stringify({ ...JSON.parse(frame), id: agentId });
       }
     }
     agent.child.stdin?.write(frame + "\n");

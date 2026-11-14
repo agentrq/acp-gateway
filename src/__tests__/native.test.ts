@@ -368,7 +368,7 @@ describe("runNative", () => {
     expect(t.ws().data()).toEqual(['{"jsonrpc":"2.0","id":1,"result":{"sessionId":"S2"}}']);
   });
 
-  it("sends a second connection's initialize to an agent that never answered the first", async () => {
+  it("coalesces a second connection's initialize while the first is still in flight", async () => {
     const t = await connected();
     t.ws().receive('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}');
     await flush();
@@ -376,18 +376,40 @@ describe("runNative", () => {
     await flush();
     t.children[0].written.length = 0;
 
-    t.ws().receive('{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}');
+    // A second initialize arrives while the first (id 0) has not been answered yet.
+    // It should be held without sending a second initialize to the agent's stdin.
+    t.ws().receive('{"jsonrpc":"2.0","id":3,"method":"initialize","params":{}}');
     await flush();
-    expect(t.children[0].written).toEqual(['{"jsonrpc":"2.0","id":"1:0","method":"initialize","params":{}}\n']);
-    t.children[0].stdout.write('{"jsonrpc":"2.0","id":"1:0","result":{"protocolVersion":1}}\n');
-    await flush();
-    expect(t.ws().data()).toEqual(['{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}']);
+    expect(t.children[0].written).toEqual([]);
 
-    // ...and remembers that answer for the next connection.
-    freshReconnect(t);
-    t.ws().receive('{"jsonrpc":"2.0","id":5,"method":"initialize","params":{}}');
+    // When the agent answers the in-flight initialize (id 0) with an error, the active
+    // connection receives that error for its pending id 3, and a retry is forwarded.
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"busy"}}\n');
     await flush();
-    expect(t.ws().data()).toEqual(['{"jsonrpc":"2.0","id":5,"result":{"protocolVersion":1}}']);
+    expect(t.ws().data()).toEqual(['{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"busy"}}']);
+
+    t.ws().receive('{"jsonrpc":"2.0","id":4,"method":"initialize","params":{}}');
+    await flush();
+    expect(t.children[0].written).toEqual(['{"jsonrpc":"2.0","id":"1:4","method":"initialize","params":{}}\n']);
+
+    // Reconnect again while "1:4" is in flight, and send initialize id 7 on the new connection.
+    freshReconnect(t);
+    await flush();
+    t.children[0].written.length = 0;
+    t.ws().receive('{"jsonrpc":"2.0","id":7,"method":"initialize","params":{}}');
+    await flush();
+    expect(t.children[0].written).toEqual([]);
+
+    // Now the agent answers "1:4" with a result -> active connection gets id 7 answered,
+    // and initResult is cached for future connections.
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":"1:4","result":{"protocolVersion":1}}\n');
+    await flush();
+    expect(t.ws().data()).toEqual(['{"jsonrpc":"2.0","id":7,"result":{"protocolVersion":1}}']);
+
+    freshReconnect(t);
+    t.ws().receive('{"jsonrpc":"2.0","id":8,"method":"initialize","params":{}}');
+    await flush();
+    expect(t.ws().data()).toEqual(['{"jsonrpc":"2.0","id":8,"result":{"protocolVersion":1}}']);
   });
 
   it("remembers an initialize answer that arrives after a fresh reconnect, and ignores an error answer", async () => {
@@ -467,12 +489,29 @@ describe("runNative", () => {
 
     // Once AgentRQ closes it, the task starts afresh in whatever session it opens next,
     // and the closed session is not cancelled on a later reconnect.
+    // Trailing session/update frames emitted before the agent responds to session/close
+    // still have their sessionId translated back to S2 until the close response arrives.
     t.children[0].written.length = 0;
+    t.ws().sent.length = 0;
     t.ws().receive('{"jsonrpc":"2.0","id":5,"method":"session/close","params":{"sessionId":"S2"}}');
     t.ws().receive('{"jsonrpc":"2.0","id":6,"method":"session/delete","params":{"sessionId":"S4"}}');
     t.ws().receive(prompt(7, "S5", "[Task T1] again"));
     await flush();
     expect(sent().map((m) => m.params.sessionId)).toEqual(["S1", "S4", "S5"]);
+
+    // Trailing notification on S1 while session/close ("1:5") is still in flight -> mapped to S2.
+    t.children[0].stdout.write('{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S1","update":{"trailing":1}}}\n');
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":"1:5","result":{}}\n');
+    t.children[0].stdout.write('{"jsonrpc":"2.0","id":"1:6","result":{}}\n');
+    // After session/close has completed, S1 is no longer mapped to S2.
+    t.children[0].stdout.write('{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S1","update":{"afterClose":1}}}\n');
+    await flush();
+    expect(t.ws().data().map((f) => JSON.parse(f))).toEqual([
+      { jsonrpc: "2.0", method: "session/update", params: { sessionId: "S2", update: { trailing: 1 } } },
+      { jsonrpc: "2.0", id: 5, result: {} },
+      { jsonrpc: "2.0", id: 6, result: {} },
+      { jsonrpc: "2.0", method: "session/update", params: { sessionId: "S1", update: { afterClose: 1 } } },
+    ]);
 
     t.children[0].written.length = 0;
     freshReconnect(t);
