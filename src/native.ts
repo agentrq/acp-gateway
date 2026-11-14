@@ -407,6 +407,7 @@ export async function runNative(o: NativeOptions): Promise<void> {
     let partial = "";
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
+      if (a.replaced) return;
       if (isVerbose() || authRequests.size > 0 || sessionStderrStreaming) {
         process.stderr.write(chunk);
       } else if (sessionOpenRequests.size > 0) {
@@ -715,6 +716,9 @@ export async function runNative(o: NativeOptions): Promise<void> {
     if (shape?.method === "$/cancel_request" && shape.params?.requestId !== undefined) {
       const agentReqId = epoch > 0 ? `${epoch}:${shape.params.requestId}` : String(shape.params.requestId);
       promptTasks.delete(agentReqId);
+      if (authRequests.delete(agentReqId) && authRequests.size === 0 && sessionOpenRequests.size === 0) {
+        clearAuthWatch();
+      }
       const open = finishSessionOpen(agentReqId);
       if (open) {
         flushSessionStderr();
@@ -934,6 +938,8 @@ export async function runNative(o: NativeOptions): Promise<void> {
     // close never reaches here.
     agent.replaced = true;
     terminateAgentProcess(agent.child);
+    clearAuthWatch();
+    clearSessionOpenWatch();
     try {
       await o.login!();
     } catch (err) {
