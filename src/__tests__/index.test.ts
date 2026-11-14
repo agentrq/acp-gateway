@@ -43,19 +43,6 @@ import {
 import { AUTH_REQUIRED_CODE } from "../auth.js";
 import type { McpServerConfig } from "../config.js";
 
-/**
- * A stand-in for the workspace bridge.
- *
- * The ACP client registers a verdict listener on it as soon as it is built, so
- * a bare object is not enough — the real bridge is an EventEmitter.
- */
-function fakeBridge(): any {
-  const emitter: any = new EventEmitter();
-  emitter.sendNotification = vi.fn().mockResolvedValue(undefined);
-  emitter.callTool = vi.fn().mockResolvedValue({ isError: false, content: [] });
-  return emitter;
-}
-
 // Real emitters so the agent-process lifecycle handlers can be exercised.
 const { spawnedAgents } = vi.hoisted(() => ({ spawnedAgents: [] as any[] }));
 
@@ -1644,6 +1631,11 @@ describe("index", () => {
       expect(
         nativeOptionsFor(options, ["a"], ws({ name: "x", type: "http", url: "not a url", headers: { Authorization: "Bearer t" } })),
       ).toMatch(/cannot work out the AgentRQ endpoint from "not a url"; pass --acp-url/);
+
+      const badOverride = parseGatewayArgs(["--acp-url", "not a url"]);
+      expect(
+        nativeOptionsFor(badOverride, ["a"], ws(agentrq)),
+      ).toMatch(/cannot work out the AgentRQ endpoint from "not a url"; pass --acp-url/);
     });
 
     it("starts native mode with those options", async () => {
@@ -1764,6 +1756,20 @@ describe("index", () => {
       );
       expect(d.bridge).not.toHaveBeenCalled();
       expect(d.exit).toHaveBeenCalledWith(0);
+    });
+
+    it("reports a failing one-shot command cleanly and exits 1", async () => {
+      const d = deps({
+        startDir: tmpdir(),
+        agentCommand: vi.fn(async () => {
+          throw new Error("No usable authentication method");
+        }),
+      });
+
+      await runGateway(parseGatewayArgs(["--login"]), ["agent"], d);
+
+      expect(errorSpy).toHaveBeenCalledWith("[acp-gateway] No usable authentication method");
+      expect(d.exit).toHaveBeenCalledWith(1);
     });
 
     it("says why it cannot run, without a stack trace, and exits 1", async () => {

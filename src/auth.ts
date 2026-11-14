@@ -11,6 +11,7 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import type * as acp from "@agentclientprotocol/sdk";
+import { needsShell, spawnArgsFor, spawnTarget } from "./index.js";
 import { AGENT_STDERR_TAIL_LENGTH, showingAgentStderr } from "./log.js";
 
 /** JSON-RPC code ACP reserves for "the user must authenticate first". */
@@ -172,7 +173,10 @@ export async function promptUrlElicitationOnTerminal({
     return { action: "accept" };
   } catch {
     // Either the agent finished the login without us (signal) or stdin closed.
-    // Both mean "stop waiting"; neither means the human refused.
+    if (signal.reason === "complete") {
+      process.stderr.write("\n");
+      return { action: "accept" };
+    }
     return { action: "cancel" };
   } finally {
     rl.close();
@@ -338,8 +342,10 @@ export async function runTerminalAuth(
       `[auth] Complete the login in your terminal; the gateway resumes when it exits.`,
   );
 
-  const child = spawn(launch.command, args, {
+  const target = spawnTarget(launch.command);
+  const child = spawn(...spawnArgsFor(target, args), {
     stdio: "inherit",
+    shell: needsShell(target),
     env: { ...process.env, ...launch.env, ...extraEnv } as NodeJS.ProcessEnv,
   });
 

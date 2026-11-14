@@ -1054,6 +1054,7 @@ export async function runAgentCommand(
       interactive: isInteractiveTerminal(),
     });
   } finally {
+    agent.acpClient?.dispose?.();
     terminateAgentProcess(agent.process);
     isolated?.remove();
   }
@@ -1079,7 +1080,7 @@ export function nativeOptionsFor(
   try {
     endpoint = nativeEndpoint(agentrqConfig.url ?? "", options.acpUrl);
   } catch {
-    return `acp-gateway cannot work out the AgentRQ endpoint from "${agentrqConfig.url}"; pass --acp-url`;
+    return `acp-gateway cannot work out the AgentRQ endpoint from "${options.acpUrl ?? agentrqConfig.url}"; pass --acp-url`;
   }
   return {
     acpCmdArgs,
@@ -1310,13 +1311,17 @@ export async function runGateway(
     return bridge(options, acpCmdArgs, workspace);
   }
   // One-shot commands talk to the agent and exit.
-  await agentCommand(
-    options.command,
-    acpCmdArgs,
-    agentrqConfig.env,
-    options.authMethodId,
-    options.json,
-  );
+  try {
+    await agentCommand(
+      options.command,
+      acpCmdArgs,
+      agentrqConfig.env,
+      options.authMethodId,
+      options.json,
+    );
+  } catch (err) {
+    return fail(err);
+  }
   exit(0);
 }
 

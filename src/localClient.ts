@@ -46,7 +46,10 @@ export class LocalACPClient implements acp.Client {
   // elicitationId → the terminal prompt still waiting on a human. Kept so an
   // `elicitation/complete` can close a prompt whose answer the agent has
   // stopped waiting for — a browser login that finished on its own, say.
-  private pendingUrlElicitations = new Map<string, AbortController>();
+  private pendingUrlElicitations = new Map<
+    string,
+    { controller: AbortController; completed: boolean }
+  >();
 
   constructor(private readonly options: LocalClientOptions = {}) {}
 
@@ -78,15 +81,17 @@ export class LocalACPClient implements acp.Client {
     console.error(formatUrlElicitation(params.message, url));
     if (!this.options.promptUrlElicitation) return { action: "cancel" };
 
-    const controller = new AbortController();
-    if (elicitationId) this.pendingUrlElicitations.set(elicitationId, controller);
+    const entry = { controller: new AbortController(), completed: false };
+    if (elicitationId) this.pendingUrlElicitations.set(elicitationId, entry);
     try {
-      return await this.options.promptUrlElicitation({
+      const response = await this.options.promptUrlElicitation({
         message: params.message,
         url,
-        signal: controller.signal,
+        signal: entry.controller.signal,
       });
+      return entry.completed ? { action: "accept" } : response;
     } catch (err) {
+      if (entry.completed) return { action: "accept" };
       console.error(`[auth] Could not ask about the login at this terminal:`, err);
       return { action: "cancel" };
     } finally {
@@ -102,12 +107,13 @@ export class LocalACPClient implements acp.Client {
     const waiting = this.pendingUrlElicitations.get(params.elicitationId);
     if (!waiting) return;
     console.error(`[auth] The agent reports this login as finished.`);
-    waiting.abort();
+    waiting.completed = true;
+    waiting.controller.abort("complete");
   }
 
   /** Closes any terminal prompt still open, when the agent goes away. */
   dispose(): void {
-    for (const controller of this.pendingUrlElicitations.values()) controller.abort();
+    for (const waiting of this.pendingUrlElicitations.values()) waiting.controller.abort();
     this.pendingUrlElicitations.clear();
   }
 }

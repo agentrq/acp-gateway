@@ -75,13 +75,23 @@ export class LineSplitter {
       this.rest = "";
     }
     const parts = (this.rest + chunk).split("\n");
-    this.rest = parts.pop() ?? "";
-    if (this.rest.length > this.maxLength) {
+    this.rest = parts.pop()!;
+    const out: string[] = [];
+    for (const raw of parts) {
+      const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+      if (line.length === 0) continue;
+      if (Buffer.byteLength(line) > this.maxLength) {
+        this.onOversize();
+        continue;
+      }
+      out.push(line);
+    }
+    if (Buffer.byteLength(this.rest) > this.maxLength) {
       this.rest = "";
       this.skipping = true;
       this.onOversize();
     }
-    return parts.map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l)).filter((l) => l.length > 0);
+    return out;
   }
 }
 
@@ -112,7 +122,7 @@ export class ReplayRing {
     this.total++;
     if (this.broken) return;
     this.frames.push(f);
-    this.bytes += f.length;
+    this.bytes += Buffer.byteLength(f);
     if (this.frames.length - this.head > REPLAY_MAX_FRAMES || this.bytes > REPLAY_MAX_BYTES) {
       this.broken = true;
       this.frames = [];
@@ -122,8 +132,9 @@ export class ReplayRing {
   }
 
   ack(received: number): void {
+    if (received > this.total) return;
     while (this.head < this.frames.length && this.first <= received) {
-      this.bytes -= this.frames[this.head++].length;
+      this.bytes -= Buffer.byteLength(this.frames[this.head++]);
       this.first++;
     }
     // Compact once the dead head is the bigger half, so trimming stays O(1) amortised.
@@ -152,7 +163,10 @@ export class ReplayRing {
 
 /** Where the bridge connects: AgentRQ's ACP v1 endpoint, on the host .mcp.json names. */
 export function nativeEndpoint(mcpUrl: string, override?: string): string {
-  if (override) return override;
+  if (override) {
+    new URL(override);
+    return override;
+  }
   const u = new URL(mcpUrl);
   u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
   u.pathname = "/api/acp/v1";
@@ -277,7 +291,7 @@ export function rpcShape(frame: string): RpcShape | undefined {
 }
 
 /** The requests that carry the directory a session runs in. */
-const CWD_METHODS: ReadonlySet<string> = new Set(["session/new", "session/load", "session/resume"]);
+const CWD_METHODS: ReadonlySet<string> = new Set(["session/new", "session/load", "session/resume", "session/fork"]);
 
 /**
  * Fills in a request that opens a session with what only this process knows.
@@ -338,5 +352,12 @@ export function taskIdOf(prompt: unknown): string | undefined {
 export function withSessionId(frame: string, sessionId: string): string {
   const m = JSON.parse(frame);
   m.params.sessionId = sessionId;
+  return JSON.stringify(m);
+}
+
+/** The frame with its `params.requestId` replaced. */
+export function withRequestId(frame: string, requestId: string | number): string {
+  const m = JSON.parse(frame);
+  m.params.requestId = requestId;
   return JSON.stringify(m);
 }
