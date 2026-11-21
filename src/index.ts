@@ -42,7 +42,6 @@ import {
   type PlatformTarget,
 } from "./registry.js";
 import { extractModels, formatModelsText } from "./models.js";
-import { MAX_MAX_CONCURRENCY, MIN_MAX_CONCURRENCY, normalizeConcurrency } from "./concurrency.js";
 import { debug, followAgentStderr, isVerbose, setVerbose } from "./log.js";
 import { pkg } from "./version.js";
 
@@ -524,11 +523,7 @@ export type GatewayCommand =
   | "agent-info"
   | "help";
 
-/** Default maximum number of concurrent tasks allowed to prompt the ACP agent at once. */
-export const DEFAULT_MAX_CONCURRENCY = MIN_MAX_CONCURRENCY;
-
 export interface GatewayOptions {
-  maxConcurrency: number;
   /** How long a tool call waits for a human verdict. 0 waits indefinitely. */
   permissionTimeoutMs: number;
   authMethodId?: string;
@@ -572,7 +567,6 @@ export interface GatewayOptions {
  */
 export function parseGatewayArgs(args: string[]): GatewayOptions {
   const options: GatewayOptions = {
-    maxConcurrency: DEFAULT_MAX_CONCURRENCY,
     permissionTimeoutMs: DEFAULT_PERMISSION_TIMEOUT_MS,
     command: "run",
     allowUnverifiedAgent: false,
@@ -588,49 +582,6 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
     const value = next !== undefined && !next.startsWith("-") ? next : undefined;
 
     switch (args[i]) {
-      case "--max-concurrency":
-      case "--maxConcurrency": {
-        // A token that starts with a digit was meant as this flag's number, so
-        // it is consumed whether or not it reads as one — left behind, it fell
-        // into `rest`, which is the agent command when no `--` was used, and
-        // `--max-concurrency 8x claude` went looking for an agent called "8x".
-        //
-        // A token that does not start with a digit was never the number. It is
-        // the agent command with the number left out, and eating it would turn
-        // `--max-concurrency claude` from a gateway running claude at the
-        // default into a gateway with nothing to run at all.
-        const looksNumeric = value !== undefined && /^[0-9]/.test(value);
-        if (looksNumeric) i++;
-
-        // Read by the same rule the workspace's set_concurrency goes through,
-        // so the flag and the runtime control cannot disagree about what a
-        // number means. It is also what stops `--max-concurrency 0`, which
-        // used to be accepted and then held every task in the queue forever.
-        const parsed = looksNumeric ? normalizeConcurrency(value) : undefined;
-        if (parsed === undefined) {
-          if (value !== undefined) {
-            console.error(
-              `[acp-gateway] --max-concurrency "${value}" is not a number of ` +
-                `tasks; keeping ${options.maxConcurrency}.`,
-            );
-          }
-          break;
-        }
-
-        // Said out loud, unlike the workspace's path, which reports the limit
-        // it settled on back to the interface. Nothing reports a flag back to
-        // the person who typed it, so an existing `--max-concurrency 128` would
-        // otherwise quietly boot at the ceiling with no sign it had been cut.
-        const asked = Number(value);
-        if (Number.isFinite(asked) && Math.trunc(asked) !== parsed) {
-          console.error(
-            `[acp-gateway] --max-concurrency ${value} is outside ` +
-              `${MIN_MAX_CONCURRENCY}-${MAX_MAX_CONCURRENCY}; using ${parsed}.`,
-          );
-        }
-        options.maxConcurrency = parsed;
-        break;
-      }
       case "--permission-timeout": {
         const minutes = parseInt(value ?? "", 10);
         if (!isNaN(minutes) && minutes >= 0) {
@@ -1090,7 +1041,6 @@ export function nativeOptionsFor(
     agentId: options.agentId ?? path.basename(acpCmdArgs[0] ?? ""),
     modelId: options.modelId,
     effort: options.effort,
-    maxConcurrency: options.maxConcurrency,
     permissionTimeoutMinutes: Math.round(options.permissionTimeoutMs / 60_000),
     authMethodId: options.authMethodId,
     cwd: path.resolve(cwd),
@@ -1169,9 +1119,6 @@ AUTHENTICATION
                               mid-run. Defaults to choosing one automatically.
 
 BRIDGE
-  --max-concurrency <number>  How many tasks may prompt the agent at once, from
-                              ${MIN_MAX_CONCURRENCY} to ${MAX_MAX_CONCURRENCY}. Defaults to ${DEFAULT_MAX_CONCURRENCY}. This is the limit
-                              to start on — agentrq can change it while running.
   --permission-timeout <min>  How long a tool call waits for someone to approve
                               it before the turn is cancelled. Defaults to 30.
                               0 waits indefinitely, which is what a wedged
@@ -1201,7 +1148,6 @@ EXAMPLES
   acp-gateway --model gemini-2.5-pro -- gemini --acp
   acp-gateway --agent-info --agent gemini        See what that agent supports
   acp-gateway --login -- gemini --acp            Log in before running anything
-  acp-gateway --max-concurrency 4 -- gemini --acp
   acp-gateway --mcp-json ~/work/.mcp.json -- gemini --acp
 
 The workspace comes from .mcp.json, searched for in the current directory and up

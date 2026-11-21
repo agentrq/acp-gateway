@@ -14,7 +14,6 @@ import {
   agentExitFailed,
   showAgentStderr,
   shouldPrintBanner,
-  DEFAULT_MAX_CONCURRENCY,
   parseGatewayArgs,
   assertAgentRunnable,
   helpText,
@@ -411,9 +410,8 @@ describe("index", () => {
   });
 
   describe("parseGatewayArgs", () => {
-    it("should default to bridging tasks with a concurrency of 1", () => {
+    it("should default to bridging tasks", () => {
       expect(parseGatewayArgs([])).toEqual({
-        maxConcurrency: 1,
         permissionTimeoutMs: 30 * 60_000,
         command: "run",
         allowUnverifiedAgent: false,
@@ -444,114 +442,8 @@ describe("index", () => {
       );
     });
 
-    it("should accept both spellings of the concurrency flag", () => {
-      expect(parseGatewayArgs(["--max-concurrency", "4"]).maxConcurrency).toBe(4);
-      expect(parseGatewayArgs(["--maxConcurrency", "8"]).maxConcurrency).toBe(8);
-    });
-
-    it("should refuse a concurrency of zero, which used to stall the queue forever", () => {
-      // Accepted before, and then every task waited on a limit of 0 that no
-      // completion could ever get under.
-      expect(parseGatewayArgs(["--max-concurrency", "0"]).maxConcurrency).toBe(1);
-      expect(parseGatewayArgs(["--max-concurrency", "-3"]).maxConcurrency).toBe(1);
-    });
-
-    it("should cap the concurrency flag at the same ceiling the workspace gets", () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      expect(parseGatewayArgs(["--max-concurrency", "10000"]).maxConcurrency).toBe(64);
-      errorSpy.mockRestore();
-    });
-
-    it("should say so when it caps the flag, since nothing reports a flag back", () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      errorSpy.mockClear();
-
-      parseGatewayArgs(["--max-concurrency", "128"]);
-
-      // An existing --max-concurrency 128 would otherwise quietly boot at 64.
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("--max-concurrency 128 is outside 1-64; using 64."),
-      );
-      errorSpy.mockRestore();
-    });
-
-    it("should not warn about a fraction, which is truncated rather than capped", () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      errorSpy.mockClear();
-
-      expect(parseGatewayArgs(["--max-concurrency", "4.9"]).maxConcurrency).toBe(4);
-
-      expect(errorSpy).not.toHaveBeenCalled();
-      errorSpy.mockRestore();
-    });
-
-    it("should leave a non-numeric token alone, since it is the agent command", () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-      // `--max-concurrency claude` is the number left out, not a mistyped
-      // number. Eating the token would leave the gateway nothing to run.
-      expect(parseGatewayArgs(["--max-concurrency", "claude"])).toMatchObject({
-        maxConcurrency: 1,
-        rest: ["claude"],
-      });
-
-      errorSpy.mockRestore();
-    });
-
-    it("should consume a malformed concurrency value instead of leaving it to be run", () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-
-      // `rest` is the agent command when no `--` was used, so a value left
-      // behind here sent the gateway looking for an agent called "8x".
-      expect(parseGatewayArgs(["--max-concurrency", "8x", "claude"])).toMatchObject({
-        maxConcurrency: 1,
-        rest: ["claude"],
-      });
-      expect(parseGatewayArgs(["--max-concurrency", "8x", "--", "claude"]).rest).toEqual([
-        "--",
-        "claude",
-      ]);
-
-      errorSpy.mockRestore();
-    });
-
-    it("should say why a malformed concurrency value was ignored", () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      errorSpy.mockClear();
-
-      parseGatewayArgs(["--max-concurrency", "8x"]);
-
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining('--max-concurrency "8x" is not a number of tasks'),
-      );
-      errorSpy.mockRestore();
-    });
-
-    it("should stay silent when the flag simply has no value to read", () => {
-      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-      errorSpy.mockClear();
-
-      expect(parseGatewayArgs(["--max-concurrency", "--logout"])).toMatchObject({
-        maxConcurrency: 1,
-        command: "logout",
-      });
-
-      expect(errorSpy).not.toHaveBeenCalled();
-      errorSpy.mockRestore();
-    });
-
-    it("should keep the default when the concurrency value is missing or not a number", () => {
-      expect(parseGatewayArgs(["--max-concurrency"]).maxConcurrency).toBe(1);
-      expect(parseGatewayArgs(["--max-concurrency", "many"]).maxConcurrency).toBe(1);
-      expect(parseGatewayArgs(["--max-concurrency", "--logout"])).toMatchObject({
-        maxConcurrency: 1,
-        command: "logout",
-      });
-    });
-
     it("should read the preferred auth method", () => {
       expect(parseGatewayArgs(["--auth-method", "oauth"])).toMatchObject({
-        maxConcurrency: 1,
         command: "run",
         authMethodId: "oauth",
       });
@@ -559,9 +451,8 @@ describe("index", () => {
     });
 
     it("should recognise the auth commands", () => {
-      expect(parseGatewayArgs(["--login"])).toMatchObject({ maxConcurrency: 1, command: "login" });
+      expect(parseGatewayArgs(["--login"])).toMatchObject({ command: "login" });
       expect(parseGatewayArgs(["--login", "oauth"])).toMatchObject({
-        maxConcurrency: 1,
         command: "login",
         authMethodId: "oauth",
       });
@@ -576,10 +467,18 @@ describe("index", () => {
     });
 
     it("should collect an agent command given without a -- separator", () => {
-      expect(parseGatewayArgs(["--max-concurrency", "4", "gemini", "--acp"])).toMatchObject({
-        maxConcurrency: 4,
+      expect(parseGatewayArgs(["gemini", "--acp"])).toMatchObject({
         rest: ["gemini", "--acp"],
       });
+    });
+
+    it("should no longer know --max-concurrency, leaving it to the agent command", () => {
+      expect(parseGatewayArgs(["--max-concurrency", "4", "--", "gemini"])).not.toHaveProperty("maxConcurrency");
+      expect(parseGatewayArgs(["--max-concurrency", "4", "gemini"]).rest).toEqual([
+        "--max-concurrency",
+        "4",
+        "gemini",
+      ]);
     });
 
     it("should read the registry options", () => {
@@ -1095,7 +994,6 @@ describe("index", () => {
 
   describe("resolveAgentCommand", () => {
     const options = (overrides: Record<string, any> = {}) => ({
-      maxConcurrency: 1,
       permissionTimeoutMs: 30 * 60_000,
       command: "run" as const,
       allowUnverifiedAgent: false,
@@ -1567,7 +1465,7 @@ describe("index", () => {
 
     it("derives the endpoint and passes every option through as a header value", () => {
       const options = parseGatewayArgs([
-        "--acp-version", "1", "--agent", "codex-acp", "--model", "m", "--effort", "high", "--max-concurrency", "4",
+        "--acp-version", "1", "--agent", "codex-acp", "--model", "m", "--effort", "high",
         "--permission-timeout", "5", "--auth-method", "chatgpt",
       ]);
       expect(nativeOptionsFor(options, ["npx", "codex-acp"], ws(agentrq), "/work")).toEqual({
@@ -1578,7 +1476,6 @@ describe("index", () => {
         agentId: "codex-acp",
         modelId: "m",
         effort: "high",
-        maxConcurrency: 4,
         permissionTimeoutMinutes: 5,
         authMethodId: "chatgpt",
         cwd: "/work",
@@ -1830,7 +1727,6 @@ describe("index", () => {
           "--login",
           "--logout",
           "--auth-method",
-          "--max-concurrency",
           "--permission-timeout",
           "--mcp-json",
           "--acp-url",
@@ -1851,15 +1747,6 @@ describe("index", () => {
 
     it("should say why an unverified agent is not installed by default", () => {
       expect(helpText()).toMatch(/no way to tell what was downloaded/);
-    });
-
-    it("should document the default concurrency of 1", () => {
-      expect(helpText()).toContain("Defaults to 1.");
-    });
-
-    it("should document the concurrency range and that agentrq can change it", () => {
-      expect(helpText()).toContain("1 to 64.");
-      expect(helpText()).toContain("agentrq can change it while running.");
     });
   });
 

@@ -215,28 +215,27 @@ describe("upgradeHeaders", () => {
   });
 
   it("sends every optional header it is given", () => {
-    expect(
-      upgradeHeaders({
-        ...base,
-        agentId: "codex-acp",
-        modelId: "m",
-        effort: "high",
-        maxConcurrency: 4,
-        permissionTimeoutMinutes: 0,
-        authMethodId: "chatgpt",
-        resume: { connectionId: "AB", received: 7 },
-        agentInstance: "i-1",
-      }),
-    ).toMatchObject({
+    const headers = upgradeHeaders({
+      ...base,
+      agentId: "codex-acp",
+      modelId: "m",
+      effort: "high",
+      permissionTimeoutMinutes: 0,
+      authMethodId: "chatgpt",
+      resume: { connectionId: "AB", received: 7 },
+      agentInstance: "i-1",
+    });
+    expect(headers).toMatchObject({
       "X-AgentRQ-Agent-Instance": "i-1",
       "X-AgentRQ-Agent": "codex-acp",
       "X-AgentRQ-Agent-Model": "m",
       "X-AgentRQ-Agent-Effort": "high",
-      "X-AgentRQ-Max-Concurrency": "4",
       "X-AgentRQ-Permission-Timeout": "0",
       "X-AgentRQ-Auth-Method": "chatgpt",
       "X-AgentRQ-Resume": "AB:7",
     });
+    // Concurrency is gone: AgentRQ runs one task at a time per workspace.
+    expect(headers).not.toHaveProperty("X-AgentRQ-Max-Concurrency");
   });
 });
 

@@ -35,7 +35,14 @@ npm install -g @agentrq/acp-gateway
 
 ## Current Version
 
-`0.4.5`
+`0.5.0`
+
+**Breaking change in 0.5.0:** the `--max-concurrency` / `--maxConcurrency` flag is removed. AgentRQ runs one
+task at a time per workspace, so there is no limit to set. Drop the flag from launch scripts: it is no longer a
+gateway option, so without a `--` it is taken as the start of the agent command (`acp-gateway --max-concurrency 4
+gemini --acp` now tries to run `--max-concurrency`). With `--max-concurrency N -- <agent>` (the form earlier releases
+documented) or with `--agent X --max-concurrency N`, the flag is now silently ignored, and AgentRQ runs one task at
+a time regardless.
 
 ## Usage
 
@@ -58,7 +65,6 @@ acp-gateway -- your-acp-agent --flag1 --flag2
 
 You can specify gateway options before the `--` separator:
 
-- `--max-concurrency` / `--maxConcurrency` `<number>`: Sets the maximum number of concurrent tasks allowed to prompt the ACP agent at once. Defaults to `1`, and can be anything from `1` to `64`. This is the limit the gateway starts on; it can be changed while running from the agentrq interface.
 - `--agent <registry-id>`: Runs an agent from the ACP registry instead of a command you supply yourself.
 - `--list-agents`: Prints every agent in the registry and how each one can run on this machine, then exits.
 - `--list-models`: Prints the models supported by the agent, then exits.
@@ -78,7 +84,6 @@ You can specify gateway options before the `--` separator:
 
 Example:
 ```bash
-acp-gateway --max-concurrency 4 -- gemini --acp
 acp-gateway --mcp-json ~/work/.mcp.json -- gemini --acp
 ```
 
@@ -229,9 +234,9 @@ directory and to keep the agent across a new connection (below).
 - **Before connecting** it sends a plain `GET` with the token, so a problem is named rather than retried for ever:
   an old server without the endpoint (404), a bad token (401/403, with the server's reason), or a proxy that does
   not pass `Upgrade` for `/api/acp/`. Each of these exits 1.
-- **Options travel as headers.** `--agent`, `--model`, `--effort`, `--max-concurrency`, `--permission-timeout` and
-  `--auth-method` reach AgentRQ in the WebSocket handshake, along with the working directory every session runs in.
-  AgentRQ applies them, and can change the concurrency limit and model while running.
+- **Options travel as headers.** `--agent`, `--model`, `--effort`, `--permission-timeout` and `--auth-method` reach
+  AgentRQ in the WebSocket handshake, along with the working directory every session runs in. AgentRQ applies them,
+  and can change the model while running.
 - **Dropped connections resume.** The gateway reconnects with backoff (1 s doubling to 60 s), for as long as it
   takes, and AgentRQ keeps the connection for two minutes. Within that time nothing is lost or repeated: each side
   replays what the other had not acknowledged, up to 1,024 frames or 8 MiB.
