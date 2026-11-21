@@ -40,7 +40,9 @@ npm install -g @agentrq/acp-gateway
 **Breaking change in 0.5.0:** the `--max-concurrency` / `--maxConcurrency` flag is removed. AgentRQ runs one
 task at a time per workspace, so there is no limit to set. Drop the flag from launch scripts: it is no longer a
 gateway option, so without a `--` it is taken as the start of the agent command (`acp-gateway --max-concurrency 4
-gemini --acp` now tries to run `--max-concurrency`).
+gemini --acp` now tries to run `--max-concurrency`). With `--max-concurrency N -- <agent>` (the form earlier releases
+documented) or with `--agent X --max-concurrency N`, the flag is now silently ignored, and AgentRQ runs one task at
+a time regardless.
 
 ## Usage
 
