@@ -440,9 +440,9 @@ describe("mcpLogin", () => {
       const form = new URLSearchParams(tokenCall.body);
       expect(form.get("grant_type")).toBe("authorization_code");
       expect(form.get("code")).toBe("the-code");
-      expect(createHash("sha256").update(form.get("code_verifier")!).digest("base64url")).toBe(
-        auth!.searchParams.get("code_challenge"),
-      );
+      // The challenge sent to the browser is the S256 of the verifier sent to the token endpoint.
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(form.get("code_verifier")!));
+      expect(Buffer.from(digest).toString("base64url")).toBe(auth!.searchParams.get("code_challenge"));
       expect(readTokenStore(store)[`${s.base}/mcp`]).toEqual({
         clientId: "cid",
         clientSecret: undefined,
