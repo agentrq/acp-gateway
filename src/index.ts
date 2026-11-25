@@ -44,6 +44,7 @@ import {
 import { extractModels, formatModelsText } from "./models.js";
 import { debug, followAgentStderr, isVerbose, setVerbose } from "./log.js";
 import { pkg } from "./version.js";
+import { authorizeMcpServers, mcpLogin, mcpLogout } from "./mcpOAuth.js";
 
 /** How long a tool call waits for a human verdict by default: 30 minutes. */
 export const DEFAULT_PERMISSION_TIMEOUT_MS = 30 * 60 * 1000;
@@ -521,6 +522,8 @@ export type GatewayCommand =
   | "list-agents"
   | "list-models"
   | "agent-info"
+  | "mcp-login"
+  | "mcp-logout"
   | "help";
 
 export interface GatewayOptions {
@@ -557,6 +560,8 @@ export interface GatewayOptions {
   mcpJsonPath?: string;
   /** The ACP endpoint, when it cannot be worked out from .mcp.json. */
   acpUrl?: string;
+  /** The .mcp.json server `--mcp-login` / `--mcp-logout` is about. */
+  mcpServerName?: string;
   /** Tokens that are not gateway options — the agent command, when no `--` was used. */
   rest: string[];
 }
@@ -621,6 +626,14 @@ export function parseGatewayArgs(args: string[]): GatewayOptions {
         break;
       case "--logout":
         options.command = "logout";
+        break;
+      case "--mcp-login":
+      case "--mcp-logout":
+        options.command = args[i] === "--mcp-login" ? "mcp-login" : "mcp-logout";
+        if (value) {
+          options.mcpServerName = value;
+          i++;
+        }
         break;
       case "--list-auth-methods":
         options.command = "list-auth-methods";
@@ -1063,13 +1076,42 @@ export async function startNativeMode(
   workspace: Workspace,
   run: (o: NativeOptions) => Promise<void> = runNative,
   exit: (code: number) => void = process.exit.bind(process),
+  authorize: typeof authorizeMcpServers = authorizeMcpServers,
 ): Promise<void> {
   const native = nativeOptionsFor(options, acpCmdArgs, workspace);
   if (typeof native === "string") {
     console.error(`[acp-gateway] ${native}`);
     return exit(1);
   }
+  // Servers signed in with --mcp-login get their token as a header; the ones
+  // still waiting for a login are named now, rather than the agent quietly
+  // going without their tools. The refresh timers run as long as the gateway.
+  await authorize(workspace.configs, { skip: workspace.agentrqConfig.name });
   await run(native);
+}
+
+/**
+ * `--mcp-login <name>` and `--mcp-logout <name>`: sign the gateway in to, or
+ * out of, one of .mcp.json's servers. No agent is involved.
+ */
+export async function runMcpCommand(
+  options: GatewayOptions,
+  startDir: string = process.cwd(),
+  deps: { login?: typeof mcpLogin; logout?: typeof mcpLogout } = {},
+): Promise<void> {
+  const { login: signIn = mcpLogin, logout: signOut = mcpLogout } = deps;
+  const flag = `--${options.command}`;
+  const name = options.mcpServerName;
+  if (!name) throw new Error(`${flag} needs the name of a server in .mcp.json, e.g. ${flag} <name>`);
+  const configs = loadMcpConfig(startDir, options.mcpJsonPath);
+  const server = configs.find((c) => c.name === name);
+  if (!server) {
+    throw new Error(
+      `There is no MCP server named "${name}" in .mcp.json. It has: ${configs.map((c) => c.name).join(", ")}.`,
+    );
+  }
+  if (options.command === "mcp-logout") return signOut(server);
+  await signIn(server, { interactive: isInteractiveTerminal() });
 }
 
 /**
@@ -1118,6 +1160,12 @@ AUTHENTICATION
   --auth-method <id>          The method to use when the agent demands a login
                               mid-run. Defaults to choosing one automatically.
 
+MCP SERVER LOGIN
+  --mcp-login <name>          Sign in to an MCP server from .mcp.json that wants
+                              an OAuth login. Once done, the agent is handed its
+                              token in every session. Exits.
+  --mcp-logout <name>         Forget the saved login for that server. Exits.
+
 BRIDGE
   --permission-timeout <min>  How long a tool call waits for someone to approve
                               it before the turn is cancelled. Defaults to 30.
@@ -1148,6 +1196,7 @@ EXAMPLES
   acp-gateway --model gemini-2.5-pro -- gemini --acp
   acp-gateway --agent-info --agent gemini        See what that agent supports
   acp-gateway --login -- gemini --acp            Log in before running anything
+  acp-gateway --mcp-login linear                 Sign in to the "linear" MCP server
   acp-gateway --mcp-json ~/work/.mcp.json -- gemini --acp
 
 The workspace comes from .mcp.json, searched for in the current directory and up
@@ -1161,8 +1210,22 @@ export function printHelp(): void {
   console.log(helpText());
 }
 
-async function main() {
-  const args = process.argv.slice(2);
+/** Reads the command line and does what it asks; exported, with its dependencies, for tests. */
+export async function main(
+  args: string[] = process.argv.slice(2),
+  deps: {
+    exit?: (code: number) => void;
+    listAgents?: typeof runListAgents;
+    gateway?: typeof runGateway;
+    mcpCommand?: typeof runMcpCommand;
+  } = {},
+): Promise<void> {
+  const {
+    exit = process.exit.bind(process),
+    listAgents = runListAgents,
+    gateway = runGateway,
+    mcpCommand = runMcpCommand,
+  } = deps;
 
   // Everything after `--` is the agent command. Without a separator the
   // gateway's own options are still recognised and whatever is left over is
@@ -1178,13 +1241,24 @@ async function main() {
 
   if (command === "help") {
     printHelp();
-    process.exit(0);
+    return exit(0);
   }
 
   // Listing the registry needs neither a workspace nor an agent.
   if (command === "list-agents") {
-    await runListAgents(options.registryUrl, undefined, options.json);
-    process.exit(0);
+    await listAgents(options.registryUrl, undefined, options.json);
+    return exit(0);
+  }
+
+  // Signing in to an MCP server needs the workspace's .mcp.json, but no agent.
+  if (command === "mcp-login" || command === "mcp-logout") {
+    try {
+      await mcpCommand(options);
+    } catch (err) {
+      console.error(`[acp-gateway] ${err instanceof Error ? err.message : err}`);
+      return exit(1);
+    }
+    return exit(0);
   }
 
   // Nothing to run: the reason someone is looking at the terminal now is that
@@ -1192,12 +1266,12 @@ async function main() {
   // about a workspace they have not got to yet.
   if (!options.agentId && explicitCommand.length === 0) {
     printHelp();
-    process.exit(1);
+    return exit(1);
   }
 
   if (shouldPrintBanner(options)) console.log(`Starting [acp-gateway] ${pkg.name} v${pkg.version}`);
 
-  await runGateway(options, explicitCommand);
+  await gateway(options, explicitCommand);
 }
 
 /**

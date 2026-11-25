@@ -79,6 +79,8 @@ You can specify gateway options before the `--` separator:
 - `--list-auth-methods`: Prints the login methods the agent advertises, then exits.
 - `--login [method-id]`: Logs in to the agent, then exits.
 - `--logout`: Ends the agent's authenticated state, then exits (only for agents that support logout).
+- `--mcp-login <name>`: Signs the gateway in to the `.mcp.json` server `<name>` when that server wants an OAuth login, then exits. See [MCP Servers That Need a Login](#mcp-servers-that-need-a-login).
+- `--mcp-logout <name>`: Forgets the saved login for that server, then exits.
 - `--acp-url <url>`: The ACP endpoint, for a deployment where it cannot be worked out from `.mcp.json`.
 - `--acp-version 1`: Still accepted so existing launch scripts keep working, but it changes nothing: ACP v1 is the only protocol. Any other version is refused.
 
@@ -181,6 +183,45 @@ own machine to finish the login.
 
 Credentials are never stored by the gateway; the agent keeps its own, exactly as it does under an editor.
 
+### MCP Servers That Need a Login
+
+ACP lets a client hand an agent an MCP server with fixed headers (http, sse) or env vars (stdio), and
+nothing more. There is no way for the agent to ask anyone to sign in. So a server in `.mcp.json` that wants an
+OAuth login would leave the agent without its tools. `acp-gateway` runs that login itself, once:
+
+```bash
+acp-gateway --mcp-login linear
+```
+
+It follows the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization):
+
+1. It discovers the authorization server from the server's `401` challenge (`resource_metadata`) or its
+   `/.well-known/oauth-protected-resource` document. Servers that publish neither get the older spec's
+   `/authorize`, `/token` and `/register` defaults.
+2. It registers itself as a client (dynamic client registration) and signs in with PKCE (S256), `state` and
+   the server's `resource`.
+3. It prints the sign-in address. The browser comes back to a one-time server on `127.0.0.1`. If you sign in
+   on another computer, that last page will not load. Paste its address at the terminal instead, as with
+   agent logins.
+
+The tokens are saved per server URL in `$XDG_CONFIG_HOME/acp-gateway/mcp-oauth.json`, else
+`~/.config/acp-gateway/mcp-oauth.json` (`%APPDATA%\acp-gateway\mcp-oauth.json` on Windows), readable only by you.
+From then on, every session the gateway opens hands the agent that server with an
+`Authorization: Bearer` header. The gateway refreshes the token before it expires, for as long as it runs.
+
+On start-up, an http or sse server with no saved login and no `Authorization` header of its own is asked once
+whether it lets the gateway in. If it answers `401`, the gateway says so instead of the tools quietly going
+missing:
+
+```
+[mcp] MCP server "linear" needs a login, so the agent will not get its tools. Sign in once with: acp-gateway --mcp-login linear
+```
+
+A login that has expired and cannot be refreshed is reported the same way. Tokens are only sent to the MCP
+server itself and to its authorization server's token endpoint. They are never printed and never sent to
+AgentRQ. `acp-gateway --mcp-logout linear` forgets them. A server with an `Authorization` header in
+`.mcp.json` keeps that header, and the AgentRQ server is never touched.
+
 ### Configuration
 
 `acp-gateway` searches for `.mcp.json` starting in the current working directory and up to 3 parent directories.
@@ -259,7 +300,9 @@ directory and to keep the agent across a new connection (below).
   a terminal, or when the agent asks again straight after a login, it stops with AgentRQ's instructions.
 - **Errors that a retry cannot fix** (an agent that speaks a different ACP version) are printed and exit 1.
 - `--login`, `--logout`, `--list-models`, `--list-auth-methods` and `--agent-info` talk to the agent locally and
-  exit; they never connect to AgentRQ.
+  exit; they never connect to AgentRQ. `--mcp-login` and `--mcp-logout` need no agent at all.
+- **MCP servers that need an OAuth login** get the token saved by `--mcp-login` as an `Authorization` header, which
+  is refreshed while the gateway runs. Those still waiting for a login are named at start-up.
 
 ### Key Components
 
@@ -271,6 +314,7 @@ directory and to keep the agent across a new connection (below).
 | `src/localClient.ts` | The ACP client the one-shot commands use; puts a login URL to the person at the terminal. |
 | `src/config.ts` | Parses `.mcp.json` from the current directory tree up to 3 levels deep, plus any config named with `--mcp-json`. |
 | `src/auth.ts` | ACP authentication — lists the agent's login methods, detects `auth_required`, and runs agent or terminal logins. |
+| `src/mcpOAuth.ts` | OAuth for `.mcp.json` servers — discovery, client registration, the PKCE login, the token store, and refreshed `Authorization` headers. |
 | `src/registry.ts` | Reads the ACP registry index — agent lookup, host platform matching, and package launch commands. |
 | `src/agentInstall.ts` | Downloads, verifies, unpacks and caches a registry agent's binary distribution. |
 | `src/progress.ts` | Draws the single-line download progress bar, on a terminal and nowhere else. |
