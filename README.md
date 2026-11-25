@@ -204,7 +204,13 @@ Example `.mcp.json`:
 }
 ```
 
-`acp-gateway` prefers servers with `agentrq` in the name; it falls back to the first HTTP server with a `url`.
+`acp-gateway` connects through the first HTTP server (with a `url`) it finds under these names, in this order:
+
+1. `agentrq-workspace`
+2. `agentrq-<11-character workspace id>`, e.g. `agentrq-0an2BXTfpGj`
+3. `acp-gateway`
+
+If none is there, it takes any server with `agentrq` in its name, and then the first HTTP server with a `url`.
 
 ## How It Works
 
