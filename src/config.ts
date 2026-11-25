@@ -233,21 +233,39 @@ function assertUsable(server: McpServerConfig, source: string): void {
 }
 
 /**
+ * The server names AgentRQ itself writes into a workspace's .mcp.json, most
+ * specific first. A name is matched whole (ignoring case), so a server that
+ * merely mentions agentrq never beats one of these.
+ */
+const AGENTRQ_SERVER_NAMES: readonly ((name: string) => boolean)[] = [
+  (name) => name === "agentrq-workspace",
+  (name) => /^agentrq-[a-z0-9]{11}$/.test(name),
+  (name) => name === "acp-gateway",
+];
+
+/**
  * Pick the primary agentrq MCP server from the list.
- * Prefers servers with "agentrq" in the name; falls back to the first HTTP server.
+ *
+ * Looks for the names AgentRQ uses, in order: `agentrq-workspace`, then
+ * `agentrq-<11-character workspace id>`, then `acp-gateway`. Only when none of
+ * those is there does it fall back to any server with "agentrq" in its name,
+ * and then to the first HTTP server — the rules configs written before these
+ * names existed rely on.
  */
 export function pickAgentrqServer(
   servers: McpServerConfig[]
 ): McpServerConfig {
-  // Prefer named agentrq server
-  const named = servers.find(
-    (s) => s.name.toLowerCase().includes("agentrq") && s.type === "http" && s.url
-  );
+  const usable = servers.filter((s) => s.type === "http" && s.url);
+
+  for (const matches of AGENTRQ_SERVER_NAMES) {
+    const found = usable.find((s) => matches(s.name.toLowerCase()));
+    if (found) return found;
+  }
+
+  const named = usable.find((s) => s.name.toLowerCase().includes("agentrq"));
   if (named) return named;
 
-  // Fall back to first HTTP server
-  const http = servers.find((s) => s.type === "http" && s.url);
-  if (http) return http;
+  if (usable.length > 0) return usable[0];
 
   throw new Error(
     "No HTTP MCP server found in .mcp.json — expected at least one entry with type=http and url"

@@ -269,6 +269,55 @@ describe("config", () => {
       expect(picked.name).toBe("my-agentrq-server");
     });
 
+    it("prefers agentrq-workspace over every other name", () => {
+      const servers = [
+        { name: "acp-gateway", type: "http", url: "http://gw" },
+        { name: "agentrq-0an2BXTfpGj", type: "http", url: "http://id" },
+        { name: "my-agentrq-server", type: "http", url: "http://loose" },
+        { name: "agentrq-workspace", type: "http", url: "http://ws" },
+      ] as any;
+
+      expect(pickAgentrqServer(servers).url).toBe("http://ws");
+    });
+
+    it("prefers agentrq-<workspace id> over acp-gateway and looser names", () => {
+      const servers = [
+        { name: "my-agentrq-server", type: "http", url: "http://loose" },
+        { name: "acp-gateway", type: "http", url: "http://gw" },
+        { name: "Agentrq-0an2BXTfpGj", type: "http", url: "http://id" },
+      ] as any;
+
+      expect(pickAgentrqServer(servers).url).toBe("http://id");
+    });
+
+    it("only takes an 11-character id as a workspace id", () => {
+      const servers = [
+        { name: "agentrq-short", type: "http", url: "http://short" },
+        { name: "agentrq-0an2BXTfpGjX", type: "http", url: "http://long" },
+        { name: "acp-gateway", type: "http", url: "http://gw" },
+      ] as any;
+
+      expect(pickAgentrqServer(servers).url).toBe("http://gw");
+    });
+
+    it("prefers acp-gateway over a server that only mentions agentrq", () => {
+      const servers = [
+        { name: "my-agentrq-server", type: "http", url: "http://loose" },
+        { name: "acp-gateway", type: "http", url: "http://gw" },
+      ] as any;
+
+      expect(pickAgentrqServer(servers).url).toBe("http://gw");
+    });
+
+    it("skips a preferred name that is not a usable HTTP server", () => {
+      const servers = [
+        { name: "agentrq-workspace", type: "stdio", command: "ls" },
+        { name: "acp-gateway", type: "http", url: "http://gw" },
+      ] as any;
+
+      expect(pickAgentrqServer(servers).url).toBe("http://gw");
+    });
+
     it("should fall back to first HTTP server", () => {
       const servers = [
         { name: "other", type: "http", url: "http://other" }
