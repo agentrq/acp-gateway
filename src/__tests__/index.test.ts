@@ -1727,6 +1727,8 @@ describe("index", () => {
           "--login",
           "--logout",
           "--auth-method",
+          "--mcp-login",
+          "--mcp-logout",
           "--permission-timeout",
           "--mcp-json",
           "--acp-url",

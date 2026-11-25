@@ -186,7 +186,7 @@ export async function promptUrlElicitationOnTerminal({
 /** Reads one answer, giving up when `signal` fires; replaceable in tests. */
 export type AbortableAsker = (question: string, signal: AbortSignal) => Promise<string>;
 
-async function askOnTerminalUntil(question: string, signal: AbortSignal): Promise<string> {
+export async function askOnTerminalUntil(question: string, signal: AbortSignal): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stderr });
   try {
     return await rl.question(question, { signal });
